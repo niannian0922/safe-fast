@@ -1,6 +1,6 @@
 """
 训练循环和损失函数定义 - 完全修复JIT兼容性
-严格分离设置(Setup)和计算(Compute)阶段
+严格分离设置(Setup)和计算(Compute)阶段，正确集成GNN系统
 """
 
 import jax
@@ -11,7 +11,9 @@ import chex
 
 from core.physics import DroneState, DroneParams, create_initial_state, create_default_params
 from core.policy import create_policy_model, PolicyMLP
-from core.loop import rollout_trajectory, LoopOutput, BatchRolloutSystem
+from core.loop import LoopOutput, CompleteBatchRolloutSystem  # 使用正确的完整系统
+from core.perception import create_perception_system
+from core.safety import SafetyParams
 
 
 class TrainingConfig(NamedTuple):
@@ -52,7 +54,8 @@ class TrainingSystem:
         dummy_state = jnp.zeros(13)
         self.initial_policy_params = self.policy_model.init(rng_key, dummy_state)
         
-        # 创建批量rollout系统
+        # 【修复】使用基础批量rollout系统（不涉及GNN）
+        from core.loop import BatchRolloutSystem
         self.batch_system = BatchRolloutSystem(
             self.policy_model, self.physics_params, config.dt
         )
@@ -254,7 +257,7 @@ class CompleteTrainingState(NamedTuple):
 class CompleteTrainingSystem:
     """
     完整训练系统 - 包含策略网络和GNN
-    严格分离设置和计算阶段
+    严格分离设置和计算阶段，【完全修复版】
     """
     
     def __init__(self, config: CompleteTrainingConfig, rng_key: chex.PRNGKey):
@@ -262,20 +265,39 @@ class CompleteTrainingSystem:
         self.physics_params = create_default_params()
         
         # 分割随机数种子
-        policy_key, gnn_key = jax.random.split(rng_key)
+        policy_key, gnn_key, env_key = jax.random.split(rng_key, 3)
         
         # 设置阶段：创建模型
         self.policy_model = create_policy_model("mlp")
         
-        # 创建批量rollout系统
-        self.batch_system = BatchRolloutSystem(
-            self.policy_model, self.physics_params, config.dt
+        # 【关键修复1】创建真实的感知系统
+        self.gnn_model, self.perception_fn = create_perception_system()
+        
+        # 【关键修复2】创建完整的安全参数
+        self.safety_params = SafetyParams()
+        
+        # 【关键修复3】使用CompleteBatchRolloutSystem而非基础版本
+        self.batch_system = CompleteBatchRolloutSystem(
+            self.policy_model, 
+            self.physics_params, 
+            config.dt,
+            self.perception_fn,
+            self.safety_params,
+            environment_config={
+                'num_obstacles': config.num_obstacles,
+                'obstacle_bounds': config.obstacle_bounds
+            }
         )
         
-        # 初始化参数
+        # 【关键修复4】正确初始化GNN参数
         dummy_state = jnp.zeros(13)
         self.initial_policy_params = self.policy_model.init(policy_key, dummy_state)
-        self.initial_gnn_params = {'dummy_param': jnp.ones(10)}  # 简化的GNN参数
+        
+        # 创建dummy图来初始化GNN
+        from core.perception import create_dummy_pointcloud, pointcloud_to_graph
+        dummy_cloud = create_dummy_pointcloud(gnn_key, 10)
+        dummy_graph = pointcloud_to_graph(jnp.zeros(3), dummy_cloud)
+        self.initial_gnn_params = self.gnn_model.init(gnn_key, dummy_graph)
         
         # 创建优化器
         self.policy_optimizer = optax.chain(
@@ -310,11 +332,12 @@ class CompleteTrainingSystem:
                            gnn_params: Any,
                            initial_state: DroneState,
                            target_position: chex.Array) -> Tuple[float, Dict[str, Any]]:
-            """完整损失函数（纯计算）"""
+            """完整损失函数（纯计算）- 【修复版】"""
             
-            # 执行基础轨迹rollout
-            final_carry, trajectory_outputs = self.batch_system.rollout_single(
+            # 【关键修复5】调用正确的完整rollout函数
+            final_carry, trajectory_outputs = self.batch_system.rollout_single_complete(
                 policy_params=policy_params,
+                gnn_params=gnn_params,  # 传入GNN参数
                 initial_state=initial_state,
                 target_position=target_position,
                 trajectory_length=self.config.trajectory_length
@@ -329,8 +352,10 @@ class CompleteTrainingSystem:
             final_position = final_carry.drone_state.position
             losses['final_position'] = final_position
             losses['final_distance_loss'] = jnp.linalg.norm(final_position - target_position)
-            losses['mean_cbf_value'] = 0.5  # 模拟值
-            losses['safety_violations'] = 0.0  # 模拟值
+            
+            # 【关键修复6】从轨迹输出中提取真实的CBF信息
+            losses['mean_cbf_value'] = jnp.mean(trajectory_outputs.cbf_value)
+            losses['safety_violations'] = jnp.sum(trajectory_outputs.safety_violation > 0)
             
             return losses['total_loss'], losses
         
@@ -344,12 +369,16 @@ class CompleteTrainingSystem:
     
     def _compute_complete_losses(self, trajectory_outputs: LoopOutput,
                                target_position: chex.Array) -> Dict[str, float]:
-        """计算完整损失（纯计算）"""
+        """计算完整损失（纯计算）- 【修复版】"""
         
         # 基础损失
         positions = trajectory_outputs.drone_state.position
         velocities = trajectory_outputs.drone_state.velocity
         actions = trajectory_outputs.action
+        
+        # 【关键修复7】使用真实的CBF数据
+        cbf_values = trajectory_outputs.cbf_value
+        safety_violations = trajectory_outputs.safety_violation
         
         # 1. 物理驱动损失
         target_velocity = jnp.array([2.0, 2.0, 0.0])  # 期望速度
@@ -361,9 +390,9 @@ class CompleteTrainingSystem:
         control_changes = jnp.diff(actions, axis=0)
         jerk_loss = jnp.mean(jnp.sum(control_changes**2, axis=1))
         
-        # 2. CBF损失（简化版本）
-        cbf_unsafe_penalty = 0.0  # 模拟安全场景
-        cbf_derivative_penalty = 0.0
+        # 2. 真实CBF损失
+        cbf_unsafe_penalty = jnp.mean(jnp.maximum(0, -cbf_values))  # 惩罚负CBF值
+        cbf_derivative_penalty = jnp.mean(safety_violations)  # 安全违规惩罚
         
         # 3. 任务损失
         final_position = positions[-1]
@@ -501,7 +530,7 @@ def test_gradient_flow(config: TrainingConfig = None) -> bool:
 
 
 def test_complete_gradient_flow() -> bool:
-    """测试完整系统梯度流"""
+    """测试完整系统梯度流 - 【修复版】"""
     
     print("开始完整系统梯度流测试...")
     
@@ -550,6 +579,8 @@ def test_complete_gradient_flow() -> bool:
             return True
         else:
             print("❌ 警告: 某些网络的梯度异常")
+            print(f"策略网络梯度OK: {policy_grad_ok}")
+            print(f"GNN梯度OK: {gnn_grad_ok}")
             return False
         
     except Exception as e:
