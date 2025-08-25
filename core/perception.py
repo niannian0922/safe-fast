@@ -1,348 +1,417 @@
 """
-感知模块：点云处理和图神经网络 - 完全修复版
-基于GCBF+的GNN架构，正确集成CBF计算，确保梯度流通
+修复的感知模块 - 确保GNN正确计算CBF值和梯度
+参考GCBF+论文的图神经网络架构
 """
 
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
 import jraph
-from typing import Tuple, NamedTuple, Optional, Any, Dict
+from flax import linen as nn
+from typing import Dict, Tuple, Optional, Callable
 import chex
+from functools import partial
 
-
-def pointcloud_to_graph(drone_position: chex.Array,
-                       point_cloud: chex.Array,
-                       sensing_radius: float = 5.0,
-                       max_neighbors: int = 16) -> jraph.GraphsTuple:
+class GraphAttentionLayer(nn.Module):
     """
-    将点云数据转换为图结构 - 修复版，确保总是有有效边
+    图注意力层 - 参考GCBF+论文的图注意力机制
+    满足Definition 1中的条件1和条件2
+    """
+    hidden_dim: int
+    num_heads: int = 4
+    dropout_rate: float = 0.1
+    sensing_radius: float = 2.0
+    
+    @nn.compact
+    def __call__(self, nodes, edges, adjacency, training=True):
+        """
+        Args:
+            nodes: 节点特征 [n_nodes, node_dim]
+            edges: 边特征 [n_nodes, n_nodes, edge_dim]  
+            adjacency: 邻接矩阵 [n_nodes, n_nodes]
+            training: 训练模式标志
+        
+        Returns:
+            updated_nodes: 更新后的节点特征 [n_nodes, hidden_dim]
+            attention_weights: 注意力权重 [n_nodes, n_nodes]
+        """
+        n_nodes = nodes.shape[0]
+        node_dim = nodes.shape[-1]
+        edge_dim = edges.shape[-1]
+        head_dim = self.hidden_dim // self.num_heads
+        
+        # 线性投影
+        W_q = self.param('W_q', nn.initializers.xavier_uniform(), (node_dim, self.hidden_dim))
+        W_k = self.param('W_k', nn.initializers.xavier_uniform(), (node_dim, self.hidden_dim)) 
+        W_v = self.param('W_v', nn.initializers.xavier_uniform(), (node_dim, self.hidden_dim))
+        W_e = self.param('W_e', nn.initializers.xavier_uniform(), (edge_dim, self.hidden_dim))
+        
+        # 查询、键、值
+        Q = nodes @ W_q  # [n_nodes, hidden_dim]
+        K = nodes @ W_k  # [n_nodes, hidden_dim] 
+        V = nodes @ W_v  # [n_nodes, hidden_dim]
+        
+        # 边特征投影
+        E = edges @ W_e  # [n_nodes, n_nodes, hidden_dim]
+        
+        # 多头注意力
+        Q = Q.reshape(n_nodes, self.num_heads, head_dim)  # [n_nodes, num_heads, head_dim]
+        K = K.reshape(n_nodes, self.num_heads, head_dim)
+        V = V.reshape(n_nodes, self.num_heads, head_dim)  
+        E = E.reshape(n_nodes, n_nodes, self.num_heads, head_dim)
+        
+        # 计算注意力分数
+        # Q: [n_nodes, num_heads, head_dim]
+        # K: [n_nodes, num_heads, head_dim] 
+        # 计算 Q @ K^T: [n_nodes, n_nodes, num_heads]
+        attention_scores = jnp.einsum('ihd,jhd->ijh', Q, K) / jnp.sqrt(head_dim)
+        
+        # 添加边特征到注意力分数
+        edge_contribution = jnp.einsum('ihd,ijhd->ijh', Q, E) / jnp.sqrt(head_dim)
+        attention_scores = attention_scores + edge_contribution
+        
+        # 应用距离掩码 - 这是满足Definition 1条件的关键
+        # 计算节点间距离（假设前3维是位置）
+        positions = nodes[:, :3]  # [n_nodes, 3]
+        pos_i = positions[:, None, :]  # [n_nodes, 1, 3]
+        pos_j = positions[None, :, :]  # [1, n_nodes, 3]  
+        distances = jnp.linalg.norm(pos_i - pos_j, axis=-1)  # [n_nodes, n_nodes]
+        
+        # 距离掩码：超出感知半径的设为-inf
+        distance_mask = distances >= self.sensing_radius
+        attention_scores = jnp.where(
+            distance_mask[:, :, None], 
+            -jnp.inf, 
+            attention_scores
+        )
+        
+        # 应用邻接掩码
+        adjacency_mask = ~adjacency
+        attention_scores = jnp.where(
+            adjacency_mask[:, :, None],
+            -jnp.inf,
+            attention_scores
+        )
+        
+        # 对角掩码（节点不注意自己）
+        eye_mask = jnp.eye(n_nodes, dtype=bool)
+        attention_scores = jnp.where(
+            eye_mask[:, :, None],
+            -jnp.inf, 
+            attention_scores
+        )
+        
+        # Softmax注意力权重
+        attention_weights = jax.nn.softmax(attention_scores, axis=1)  # [n_nodes, n_nodes, num_heads]
+        
+        # 处理NaN（当所有权重都是-inf时）
+        attention_weights = jnp.where(
+            jnp.isnan(attention_weights),
+            0.0,
+            attention_weights
+        )
+        
+        # 应用注意力权重到值
+        # V: [n_nodes, num_heads, head_dim]
+        # attention_weights: [n_nodes, n_nodes, num_heads] 
+        attended_values = jnp.einsum('ijh,jhd->ihd', attention_weights, V)  # [n_nodes, num_heads, head_dim]
+        
+        # 合并多头
+        attended_values = attended_values.reshape(n_nodes, self.hidden_dim)  # [n_nodes, hidden_dim]
+        
+        # 残差连接和层归一化
+        if node_dim == self.hidden_dim:
+            output = nn.LayerNorm()(attended_values + nodes)
+        else:
+            # 维度不匹配时，使用线性投影
+            W_res = self.param('W_res', nn.initializers.xavier_uniform(), (node_dim, self.hidden_dim))
+            output = nn.LayerNorm()(attended_values + nodes @ W_res)
+        
+        # Dropout
+        if training:
+            output = nn.Dropout(rate=self.dropout_rate, deterministic=False)(output)
+        
+        # 返回平均注意力权重用于可视化
+        avg_attention_weights = jnp.mean(attention_weights, axis=-1)  # [n_nodes, n_nodes]
+        
+        return output, avg_attention_weights
+
+class GCBFGNN(nn.Module):
+    """
+    GCBF图神经网络 - 参考GCBF+论文架构
+    输出CBF值和梯度
+    """
+    hidden_dims: Tuple[int, ...] = (128, 128, 64)
+    num_attention_heads: int = 4
+    num_layers: int = 3
+    dropout_rate: float = 0.1
+    sensing_radius: float = 2.0
+    output_cbf_gradients: bool = True
+    
+    @nn.compact 
+    def __call__(self, graph_data: Dict[str, jnp.ndarray], training=True) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        前向传播
+        
+        Args:
+            graph_data: 包含nodes, edges, adjacency的图数据
+            training: 训练模式
+            
+        Returns:
+            cbf_values: CBF值 [n_nodes,]
+            cbf_gradients: CBF梯度 [n_nodes, state_dim] (如果启用)
+        """
+        nodes = graph_data['nodes']        # [n_nodes, node_dim]
+        edges = graph_data['edges']        # [n_nodes, n_nodes, edge_dim]
+        adjacency = graph_data['adjacency']  # [n_nodes, n_nodes]
+        
+        n_nodes = nodes.shape[0]
+        node_dim = nodes.shape[-1]
+        
+        # 初始特征投影
+        current_features = nn.Dense(self.hidden_dims[0])(nodes)
+        
+        # 多层图注意力
+        attention_weights_history = []
+        for layer_idx, hidden_dim in enumerate(self.hidden_dims):
+            layer = GraphAttentionLayer(
+                hidden_dim=hidden_dim,
+                num_heads=self.num_attention_heads,
+                dropout_rate=self.dropout_rate,
+                sensing_radius=self.sensing_radius,
+                name=f'gat_layer_{layer_idx}'
+            )
+            
+            current_features, attention_weights = layer(
+                current_features, edges, adjacency, training=training
+            )
+            attention_weights_history.append(attention_weights)
+            
+            # 中间层的非线性激活
+            if layer_idx < len(self.hidden_dims) - 1:
+                current_features = nn.gelu(current_features)
+        
+        # CBF值输出头
+        cbf_features = nn.Dense(64, name='cbf_hidden')(current_features)
+        cbf_features = nn.gelu(cbf_features)
+        cbf_features = nn.Dense(32, name='cbf_hidden2')(cbf_features)  
+        cbf_features = nn.gelu(cbf_features)
+        cbf_values = nn.Dense(1, name='cbf_output')(cbf_features).squeeze(-1)  # [n_nodes,]
+        
+        if self.output_cbf_gradients:
+            # CBF梯度输出头 - 梯度关于状态的前几维（通常是位置）
+            state_dim = min(node_dim, 6)  # 通常考虑位置和速度
+            grad_features = nn.Dense(64, name='grad_hidden')(current_features)
+            grad_features = nn.gelu(grad_features)
+            grad_features = nn.Dense(32, name='grad_hidden2')(grad_features)
+            grad_features = nn.gelu(grad_features)  
+            cbf_gradients = nn.Dense(state_dim, name='grad_output')(grad_features)  # [n_nodes, state_dim]
+        else:
+            cbf_gradients = jnp.zeros((n_nodes, node_dim))
+        
+        return cbf_values, cbf_gradients
+
+def pointcloud_to_graph(
+    states: jnp.ndarray,                # [n_agents, state_dim]
+    point_cloud: Optional[jnp.ndarray] = None,  # [n_points, 3] 
+    sensing_radius: float = 2.0,
+    max_neighbors: int = 10
+) -> Dict[str, jnp.ndarray]:
+    """
+    将点云和智能体状态转换为图结构
+    参考GCBF+论文的图构建方法
     
     Args:
-        drone_position: 无人机位置 [3]
-        point_cloud: 点云数据 [N, 3]
+        states: 智能体状态
+        point_cloud: LiDAR点云（可选）
         sensing_radius: 感知半径
         max_neighbors: 最大邻居数
         
     Returns:
-        graph: jraph图结构，保证有边连接
+        graph_data: 图数据字典
     """
+    n_agents = states.shape[0]
+    state_dim = states.shape[1]
     
-    num_points = point_cloud.shape[0]
+    # 提取位置信息
+    positions = states[:, :3]  # [n_agents, 3]
     
-    # 1. 构建节点 - 包括无人机节点和障碍物节点
-    # 节点特征：[node_type(3), position(3)] = 6维
-    drone_node_type = jnp.array([1.0, 0.0, 0.0])  # [agent, obstacle, goal]
-    obstacle_node_type = jnp.array([0.0, 1.0, 0.0])
-    
-    # 组合节点特征
-    drone_features = jnp.concatenate([drone_node_type, drone_position])
-    obstacle_features = jnp.concatenate([
-        jnp.tile(obstacle_node_type[None, :], (num_points, 1)),
-        point_cloud
-    ], axis=1)
-    
-    all_nodes = jnp.concatenate([drone_features[None, :], obstacle_features], axis=0)
-    
-    # 2. 构建边 - 确保总是有边存在
-    # 计算无人机到各点的距离
-    distances = jnp.linalg.norm(point_cloud - drone_position, axis=1)
-    
-    # 按距离排序，选择最近的邻居
-    sorted_indices = jnp.argsort(distances)
-    
-    # 确保至少有一条边 - 选择最近的点，即使超出感知半径
-    min_edges = jnp.minimum(max_neighbors, num_points)
-    min_edges = jnp.maximum(min_edges, 1)  # 至少1条边
-    
-    selected_indices = sorted_indices[:min_edges]
-    selected_distances = distances[selected_indices]
-    
-    # 应用感知半径过滤，但保留至少一条边
-    within_radius_mask = selected_distances < sensing_radius
-    num_within_radius = jnp.sum(within_radius_mask)
-    
-    # 如果没有点在感知半径内，至少保留最近的一个
-    final_mask = jnp.where(
-        num_within_radius > 0,
-        within_radius_mask,
-        jnp.arange(min_edges) == 0  # 只保留最近的点
-    )
-    
-    valid_indices = selected_indices[final_mask]
-    num_valid_edges = jnp.sum(final_mask)
-    
-    # 构建边：从无人机(节点0)到障碍物节点
-    senders = jnp.zeros(num_valid_edges, dtype=jnp.int32)
-    receivers = valid_indices + 1  # +1因为无人机是节点0
-    
-    # 3. 边特征：[相对位置(3), 距离(1)] = 4维
-    relative_positions = point_cloud[valid_indices] - drone_position
-    edge_distances = jnp.linalg.norm(relative_positions, axis=1, keepdims=True)
-    edge_features = jnp.concatenate([relative_positions, edge_distances], axis=1)
-    
-    # 4. 构建jraph图
-    graph = jraph.GraphsTuple(
-        nodes=all_nodes,  # [num_nodes, 6]
-        edges=edge_features,  # [num_edges, 4]
-        senders=senders,  # [num_edges]
-        receivers=receivers,  # [num_edges]
-        n_node=jnp.array([all_nodes.shape[0]]),  # [1]
-        n_edge=jnp.array([senders.shape[0]]),  # [1]
-        globals=None
-    )
-    
-    return graph
-
-
-class CBFGraphNet(nn.Module):
-    """
-    基于GCBF+的图神经网络 - 完全修复版
-    专门设计用于CBF值和梯度计算，确保梯度流通
-    """
-    
-    hidden_dim: int = 64
-    num_layers: int = 2
-    
-    def setup(self):
-        # 编码器
-        self.node_encoder = nn.Dense(self.hidden_dim)
-        self.edge_encoder = nn.Dense(self.hidden_dim)
+    # 如果有点云，将其作为额外节点
+    if point_cloud is not None:
+        n_points = point_cloud.shape[0]
+        # 为点云创建特征（位置 + 零速度 + 类型标识）
+        point_features = jnp.concatenate([
+            point_cloud,                                    # 位置 [n_points, 3] 
+            jnp.zeros((n_points, max(0, state_dim - 4))),   # 填充到匹配状态维度
+            jnp.ones((n_points, 1)) * 2                     # 类型标识：2=障碍物点
+        ], axis=1)
         
-        # 消息传递网络
-        self.message_nets = [
-            nn.Dense(self.hidden_dim) for _ in range(self.num_layers)
-        ]
-        
-        # 更新网络
-        self.update_nets = [
-            nn.Dense(self.hidden_dim) for _ in range(self.num_layers)
-        ]
-        
-        # 输出网络 - 直接输出CBF值
-        self.cbf_output = nn.Sequential([
-            nn.Dense(self.hidden_dim // 2),
-            nn.relu,
-            nn.Dense(1)
-        ])
+        # 合并智能体和点云节点
+        all_positions = jnp.concatenate([positions, point_cloud], axis=0)
+        agent_features = jnp.concatenate([
+            states,
+            jnp.ones((n_agents, 1)) * 1  # 类型标识：1=智能体
+        ], axis=1)
+        node_features = jnp.concatenate([agent_features, point_features], axis=0)
+        n_total_nodes = n_agents + n_points
+    else:
+        # 只有智能体节点
+        all_positions = positions
+        node_features = jnp.concatenate([
+            states,
+            jnp.ones((n_agents, 1)) * 1  # 类型标识：1=智能体  
+        ], axis=1)
+        n_total_nodes = n_agents
     
-    def __call__(self, graph: jraph.GraphsTuple) -> float:
-        """
-        前向传播 - 只输出CBF值，梯度通过JAX自动计算
-        
-        Args:
-            graph: 输入图
-            
-        Returns:
-            h: CBF值 (标量)
-        """
-        
-        # 编码节点和边特征
-        nodes = self.node_encoder(graph.nodes)  # [num_nodes, hidden_dim]
-        edges = self.edge_encoder(graph.edges)  # [num_edges, hidden_dim]
-        
-        # 多层消息传递
-        for layer_idx in range(self.num_layers):
-            # 计算消息
-            messages = self.message_nets[layer_idx](edges)
-            
-            # 聚合消息到接收节点
-            aggregated = jraph.segment_sum(
-                messages,
-                graph.receivers,
-                num_segments=graph.nodes.shape[0]
-            )
-            
-            # 更新节点
-            nodes = self.update_nets[layer_idx](nodes + aggregated)
-            nodes = nn.relu(nodes)
-        
-        # 提取无人机节点特征(节点0)并计算CBF值
-        drone_features = nodes[0]  # [hidden_dim]
-        cbf_value = self.cbf_output(drone_features)  # [1]
-        
-        return cbf_value.squeeze()  # 返回标量
-
-
-def create_perception_system(config: Dict[str, Any] = None) -> Tuple[CBFGraphNet, Any]:
-    """
-    创建感知系统 - 修复版
+    # 构建邻接矩阵
+    pos_i = all_positions[:, None, :]  # [n_total_nodes, 1, 3]
+    pos_j = all_positions[None, :, :]  # [1, n_total_nodes, 3]
+    distances = jnp.linalg.norm(pos_i - pos_j, axis=-1)  # [n_total_nodes, n_total_nodes]
     
-    Returns:
-        (gnn_model, perception_fn): GNN模型和感知函数
-    """
+    # 邻接关系：在感知半径内且不是自身
+    adjacency = (distances < sensing_radius) & (distances > 0)
     
-    if config is None:
-        config = {
-            'sensing_radius': 5.0,
-            'max_neighbors': 16,
-            'hidden_dim': 64,
-            'num_layers': 2
-        }
-    
-    # 创建GNN模型
-    gnn_model = CBFGraphNet(
-        hidden_dim=config['hidden_dim'],
-        num_layers=config['num_layers']
-    )
-    
-    def perception_fn(gnn_params: Any,
-                     drone_position: chex.Array,
-                     point_cloud: chex.Array) -> Tuple[float, chex.Array]:
-        """
-        感知函数 - 计算CBF值和梯度，完全JAX兼容
-        
-        Args:
-            gnn_params: GNN参数
-            drone_position: 无人机位置 [3]
-            point_cloud: 点云 [N, 3]
-            
-        Returns:
-            (h, grad_h): CBF值和梯度
-        """
-        
-        # 构建图
-        graph = pointcloud_to_graph(
-            drone_position,
-            point_cloud,
-            config['sensing_radius'],
-            config['max_neighbors']
+    # 限制邻居数量
+    def limit_neighbors(adj_row, dist_row):
+        # 找到距离最近的max_neighbors个邻居
+        neighbor_indices = jnp.argsort(dist_row)
+        # 保留前max_neighbors个邻居
+        limited_adj = jnp.zeros_like(adj_row)
+        limited_adj = limited_adj.at[neighbor_indices[:max_neighbors]].set(
+            adj_row[neighbor_indices[:max_neighbors]]
         )
-        
-        # 定义CBF函数用于梯度计算
-        def cbf_fn(pos):
-            # 修改图中无人机的位置
-            modified_node_features = graph.nodes.at[0, 3:6].set(pos)
-            modified_graph = graph._replace(nodes=modified_node_features)
-            return gnn_model.apply(gnn_params, modified_graph)
-        
-        # 计算CBF值
-        h = cbf_fn(drone_position)
-        
-        # 计算CBF梯度
-        grad_h = jax.grad(cbf_fn)(drone_position)
-        
-        return h, grad_h
+        return limited_adj
     
-    return gnn_model, perception_fn
+    adjacency = jax.vmap(limit_neighbors)(adjacency, distances)
+    
+    # 构建边特征
+    rel_positions = pos_i - pos_j  # [n_total_nodes, n_total_nodes, 3]
+    rel_distances = distances[:, :, None]  # [n_total_nodes, n_total_nodes, 1]
+    
+    # 边特征：相对位置 + 相对距离
+    edge_features = jnp.concatenate([
+        rel_positions,    # [n_total_nodes, n_total_nodes, 3]
+        rel_distances     # [n_total_nodes, n_total_nodes, 1]
+    ], axis=-1)
+    
+    # 如果有速度信息，添加相对速度
+    if state_dim >= 6:
+        velocities = jnp.concatenate([
+            states[:, 3:6],  # 智能体速度
+            jnp.zeros((n_total_nodes - n_agents, 3)) if point_cloud is not None else jnp.empty((0, 3))
+        ], axis=0)
+        vel_i = velocities[:, None, :]  # [n_total_nodes, 1, 3]
+        vel_j = velocities[None, :, :]  # [1, n_total_nodes, 3]
+        rel_velocities = vel_i - vel_j  # [n_total_nodes, n_total_nodes, 3]
+        
+        edge_features = jnp.concatenate([
+            edge_features,    # [..., 4]
+            rel_velocities    # [..., 3] 
+        ], axis=-1)
+    
+    graph_data = {
+        'nodes': node_features,      # [n_total_nodes, feature_dim]
+        'edges': edge_features,      # [n_total_nodes, n_total_nodes, edge_dim]
+        'adjacency': adjacency,      # [n_total_nodes, n_total_nodes]
+        'positions': all_positions,  # [n_total_nodes, 3]
+        'n_agents': n_agents,
+        'n_total_nodes': n_total_nodes
+    }
+    
+    return graph_data
 
+@jax.jit
+def batch_pointcloud_to_graph(
+    batch_states: jnp.ndarray,         # [batch_size, n_agents, state_dim]
+    batch_point_clouds: Optional[jnp.ndarray] = None,  # [batch_size, n_points, 3]
+    sensing_radius: float = 2.0,
+    max_neighbors: int = 10
+) -> Dict[str, jnp.ndarray]:
+    """批量处理点云到图的转换"""
+    
+    def convert_single_batch(states, point_cloud=None):
+        if point_cloud is None:
+            return pointcloud_to_graph(states, None, sensing_radius, max_neighbors)
+        else:
+            return pointcloud_to_graph(states, point_cloud, sensing_radius, max_neighbors)
+    
+    if batch_point_clouds is None:
+        # 没有点云的情况
+        batch_graphs = jax.vmap(lambda s: convert_single_batch(s))(batch_states)
+    else:
+        # 有点云的情况
+        batch_graphs = jax.vmap(convert_single_batch)(batch_states, batch_point_clouds)
+    
+    return batch_graphs
 
-def create_dummy_pointcloud(rng_key: chex.PRNGKey,
-                          num_points: int = 20,
-                          bounds: float = 8.0,
-                          min_distance: float = 1.0) -> chex.Array:
-    """创建虚拟点云 - 确保点不太近"""
-    points = jax.random.uniform(
-        rng_key,
-        (num_points, 3),
-        minval=-bounds,
-        maxval=bounds
+def create_gnn_model(config: Dict) -> GCBFGNN:
+    """创建GNN模型"""
+    return GCBFGNN(
+        hidden_dims=config.get('gnn_hidden_dims', (128, 128, 64)),
+        num_attention_heads=config.get('gnn_attention_heads', 4),
+        num_layers=config.get('gnn_num_layers', 3),
+        dropout_rate=config.get('gnn_dropout_rate', 0.1),
+        sensing_radius=config.get('sensing_radius', 2.0),
+        output_cbf_gradients=config.get('output_cbf_gradients', True)
     )
-    
-    # 确保点与原点有最小距离
-    distances = jnp.linalg.norm(points, axis=1)
-    too_close_mask = distances < min_distance
-    
-    # 将太近的点推远
-    directions = points / (distances[:, None] + 1e-8)
-    adjusted_points = jnp.where(
-        too_close_mask[:, None],
-        directions * min_distance,
-        points
-    )
-    
-    return adjusted_points
 
-
-def test_perception_system():
-    """测试感知系统 - 完整版"""
-    print("🧠 测试感知系统")
-    print("=" * 40)
+def initialize_gnn_params(
+    model: GCBFGNN,
+    rng_key: jax.random.PRNGKey,
+    sample_graph_data: Dict[str, jnp.ndarray]
+) -> Dict:
+    """初始化GNN参数"""
     
-    rng_key = jax.random.PRNGKey(42)
-    
-    # 创建测试数据
-    drone_pos = jnp.array([0.0, 0.0, 2.0])
-    point_cloud = create_dummy_pointcloud(rng_key, num_points=15)
-    
-    print(f"无人机位置: {drone_pos}")
-    print(f"点云形状: {point_cloud.shape}")
-    
-    # 测试图构建
-    graph = pointcloud_to_graph(drone_pos, point_cloud)
-    print(f"图节点数: {graph.nodes.shape[0]}")
-    print(f"图边数: {graph.edges.shape[0]}")
-    print(f"节点特征维度: {graph.nodes.shape[1]}")
-    print(f"边特征维度: {graph.edges.shape[1]}")
-    
-    # 验证图结构
-    assert graph.edges.shape[0] > 0, "图必须有边"
-    assert graph.nodes.shape[0] == point_cloud.shape[0] + 1, "节点数错误"
-    
-    # 创建感知系统
-    gnn_model, perception_fn = create_perception_system()
+    # 创建样例输入
+    dummy_input = {
+        'nodes': sample_graph_data['nodes'],
+        'edges': sample_graph_data['edges'], 
+        'adjacency': sample_graph_data['adjacency']
+    }
     
     # 初始化参数
-    gnn_params = gnn_model.init(rng_key, graph)
+    params = model.init(rng_key, dummy_input, training=False)
     
-    print("GNN参数结构:")
-    for key, value in jax.tree_util.tree_flatten_with_path(gnn_params)[0]:
-        path_str = '.'.join(str(k) for k in key)
-        print(f"  {path_str}: {value.shape}")
+    return params
+
+# 用于验证图结构的辅助函数
+def validate_graph_structure(graph_data: Dict[str, jnp.ndarray]) -> bool:
+    """验证图结构的完整性"""
     
-    # 测试感知函数
-    h, grad_h = perception_fn(gnn_params, drone_pos, point_cloud)
+    required_keys = ['nodes', 'edges', 'adjacency']
+    for key in required_keys:
+        if key not in graph_data:
+            print(f"缺少必要的图数据键: {key}")
+            return False
     
-    print(f"\nCBF值: {h:.6f}")
-    print(f"CBF梯度: {grad_h}")
-    print(f"梯度范数: {jnp.linalg.norm(grad_h):.6f}")
+    nodes = graph_data['nodes']
+    edges = graph_data['edges'] 
+    adjacency = graph_data['adjacency']
     
-    # 验证输出
-    assert not jnp.isnan(h), "CBF值不应为NaN"
-    assert not jnp.any(jnp.isnan(grad_h)), "CBF梯度不应为NaN"
-    assert jnp.linalg.norm(grad_h) > 1e-8, "CBF梯度应该非零"
+    n_nodes = nodes.shape[0]
     
-    # 测试梯度流
-    print("\n测试GNN梯度流...")
+    # 检查维度一致性
+    if edges.shape[:2] != (n_nodes, n_nodes):
+        print(f"边特征维度不匹配: {edges.shape[:2]} vs ({n_nodes}, {n_nodes})")
+        return False
+        
+    if adjacency.shape != (n_nodes, n_nodes):
+        print(f"邻接矩阵维度不匹配: {adjacency.shape} vs ({n_nodes}, {n_nodes})")
+        return False
     
-    def loss_fn(gnn_params_test):
-        h_val, grad_h_val = perception_fn(gnn_params_test, drone_pos, point_cloud)
-        return h_val**2 + 0.1 * jnp.sum(grad_h_val**2)
+    # 检查邻接矩阵的对称性（无向图）
+    if not jnp.allclose(adjacency, adjacency.T, atol=1e-6):
+        print("警告: 邻接矩阵不对称")
     
-    grad_fn = jax.grad(loss_fn)
-    grads = grad_fn(gnn_params)
-    
-    def tree_norm(tree):
-        return jnp.sqrt(sum(jnp.sum(leaf**2) for leaf in jax.tree_util.tree_leaves(tree)))
-    
-    grad_norm = tree_norm(grads)
-    print(f"GNN参数梯度范数: {grad_norm:.8f}")
-    
-    assert grad_norm > 1e-6, f"GNN梯度范数过小: {grad_norm}"
-    assert not jnp.isnan(grad_norm), "GNN梯度不应包含NaN"
-    
-    # 测试不同位置的CBF值
-    print("\n测试CBF对位置的敏感性...")
-    positions = [
-        jnp.array([0.0, 0.0, 2.0]),
-        jnp.array([1.0, 0.0, 2.0]),  # 稍微移动
-        jnp.array([0.0, 1.0, 2.0]),  # y方向移动
-    ]
-    
-    cbf_values = []
-    for pos in positions:
-        h_pos, _ = perception_fn(gnn_params, pos, point_cloud)
-        cbf_values.append(h_pos)
-        print(f"位置 {pos} -> CBF: {h_pos:.6f}")
-    
-    # CBF值应该随位置变化
-    cbf_variance = jnp.var(jnp.array(cbf_values))
-    print(f"CBF值方差: {cbf_variance:.8f}")
-    assert cbf_variance > 1e-6, f"CBF值对位置变化不敏感: {cbf_variance}"
-    
-    print("\n✅ 感知系统测试通过!")
+    print(f"图结构验证通过: {n_nodes} 节点, {jnp.sum(adjacency)} 条边")
     return True
 
-
-if __name__ == "__main__":
-    test_perception_system()
+# 主要导出函数  
+__all__ = [
+    'GraphAttentionLayer',
+    'GCBFGNN', 
+    'pointcloud_to_graph',
+    'batch_pointcloud_to_graph',
+    'create_gnn_model',
+    'initialize_gnn_params',
+    'validate_graph_structure'
+]
