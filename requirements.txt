@@ -5,7 +5,7 @@ flax>=0.7.5
 optax>=0.1.7
 
 # Mathematical optimization
-qpax>=0.1.0
+qpax>=0.0.9
 jraph>=0.0.6.dev0
 
 # Scientific computing
