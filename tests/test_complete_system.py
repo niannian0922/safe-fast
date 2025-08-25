@@ -1,3 +1,5 @@
+# F:\safe_agile_flight\tests\test_complete_system.py (修复后)
+
 #!/usr/bin/env python3
 """
 完整系统集成测试 - 修复JIT兼容性问题
@@ -110,8 +112,11 @@ class TestCompleteSystem:
         print("\n测试安全约束...")
         
         try:
-            from core.safety import safety_filter
+            from core.safety import safety_filter, SafetyParams
             
+            # 【已修复】: 实例化并传递 SafetyParams 对象
+            safety_params = SafetyParams()
+
             # 基本安全滤波器测试
             u_nom = jnp.array([2.0, 1.0, 8.0])
             h_safe = 1.5
@@ -122,7 +127,8 @@ class TestCompleteSystem:
                 u_nom=u_nom,
                 h=h_safe,
                 grad_h=grad_h,
-                drone_velocity=velocity
+                drone_velocity=velocity,
+                safety_params=safety_params
             )
             
             print(f"名义指令: {u_nom}")

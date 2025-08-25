@@ -1,3 +1,5 @@
+# F:\safe_agile_flight\core\safety.py (修复后)
+
 """
 安全模块：基于qpax的可微分安全层实现 - 完全修复JAX兼容性
 实现GCBF+的QP安全约束
@@ -110,7 +112,7 @@ def safety_filter(u_nom: chex.Array,
                  h: float,
                  grad_h: chex.Array,
                  drone_velocity: chex.Array,
-                 safety_params: SafetyParams = None) -> chex.Array:
+                 safety_params: SafetyParams) -> chex.Array:
     """
     安全滤波器：解决CBF-QP优化问题 - 完全JAX兼容版本
     
@@ -119,15 +121,14 @@ def safety_filter(u_nom: chex.Array,
         h: CBF值
         grad_h: CBF梯度 [3]
         drone_velocity: 当前速度 [3]
-        safety_params: 安全参数
+        safety_params: 安全参数 (必需)
         
     Returns:
         u_safe: 安全的控制输入 [3]
     """
     
-    # 处理safety_params为None的情况
-    if safety_params is None:
-        safety_params = SafetyParams()
+    # 【已修复】: 移除`if safety_params is None:`检查，强制调用者提供参数。
+    # 这使得函数本身是纯净且可JIT编译的。
     
     # 构建QP矩阵
     Q, q, G, h_constraint = construct_cbf_qp_matrices(

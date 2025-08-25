@@ -1,3 +1,5 @@
+# F:\safe_agile_flight\core\physics.py (修复后)
+
 """
 JAX原生可微分物理引擎实现 - 完全修复JIT兼容性
 基于点质量模型的无人机动力学仿真
@@ -12,7 +14,7 @@ import chex
 class DroneState(NamedTuple):
     """无人机状态表示"""
     position: chex.Array  # [3] - (x, y, z)
-    velocity: chex.Array  # [3] - (vx, vy, vz) 
+    velocity: chex.Array  # [3] - (vx, vy, vz)
     orientation: chex.Array  # [4] - quaternion (w, x, y, z)
     angular_velocity: chex.Array  # [3] - (wx, wy, wz)
 
@@ -45,7 +47,7 @@ def quaternion_to_rotation_matrix(q: chex.Array) -> chex.Array:
     return R
 
 
-def thrust_to_body_acceleration(thrust_command: chex.Array, 
+def thrust_to_body_acceleration(thrust_command: chex.Array,
                                orientation: chex.Array,
                                params: DroneParams) -> chex.Array:
     """将推力命令转换为机体加速度 - 完全JAX兼容版本"""
@@ -98,11 +100,11 @@ def control_filter(current_thrust: chex.Array,
     return filtered_thrust
 
 
-def dynamics_step(state: DroneState, 
+def dynamics_step(state: DroneState,
                  action: chex.Array,
                  params: DroneParams,
                  dt: float,
-                 previous_thrust: chex.Array = None) -> Tuple[DroneState, chex.Array]:
+                 previous_thrust: chex.Array) -> Tuple[DroneState, chex.Array]:
     """
     单步动力学积分 - 完全JAX兼容版本，移除所有Python条件语句
     
@@ -111,22 +113,18 @@ def dynamics_step(state: DroneState,
         action: 控制输入 [3] - 期望推力向量 (ax, ay, az)
         params: 物理参数
         dt: 时间步长
-        previous_thrust: 上一步的实际推力（用于控制滤波）
+        previous_thrust: 上一步的实际推力（用于控制滤波），必须是一个有效的JAX数组
     
     Returns:
         (next_state, actual_thrust): 下一状态和实际施加的推力
     """
     
-    # 处理previous_thrust：如果未提供，使用action作为默认值
-    # 在JAX中，我们总是传入一个值，所以这里简化处理
-    actual_previous_thrust = jnp.where(
-        previous_thrust is not None,
-        previous_thrust,
-        action  # 默认值
-    ) if previous_thrust is not None else action
+    # 【已修复】: 移除所有Python条件判断。
+    # `previous_thrust` 在scan循环中始终是一个有效的JAX数组。
+    # 在循环开始时，它被初始化为jnp.zeros(3)。
     
     # 控制滤波（模拟控制器响应延迟）
-    actual_thrust = control_filter(actual_previous_thrust, action, params, dt)
+    actual_thrust = control_filter(previous_thrust, action, params, dt)
     
     # 计算推力产生的加速度
     thrust_accel = thrust_to_body_acceleration(actual_thrust, state.orientation, params)
@@ -210,14 +208,15 @@ def test_physics_jit_compatibility():
     params = create_default_params()
     action = jnp.array([0.0, 0.0, 5.0])
     dt = 0.01
+    previous_thrust = jnp.zeros(3) # 必须提供一个有效的初始值
     
     # 测试基础函数
-    new_state, thrust = dynamics_step(state, action, params, dt)
+    new_state, thrust = dynamics_step(state, action, params, dt, previous_thrust)
     print(f"✅ 基础物理步进正常")
     print(f"位置变化: {jnp.linalg.norm(new_state.position):.6f}")
     
     # 测试JIT编译
-    new_state_jit, thrust_jit = dynamics_step_jit(state, action, params, dt)
+    new_state_jit, thrust_jit = dynamics_step_jit(state, action, params, dt, previous_thrust)
     print(f"✅ JIT编译版本正常")
     
     # 验证结果一致性
@@ -233,7 +232,8 @@ def test_physics_jit_compatibility():
     # 测试梯度流
     def loss_fn(action_test):
         state_test = create_initial_state()
-        new_state_test, _ = dynamics_step(state_test, action_test, params, dt)
+        prev_thrust_test = jnp.zeros(3)
+        new_state_test, _ = dynamics_step(state_test, action_test, params, dt, prev_thrust_test)
         return jnp.sum(new_state_test.position**2)
     
     grad_fn = jax.grad(loss_fn)
