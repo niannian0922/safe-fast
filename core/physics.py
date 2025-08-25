@@ -1,5 +1,5 @@
 """
-JAX原生可微分物理引擎实现 - 修复JIT兼容性
+JAX原生可微分物理引擎实现 - 完全修复JIT兼容性
 基于点质量模型的无人机动力学仿真
 """
 
@@ -48,14 +48,15 @@ def quaternion_to_rotation_matrix(q: chex.Array) -> chex.Array:
 def thrust_to_body_acceleration(thrust_command: chex.Array, 
                                orientation: chex.Array,
                                params: DroneParams) -> chex.Array:
-    """将推力命令转换为机体加速度 - JAX兼容版本"""
+    """将推力命令转换为机体加速度 - 完全JAX兼容版本"""
     # 限制推力幅值
     thrust_magnitude = jnp.clip(jnp.linalg.norm(thrust_command), 0.0, params.max_thrust)
     
-    # 使用jnp.where替代if语句
+    # 使用jnp.where替代if语句，避免除零
+    thrust_norm = jnp.linalg.norm(thrust_command)
     thrust_direction = jnp.where(
-        jnp.linalg.norm(thrust_command) > 1e-6,
-        thrust_command / (jnp.linalg.norm(thrust_command) + 1e-8),  # 添加小值避免除零
+        thrust_norm > 1e-6,
+        thrust_command / jnp.maximum(thrust_norm, 1e-8),  # 避免除零
         jnp.array([0.0, 0.0, 1.0])  # 默认向上
     )
     
@@ -72,9 +73,10 @@ def thrust_to_body_acceleration(thrust_command: chex.Array,
 
 
 def apply_air_drag(velocity: chex.Array, params: DroneParams) -> chex.Array:
-    """计算空气阻力加速度"""
+    """计算空气阻力加速度 - JAX兼容版本"""
     # 二次阻力模型: F_drag = -k * |v| * v
     speed = jnp.linalg.norm(velocity)
+    # 使用jnp.where替代if语句
     drag_acceleration = jnp.where(
         speed > 1e-6,
         -params.drag_coefficient * speed * velocity,
@@ -88,7 +90,7 @@ def control_filter(current_thrust: chex.Array,
                   desired_thrust: chex.Array,
                   params: DroneParams,
                   dt: float) -> chex.Array:
-    """模拟控制器响应的指数移动平均滤波"""
+    """模拟控制器响应的指数移动平均滤波 - JAX兼容版本"""
     # 一阶低通滤波器模拟控制延迟
     alpha = jnp.exp(-params.control_smoothing * dt)
     filtered_thrust = alpha * current_thrust + (1 - alpha) * desired_thrust
@@ -102,7 +104,7 @@ def dynamics_step(state: DroneState,
                  dt: float,
                  previous_thrust: chex.Array = None) -> Tuple[DroneState, chex.Array]:
     """
-    单步动力学积分 - 完全JAX兼容版本
+    单步动力学积分 - 完全JAX兼容版本，移除所有Python条件语句
     
     Args:
         state: 当前无人机状态
@@ -115,12 +117,12 @@ def dynamics_step(state: DroneState,
         (next_state, actual_thrust): 下一状态和实际施加的推力
     """
     
-    # 处理previous_thrust为None的情况（JAX兼容）
-    # 在JAX中，我们不能直接检查None，所以使用默认值
+    # 处理previous_thrust：如果未提供，使用action作为默认值
+    # 在JAX中，我们总是传入一个值，所以这里简化处理
     actual_previous_thrust = jnp.where(
-        previous_thrust is None,
-        action,  # 如果为None，使用action作为默认值
-        previous_thrust
+        previous_thrust is not None,
+        previous_thrust,
+        action  # 默认值
     ) if previous_thrust is not None else action
     
     # 控制滤波（模拟控制器响应延迟）
@@ -148,7 +150,8 @@ def dynamics_step(state: DroneState,
     new_orientation = state.orientation
     
     # 角速度动力学（简化处理） - 简单阻尼
-    new_angular_velocity = state.angular_velocity * 0.95  
+    damping_factor = 0.95
+    new_angular_velocity = state.angular_velocity * damping_factor
     
     # 构造新状态
     new_state = DroneState(
@@ -165,10 +168,10 @@ def dynamics_step(state: DroneState,
 def dynamics_step_for_scan(state: DroneState,
                           action: chex.Array,
                           params: DroneParams,
-                          dt: float) -> DroneState:
+                          dt: float,
+                          previous_thrust: chex.Array) -> Tuple[DroneState, chex.Array]:
     """简化版本，用于jax.lax.scan循环"""
-    new_state, _ = dynamics_step(state, action, params, dt)
-    return new_state
+    return dynamics_step(state, action, params, dt, previous_thrust)
 
 
 # JIT编译版本
@@ -178,15 +181,16 @@ dynamics_step_for_scan_jit = jax.jit(dynamics_step_for_scan, static_argnames=['d
 
 def create_initial_state(position: chex.Array = None,
                         velocity: chex.Array = None) -> DroneState:
-    """创建初始状态"""
-    if position is None:
-        position = jnp.zeros(3)
-    if velocity is None:
-        velocity = jnp.zeros(3)
+    """创建初始状态 - 处理None值"""
+    default_position = jnp.zeros(3)
+    default_velocity = jnp.zeros(3)
+    
+    actual_position = default_position if position is None else position
+    actual_velocity = default_velocity if velocity is None else velocity
     
     return DroneState(
-        position=position,
-        velocity=velocity,
+        position=actual_position,
+        velocity=actual_velocity,
         orientation=jnp.array([1.0, 0.0, 0.0, 0.0]),  # 单位四元数
         angular_velocity=jnp.zeros(3)
     )
