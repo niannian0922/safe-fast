@@ -1,6 +1,6 @@
 """
 核心BPTT循环实现 - 修复JIT兼容性
-使用jax.lax.scan进行高效的序列处理
+严格分离设置和计算，确保scan函数只包含纯计算
 """
 
 import jax
@@ -27,19 +27,43 @@ class LoopOutput(NamedTuple):
     reward: float
 
 
-def create_scan_function(policy_model: Any,
-                        physics_params: DroneParams,
-                        dt: float,
-                        use_rnn: bool = False):
+def compute_step_reward(current_state: DroneState,
+                       action: chex.Array,
+                       next_state: DroneState) -> float:
+    """计算单步奖励/损失（纯计算函数）"""
+    # 目标位置（暂时固定）
+    target_position = jnp.array([10.0, 10.0, 5.0])
+    
+    # 距离损失
+    distance_to_target = jnp.linalg.norm(next_state.position - target_position)
+    distance_reward = -distance_to_target
+    
+    # 控制成本
+    control_cost = -0.01 * jnp.sum(action**2)
+    
+    # 速度惩罚（避免过快）
+    speed_penalty = -0.001 * jnp.sum(next_state.velocity**2)
+    
+    total_reward = distance_reward + control_cost + speed_penalty
+    
+    return total_reward
+
+
+def create_rollout_functions(policy_model: Any, 
+                           physics_params: DroneParams,
+                           dt: float,
+                           use_rnn: bool = False):
     """
-    创建scan函数，使用闭包避免JIT问题
+    创建rollout相关函数
+    使用闭包分离设置和计算阶段
     """
     
     def scan_function(carry: LoopCarry,
-                     x: Any,  # 当前时间步的外部输入（暂时未使用）
+                     x: Any,  # 外部输入（暂时未使用）
                      policy_params: Any) -> Tuple[LoopCarry, LoopOutput]:
         """
-        单时间步的scan函数
+        纯计算的scan函数
+        通过闭包捕获模型和物理参数
         """
         
         # 提取当前状态
@@ -62,7 +86,7 @@ def create_scan_function(policy_model: Any,
             current_state, action, physics_params, dt, carry.previous_thrust
         )
         
-        # 计算即时奖励/损失（简单版本）
+        # 计算即时奖励
         reward = compute_step_reward(current_state, action, new_drone_state)
         
         # 构造新的carry
@@ -82,32 +106,41 @@ def create_scan_function(policy_model: Any,
         
         return new_carry, output
     
-    return scan_function
-
-
-def compute_step_reward(current_state: DroneState,
-                       action: chex.Array,
-                       next_state: DroneState) -> float:
-    """
-    计算单步奖励/损失
-    这是一个简化版本，后续会扩展为完整的多目标损失
-    """
-    # 目标位置（暂时固定）
-    target_position = jnp.array([10.0, 10.0, 5.0])
+    def rollout_trajectory_fn(policy_params: Any,
+                            initial_state: DroneState,
+                            trajectory_length: int) -> Tuple[LoopCarry, LoopOutput]:
+        """
+        纯计算的轨迹rollout函数
+        """
+        
+        # 初始化carry
+        initial_carry = LoopCarry(
+            drone_state=initial_state,
+            rnn_hidden=policy_model.init_hidden() if use_rnn and hasattr(policy_model, 'init_hidden') else None,
+            previous_thrust=jnp.zeros(3)
+        )
+        
+        # 外部输入序列（暂时为空）
+        xs = jnp.zeros((trajectory_length, 1))
+        
+        # 部分应用参数的scan函数
+        def scan_fn_with_params(carry, x):
+            return scan_function(carry, x, policy_params)
+        
+        # 执行scan
+        final_carry, trajectory_outputs = jax.lax.scan(
+            scan_fn_with_params, initial_carry, xs, length=trajectory_length
+        )
+        
+        return final_carry, trajectory_outputs
     
-    # 距离损失
-    distance_to_target = jnp.linalg.norm(next_state.position - target_position)
-    distance_reward = -distance_to_target
+    # JIT编译rollout函数
+    rollout_trajectory_jit = jax.jit(
+        rollout_trajectory_fn, 
+        static_argnames=['trajectory_length']
+    )
     
-    # 控制成本
-    control_cost = -0.01 * jnp.sum(action**2)
-    
-    # 速度惩罚（避免过快）
-    speed_penalty = -0.001 * jnp.sum(next_state.velocity**2)
-    
-    total_reward = distance_reward + control_cost + speed_penalty
-    
-    return total_reward
+    return rollout_trajectory_jit
 
 
 def rollout_trajectory(initial_state: DroneState,
@@ -119,42 +152,12 @@ def rollout_trajectory(initial_state: DroneState,
                       use_rnn: bool = False,
                       rng_key: chex.PRNGKey = None) -> Tuple[LoopCarry, LoopOutput]:
     """
-    执行完整轨迹展开
+    公共接口函数
+    在内部处理JIT编译，对外提供简单接口
     """
     
-    # 创建scan函数
-    scan_fn = create_scan_function(policy_model, physics_params, dt, use_rnn)
+    # 这个函数在每次调用时创建JIT函数，不太高效
+    # 但为了保持接口兼容性暂时这样做
+    rollout_fn = create_rollout_functions(policy_model, physics_params, dt, use_rnn)
     
-    # 初始化carry
-    initial_carry = LoopCarry(
-        drone_state=initial_state,
-        rnn_hidden=policy_model.init_hidden() if use_rnn and hasattr(policy_model, 'init_hidden') else None,
-        previous_thrust=jnp.zeros(3)
-    )
-    
-    # 外部输入序列（暂时为空）
-    xs = jnp.zeros((trajectory_length, 1))
-    
-    # 部分应用参数的scan函数
-    def scan_fn_with_params(carry, x):
-        return scan_fn(carry, x, policy_params)
-    
-    # 执行scan
-    final_carry, trajectory_outputs = jax.lax.scan(
-        scan_fn_with_params, initial_carry, xs, length=trajectory_length
-    )
-    
-    return final_carry, trajectory_outputs
-
-
-# JIT编译版本
-def create_jit_rollout_fn(policy_model, physics_params, dt, trajectory_length, use_rnn=False):
-    """创建JIT编译的rollout函数"""
-    
-    def rollout_fn(policy_params, initial_state, rng_key):
-        return rollout_trajectory(
-            initial_state, policy_params, policy_model, physics_params,
-            trajectory_length, dt, use_rnn, rng_key
-        )
-    
-    return jax.jit(rollout_fn, static_argnames=[])
+    return rollout_fn(policy_params, initial_state, trajectory_length)
