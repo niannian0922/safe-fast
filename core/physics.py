@@ -1,5 +1,5 @@
 """
-JAX原生可微分物理引擎实现
+JAX原生可微分物理引擎实现 - 修复JIT兼容性
 基于点质量模型的无人机动力学仿真
 """
 
@@ -48,14 +48,14 @@ def quaternion_to_rotation_matrix(q: chex.Array) -> chex.Array:
 def thrust_to_body_acceleration(thrust_command: chex.Array, 
                                orientation: chex.Array,
                                params: DroneParams) -> chex.Array:
-    """将推力命令转换为机体加速度"""
+    """将推力命令转换为机体加速度 - JAX兼容版本"""
     # 限制推力幅值
     thrust_magnitude = jnp.clip(jnp.linalg.norm(thrust_command), 0.0, params.max_thrust)
     
-    # 如果推力为零，返回零加速度
+    # 使用jnp.where替代if语句
     thrust_direction = jnp.where(
         jnp.linalg.norm(thrust_command) > 1e-6,
-        thrust_command / jnp.linalg.norm(thrust_command),
+        thrust_command / (jnp.linalg.norm(thrust_command) + 1e-8),  # 添加小值避免除零
         jnp.array([0.0, 0.0, 1.0])  # 默认向上
     )
     
@@ -102,7 +102,7 @@ def dynamics_step(state: DroneState,
                  dt: float,
                  previous_thrust: chex.Array = None) -> Tuple[DroneState, chex.Array]:
     """
-    单步动力学积分
+    单步动力学积分 - 完全JAX兼容版本
     
     Args:
         state: 当前无人机状态
@@ -115,12 +115,16 @@ def dynamics_step(state: DroneState,
         (next_state, actual_thrust): 下一状态和实际施加的推力
     """
     
-    # 如果没有提供previous_thrust，使用当前action作为初始值
-    if previous_thrust is None:
-        previous_thrust = action
+    # 处理previous_thrust为None的情况（JAX兼容）
+    # 在JAX中，我们不能直接检查None，所以使用默认值
+    actual_previous_thrust = jnp.where(
+        previous_thrust is None,
+        action,  # 如果为None，使用action作为默认值
+        previous_thrust
+    ) if previous_thrust is not None else action
     
     # 控制滤波（模拟控制器响应延迟）
-    actual_thrust = control_filter(previous_thrust, action, params, dt)
+    actual_thrust = control_filter(actual_previous_thrust, action, params, dt)
     
     # 计算推力产生的加速度
     thrust_accel = thrust_to_body_acceleration(actual_thrust, state.orientation, params)
@@ -138,19 +142,13 @@ def dynamics_step(state: DroneState,
     new_velocity = state.velocity + total_accel * dt
     new_position = state.position + state.velocity * dt + 0.5 * total_accel * dt**2
     
-    # 简化的姿态动力学（将推力方向作为期望姿态）
-    # 在MVP阶段，我们简化姿态控制，假设无人机能快速调整到期望姿态
-    if jnp.linalg.norm(actual_thrust) > 1e-6:
-        # 期望的机体z轴方向（推力方向）
-        desired_z = actual_thrust / jnp.linalg.norm(actual_thrust)
-        # 保持偏航角度，构造简化的四元数
-        # 这里使用简化处理，实际应用中需要更完整的姿态动力学
-        new_orientation = state.orientation  # 暂时保持姿态不变
-    else:
-        new_orientation = state.orientation
+    # 简化的姿态动力学 - 完全移除条件判断
+    # 在MVP阶段，我们大幅简化姿态控制
+    # 假设无人机总是能快速调整到期望姿态，这里保持当前姿态
+    new_orientation = state.orientation
     
-    # 角速度动力学（简化处理）
-    new_angular_velocity = state.angular_velocity * 0.95  # 简单阻尼
+    # 角速度动力学（简化处理） - 简单阻尼
+    new_angular_velocity = state.angular_velocity * 0.95  
     
     # 构造新状态
     new_state = DroneState(
@@ -197,3 +195,54 @@ def create_initial_state(position: chex.Array = None,
 def create_default_params() -> DroneParams:
     """创建默认物理参数"""
     return DroneParams()
+
+
+# 测试函数
+def test_physics_jit_compatibility():
+    """测试物理引擎的JIT兼容性"""
+    print("测试JAX物理引擎JIT兼容性...")
+    
+    state = create_initial_state()
+    params = create_default_params()
+    action = jnp.array([0.0, 0.0, 5.0])
+    dt = 0.01
+    
+    # 测试基础函数
+    new_state, thrust = dynamics_step(state, action, params, dt)
+    print(f"✅ 基础物理步进正常")
+    print(f"位置变化: {jnp.linalg.norm(new_state.position):.6f}")
+    
+    # 测试JIT编译
+    new_state_jit, thrust_jit = dynamics_step_jit(state, action, params, dt)
+    print(f"✅ JIT编译版本正常")
+    
+    # 验证结果一致性
+    pos_diff = jnp.linalg.norm(new_state.position - new_state_jit.position)
+    vel_diff = jnp.linalg.norm(new_state.velocity - new_state_jit.velocity)
+    
+    print(f"位置差异: {pos_diff:.10f}")
+    print(f"速度差异: {vel_diff:.10f}")
+    
+    assert pos_diff < 1e-10, "JIT和非JIT结果应该完全一致"
+    assert vel_diff < 1e-10, "速度结果应该完全一致"
+    
+    # 测试梯度流
+    def loss_fn(action_test):
+        state_test = create_initial_state()
+        new_state_test, _ = dynamics_step(state_test, action_test, params, dt)
+        return jnp.sum(new_state_test.position**2)
+    
+    grad_fn = jax.grad(loss_fn)
+    grad_result = grad_fn(action)
+    
+    print(f"梯度计算正常: {jnp.linalg.norm(grad_result):.8f}")
+    assert not jnp.any(jnp.isnan(grad_result)), "梯度不应包含NaN"
+    assert jnp.linalg.norm(grad_result) > 1e-8, "梯度应该非零"
+    
+    print("✅ JAX物理引擎JIT兼容性测试通过!")
+    
+    return True
+
+
+if __name__ == "__main__":
+    test_physics_jit_compatibility()

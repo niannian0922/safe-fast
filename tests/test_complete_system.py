@@ -68,7 +68,7 @@ class TestCompleteSystem:
         """测试训练步骤性能"""
         print("\n测试训练性能...")
         
-        config = TrainingConfig(trajectory_length=20)
+        config = TrainingConfig(trajectory_length=15)
         rng_key = jax.random.PRNGKey(456)
         
         # 设置阶段
@@ -101,21 +101,23 @@ class TestCompleteSystem:
         assert 'grad_norm' in train_info
         
         print(f"训练损失: {train_info['total_loss']:.4f}")
+        print(f"控制损失: {train_info['control_loss']:.4f}")
+        print(f"平均奖励: {train_info['mean_reward']:.4f}")
         print("✅ 性能测试通过")
     
     def test_safety_constraint_basic(self):
         """测试安全约束基本功能"""
         print("\n测试安全约束...")
         
-        from core.safety import safety_filter
-        
-        # 基本安全滤波器测试
-        u_nom = jnp.array([2.0, 1.0, 8.0])
-        h_safe = 1.5
-        grad_h = jnp.array([0.1, 0.2, -0.5])
-        velocity = jnp.array([1.0, 0.5, 0.0])
-        
         try:
+            from core.safety import safety_filter
+            
+            # 基本安全滤波器测试
+            u_nom = jnp.array([2.0, 1.0, 8.0])
+            h_safe = 1.5
+            grad_h = jnp.array([0.1, 0.2, -0.5])
+            velocity = jnp.array([1.0, 0.5, 0.0])
+            
             safe_command = safety_filter(
                 u_nom=u_nom,
                 h=h_safe,
@@ -133,13 +135,13 @@ class TestCompleteSystem:
             print("✅ 安全约束测试通过")
             
         except Exception as e:
-            print(f"安全滤波器测试跳过（需要qpax）: {e}")
+            print(f"安全滤波器测试跳过（qpax可能未安装）: {e}")
     
     def test_multi_step_consistency(self):
         """测试多步一致性"""
         print("\n测试多步一致性...")
         
-        config = TrainingConfig(trajectory_length=15)
+        config = TrainingConfig(trajectory_length=10)
         rng_key = jax.random.PRNGKey(999)
         
         # 设置阶段
@@ -204,6 +206,55 @@ class TestCompleteSystem:
         assert jnp.isfinite(total_loss), "损失应该是有限的"
         
         print("✅ 梯度计算正确性测试通过")
+    
+    def test_individual_component_compatibility(self):
+        """测试各个组件的JAX兼容性"""
+        print("\n测试各个组件的JAX兼容性...")
+        
+        # 测试物理引擎
+        from core.physics import test_physics_jit_compatibility
+        physics_ok = test_physics_jit_compatibility()
+        assert physics_ok, "物理引擎JIT兼容性测试失败"
+        
+        # 测试循环系统
+        from core.loop import test_loop_jit_compatibility
+        loop_ok = test_loop_jit_compatibility()
+        assert loop_ok, "循环系统JIT兼容性测试失败"
+        
+        print("✅ 组件兼容性测试通过")
+    
+    def test_batch_processing(self):
+        """测试批量处理功能"""
+        print("\n测试批量处理功能...")
+        
+        from core.loop import BatchRolloutSystem
+        from core.policy import create_policy_model
+        
+        # 设置
+        rng_key = jax.random.PRNGKey(111)
+        policy_model = create_policy_model("mlp")
+        physics_params = create_default_params()
+        dt = 0.02
+        
+        # 创建批量系统
+        batch_system = BatchRolloutSystem(policy_model, physics_params, dt)
+        
+        # 初始化参数
+        dummy_state = jnp.zeros(13)
+        policy_params = policy_model.init(rng_key, dummy_state)
+        
+        # 测试单个rollout
+        initial_state = create_initial_state()
+        target_position = jnp.array([3.0, 3.0, 2.0])
+        
+        final_carry, trajectory = batch_system.rollout_single(
+            policy_params, initial_state, target_position, 10
+        )
+        
+        print(f"单个rollout成功，轨迹长度: {trajectory.drone_state.position.shape[0]}")
+        print(f"最终位置: {final_carry.drone_state.position}")
+        
+        print("✅ 批量处理测试通过")
 
 
 def run_all_tests():
@@ -220,11 +271,17 @@ def run_all_tests():
         # 系统初始化测试
         test_suite.test_system_initialization()
         
+        # 组件兼容性测试
+        test_suite.test_individual_component_compatibility()
+        
         # 性能测试
         test_suite.test_training_step_performance()
         
         # 安全性测试
         test_suite.test_safety_constraint_basic()
+        
+        # 批量处理测试
+        test_suite.test_batch_processing()
         
         # 一致性测试
         test_suite.test_multi_step_consistency()

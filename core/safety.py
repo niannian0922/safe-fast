@@ -82,62 +82,55 @@ def safety_filter(u_nom: chex.Array,
                  h: float,
                  grad_h: chex.Array,
                  drone_velocity: chex.Array,
-                 safety_params: SafetyParams = None) -> chex.Array:
+                 safety_params: SafetyParams) -> chex.Array:
     """
-    安全滤波器：解决CBF-QP优化问题
+    安全滤波器：解决CBF-QP优化问题 - JIT兼容版本
     
     Args:
         u_nom: 名义控制输入 [3]
         h: CBF值
         grad_h: CBF梯度 [3]
         drone_velocity: 当前速度 [3]
-        safety_params: 安全参数
+        safety_params: 安全参数（必须提供，不能为None）
         
     Returns:
         u_safe: 安全的控制输入 [3]
     """
-    
-    if safety_params is None:
-        safety_params = SafetyParams()
     
     # 构建QP矩阵
     Q, q, G, h_constraint = construct_cbf_qp_matrices(
         u_nom, h, grad_h, drone_velocity, safety_params
     )
     
-    try:
-        # 使用qpax求解QP
-        solution = qpax.solve_qp(
-            Q=Q,
-            c=q,
-            A_ineq=G,
-            b_ineq=h_constraint,
-            A_eq=None,  # 无等式约束
-            b_eq=None,
-            max_iter=safety_params.qp_solver_max_iter,
-            tol=safety_params.qp_tolerance
-        )
-        
-        u_safe = solution.x
-        
-        # 检查求解状态
-        if not solution.converged:
-            # 如果QP求解失败，使用回退策略
-            print("警告：QP求解未收敛，使用回退策略")
-            u_safe = apply_fallback_strategy(u_nom, h, safety_params)
-        
-    except Exception as e:
-        print(f"QP求解器错误：{e}，使用回退策略")
-        u_safe = apply_fallback_strategy(u_nom, h, safety_params)
+    # 使用qpax求解QP（移除try-catch，使其JIT兼容）
+    solution = qpax.solve_qp(
+        Q=Q,
+        c=q,
+        A_ineq=G,
+        b_ineq=h_constraint,
+        A_eq=None,  # 无等式约束
+        b_eq=None,
+        max_iter=safety_params.qp_solver_max_iter,
+        tol=safety_params.qp_tolerance
+    )
+    
+    # 使用jnp.where替代if语句（JAX兼容）
+    # 如果QP求解收敛，使用解；否则使用回退策略
+    fallback_control = apply_fallback_strategy(u_nom, h, safety_params)
+    
+    u_safe = jnp.where(
+        solution.converged,
+        solution.x,
+        fallback_control
+    )
     
     return u_safe
-
 
 def apply_fallback_strategy(u_nom: chex.Array,
                           h: float,
                           safety_params: SafetyParams) -> chex.Array:
     """
-    回退策略：当QP求解失败时使用
+    回退策略：当QP求解失败时使用 - JIT兼容版本
     
     Args:
         u_nom: 名义控制
@@ -148,13 +141,16 @@ def apply_fallback_strategy(u_nom: chex.Array,
         u_fallback: 回退控制输入
     """
     
-    # 策略1：如果CBF值为负（不安全），采用保守控制
-    if h < 0:
-        # 紧急制动：减小推力到安全水平
-        u_fallback = u_nom * 0.1
-    else:
-        # 如果CBF值为正（安全），使用限幅的名义控制
-        u_fallback = jnp.clip(u_nom, -safety_params.max_control_norm, safety_params.max_control_norm)
+    # 使用jnp.where替代if语句（JAX兼容）
+    # 如果CBF值为负（不安全），采用保守控制；否则使用限幅的名义控制
+    conservative_control = u_nom * 0.1  # 紧急制动
+    clipped_control = jnp.clip(u_nom, -safety_params.max_control_norm, safety_params.max_control_norm)
+    
+    u_fallback = jnp.where(
+        h < 0,
+        conservative_control,
+        clipped_control
+    )
     
     return u_fallback
 
@@ -163,18 +159,15 @@ def safety_filter_with_relaxation(u_nom: chex.Array,
                                  h: float,
                                  grad_h: chex.Array,
                                  drone_velocity: chex.Array,
-                                 relaxation_penalty: float = 1000.0,
-                                 safety_params: SafetyParams = None) -> Tuple[chex.Array, float]:
+                                 relaxation_penalty: float,
+                                 safety_params: SafetyParams) -> Tuple[chex.Array, float]:
     """
-    带松弛变量的安全滤波器
+    带松弛变量的安全滤波器 - JIT兼容版本
     用于处理不可行的QP问题
     
     Returns:
         (u_safe, relaxation): 安全控制和松弛变量值
     """
-    
-    if safety_params is None:
-        safety_params = SafetyParams()
     
     # 构建带松弛变量的QP
     # 变量：[u(3维), δ(1维松弛)]
@@ -211,29 +204,33 @@ def safety_filter_with_relaxation(u_nom: chex.Array,
     G_all = jnp.concatenate([G_cbf, G_bounds, G_relax], axis=0)
     h_all = jnp.concatenate([h_cbf, h_bounds, h_relax])
     
-    try:
-        solution = qpax.solve_qp(
-            Q=Q_extended,
-            c=q_extended,
-            A_ineq=G_all,
-            b_ineq=h_all,
-            A_eq=None,
-            b_eq=None,
-            max_iter=safety_params.qp_solver_max_iter,
-            tol=safety_params.qp_tolerance
-        )
-        
-        if solution.converged:
-            u_safe = solution.x[:3]
-            relaxation = solution.x[3]
-        else:
-            # 回退策略
-            u_safe = apply_fallback_strategy(u_nom, h, safety_params)
-            relaxation = jnp.maximum(0.0, -h)  # 估计松弛量
-            
-    except Exception:
-        u_safe = apply_fallback_strategy(u_nom, h, safety_params)
-        relaxation = jnp.maximum(0.0, -h)
+    # 使用qpax求解QP（移除try-catch）
+    solution = qpax.solve_qp(
+        Q=Q_extended,
+        c=q_extended,
+        A_ineq=G_all,
+        b_ineq=h_all,
+        A_eq=None,
+        b_eq=None,
+        max_iter=safety_params.qp_solver_max_iter,
+        tol=safety_params.qp_tolerance
+    )
+    
+    # 使用JAX兼容的条件逻辑
+    fallback_control = apply_fallback_strategy(u_nom, h, safety_params)
+    fallback_relaxation = jnp.maximum(0.0, -h)  # 估计松弛量
+    
+    u_safe = jnp.where(
+        solution.converged,
+        solution.x[:3],
+        fallback_control
+    )
+    
+    relaxation = jnp.where(
+        solution.converged,
+        solution.x[3],
+        fallback_relaxation
+    )
     
     return u_safe, relaxation
 
@@ -300,3 +297,25 @@ def test_safety_filter():
 
 if __name__ == "__main__":
     test_safety_filter()
+
+# JIT编译版本 - 更新以匹配新的函数签名
+def create_safety_filter_jit(safety_params: SafetyParams):
+    """创建JIT编译的安全滤波器"""
+    def safety_filter_with_params(u_nom: chex.Array,
+                                  h: float,
+                                  grad_h: chex.Array,
+                                  drone_velocity: chex.Array) -> chex.Array:
+        return safety_filter(u_nom, h, grad_h, drone_velocity, safety_params)
+    
+    return jax.jit(safety_filter_with_params)
+
+
+def create_safety_filter_with_relaxation_jit(safety_params: SafetyParams, relaxation_penalty: float):
+    """创建JIT编译的带松弛变量的安全滤波器"""
+    def safety_filter_relax_with_params(u_nom: chex.Array,
+                                        h: float,
+                                        grad_h: chex.Array,
+                                        drone_velocity: chex.Array) -> Tuple[chex.Array, float]:
+        return safety_filter_with_relaxation(u_nom, h, grad_h, drone_velocity, relaxation_penalty, safety_params)
+    
+    return jax.jit(safety_filter_relax_with_params)

@@ -1,5 +1,5 @@
 """
-训练循环和损失函数定义 - 彻底修复JIT兼容性
+训练循环和损失函数定义 - 完全修复JIT兼容性
 严格分离设置(Setup)和计算(Compute)阶段
 """
 
@@ -11,15 +11,15 @@ import chex
 
 from core.physics import DroneState, DroneParams, create_initial_state, create_default_params
 from core.policy import create_policy_model, PolicyMLP
-from core.loop import rollout_trajectory, LoopOutput
+from core.loop import rollout_trajectory, LoopOutput, BatchRolloutSystem
 
 
 class TrainingConfig(NamedTuple):
     """训练配置"""
     learning_rate: float = 3e-4
-    trajectory_length: int = 100
+    trajectory_length: int = 50
     dt: float = 0.02
-    batch_size: int = 32
+    batch_size: int = 16
     gradient_clip_norm: float = 1.0
     
     # 损失函数权重
@@ -52,6 +52,11 @@ class TrainingSystem:
         dummy_state = jnp.zeros(13)
         self.initial_policy_params = self.policy_model.init(rng_key, dummy_state)
         
+        # 创建批量rollout系统
+        self.batch_system = BatchRolloutSystem(
+            self.policy_model, self.physics_params, config.dt
+        )
+        
         # 创建优化器（非JIT）
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(config.gradient_clip_norm),
@@ -74,22 +79,18 @@ class TrainingSystem:
     def _compile_functions(self):
         """编译所有JIT函数 - 设置阶段的一部分"""
         
-        # 创建损失函数（使用闭包捕获模型和物理参数）
+        # 创建损失函数（使用闭包捕获batch_system）
         def loss_fn(policy_params: Any,
                    initial_state: DroneState,
                    target_position: chex.Array) -> Tuple[float, Dict[str, Any]]:
             """纯计算的损失函数"""
             
             # 执行轨迹rollout
-            final_carry, trajectory_outputs = rollout_trajectory(
-                initial_state=initial_state,
+            final_carry, trajectory_outputs = self.batch_system.rollout_single(
                 policy_params=policy_params,
-                policy_model=self.policy_model,  # 通过闭包捕获
-                physics_params=self.physics_params,  # 通过闭包捕获
-                trajectory_length=self.config.trajectory_length,
-                dt=self.config.dt,
-                use_rnn=False,
-                rng_key=None
+                initial_state=initial_state,
+                target_position=target_position,
+                trajectory_length=self.config.trajectory_length
             )
             
             # 计算损失
@@ -101,6 +102,7 @@ class TrainingSystem:
             final_distance = jnp.linalg.norm(final_carry.drone_state.position - target_position)
             losses['final_distance'] = final_distance
             losses['final_position'] = final_carry.drone_state.position
+            losses['final_velocity'] = final_carry.drone_state.velocity
             
             return losses['total_loss'], losses
         
@@ -118,12 +120,13 @@ class TrainingSystem:
         positions = trajectory_outputs.drone_state.position  # [T, 3]
         velocities = trajectory_outputs.drone_state.velocity  # [T, 3]
         actions = trajectory_outputs.action  # [T, 3]
+        rewards = trajectory_outputs.reward  # [T]
         
-        # 1. 距离损失
+        # 1. 最终距离损失
         final_position = positions[-1]
-        distance_loss = jnp.linalg.norm(final_position - target_position)
+        final_distance_loss = jnp.linalg.norm(final_position - target_position)
         
-        # 2. 轨迹距离损失
+        # 2. 轨迹距离损失（整个轨迹的平均距离）
         distances_to_target = jnp.linalg.norm(positions - target_position, axis=1)
         trajectory_distance_loss = jnp.mean(distances_to_target)
         
@@ -137,24 +140,30 @@ class TrainingSystem:
         # 5. 位置边界惩罚
         position_bounds = 20.0
         out_of_bounds_penalty = jnp.mean(
-            jnp.maximum(0, jnp.abs(positions) - position_bounds)
+            jnp.sum(jnp.maximum(0, jnp.abs(positions) - position_bounds), axis=1)
         )
+        
+        # 6. 利用rollout中计算的奖励
+        reward_loss = -jnp.mean(rewards)  # 最大化奖励 = 最小化负奖励
         
         # 加权总损失
         total_loss = (
-            self.config.distance_weight * (distance_loss + 0.1 * trajectory_distance_loss) +
+            self.config.distance_weight * (final_distance_loss + 0.1 * trajectory_distance_loss) +
             self.config.control_weight * control_loss +
             self.config.velocity_weight * velocity_smoothness_loss +
-            1.0 * out_of_bounds_penalty
+            1.0 * out_of_bounds_penalty +
+            0.1 * reward_loss  # 小权重的奖励项
         )
         
         return {
             'total_loss': total_loss,
-            'distance_loss': distance_loss,
+            'final_distance_loss': final_distance_loss,
             'trajectory_distance_loss': trajectory_distance_loss,
             'control_loss': control_loss,
             'velocity_smoothness_loss': velocity_smoothness_loss,
-            'out_of_bounds_penalty': out_of_bounds_penalty
+            'out_of_bounds_penalty': out_of_bounds_penalty,
+            'reward_loss': reward_loss,
+            'mean_reward': jnp.mean(rewards)
         }
     
     def _pure_train_step(self, training_state: TrainingState,
@@ -184,10 +193,14 @@ class TrainingSystem:
         )
         
         # 收集训练信息
+        def tree_norm(tree):
+            return jnp.sqrt(sum(jnp.sum(leaf**2) for leaf in jax.tree_util.tree_leaves(tree)))
+        
         train_info = {
             **loss_info,
-            'grad_norm': optax.global_norm(grads),
-            'step': training_state.step
+            'grad_norm': tree_norm(grads),
+            'step': training_state.step,
+            'param_norm': tree_norm(training_state.policy_params)
         }
         
         return new_training_state, train_info
@@ -210,9 +223,9 @@ class TrainingSystem:
 class CompleteTrainingConfig(NamedTuple):
     """完整训练配置"""
     learning_rate: float = 3e-4
-    trajectory_length: int = 50
+    trajectory_length: int = 30
     dt: float = 0.02
-    batch_size: int = 16
+    batch_size: int = 8
     gradient_clip_norm: float = 1.0
     
     # 损失权重
@@ -254,8 +267,10 @@ class CompleteTrainingSystem:
         # 设置阶段：创建模型
         self.policy_model = create_policy_model("mlp")
         
-        # 创建简化的GNN模型（用于测试）
-        self.gnn_model = self._create_simple_gnn()
+        # 创建批量rollout系统
+        self.batch_system = BatchRolloutSystem(
+            self.policy_model, self.physics_params, config.dt
+        )
         
         # 初始化参数
         dummy_state = jnp.zeros(13)
@@ -288,40 +303,26 @@ class CompleteTrainingSystem:
         # 编译JIT函数
         self._compile_functions()
     
-    def _create_simple_gnn(self):
-        """创建简化的GNN模型用于测试"""
-        class SimpleGNN:
-            def apply(self, params, inputs):
-                # 返回模拟的CBF值和梯度
-                return 0.5, jnp.array([0.1, 0.1, 0.1])
-        
-        return SimpleGNN()
-    
     def _compile_functions(self):
         """编译JIT函数"""
         
         def complete_loss_fn(policy_params: Any,
                            gnn_params: Any,
                            initial_state: DroneState,
-                           target_position: chex.Array,
-                           target_velocity: chex.Array) -> Tuple[float, Dict[str, Any]]:
+                           target_position: chex.Array) -> Tuple[float, Dict[str, Any]]:
             """完整损失函数（纯计算）"""
             
             # 执行基础轨迹rollout
-            final_carry, trajectory_outputs = rollout_trajectory(
-                initial_state=initial_state,
+            final_carry, trajectory_outputs = self.batch_system.rollout_single(
                 policy_params=policy_params,
-                policy_model=self.policy_model,
-                physics_params=self.physics_params,
-                trajectory_length=self.config.trajectory_length,
-                dt=self.config.dt,
-                use_rnn=False,
-                rng_key=None
+                initial_state=initial_state,
+                target_position=target_position,
+                trajectory_length=self.config.trajectory_length
             )
             
             # 计算各种损失
             losses = self._compute_complete_losses(
-                trajectory_outputs, target_position, target_velocity
+                trajectory_outputs, target_position
             )
             
             # 添加额外信息
@@ -342,8 +343,7 @@ class CompleteTrainingSystem:
         self._complete_train_step_fn = jax.jit(self._pure_complete_train_step)
     
     def _compute_complete_losses(self, trajectory_outputs: LoopOutput,
-                               target_position: chex.Array,
-                               target_velocity: chex.Array) -> Dict[str, float]:
+                               target_position: chex.Array) -> Dict[str, float]:
         """计算完整损失（纯计算）"""
         
         # 基础损失
@@ -352,6 +352,7 @@ class CompleteTrainingSystem:
         actions = trajectory_outputs.action
         
         # 1. 物理驱动损失
+        target_velocity = jnp.array([2.0, 2.0, 0.0])  # 期望速度
         velocity_errors = velocities - target_velocity
         velocity_loss = jnp.mean(jnp.sum(velocity_errors**2, axis=1))
         
@@ -390,8 +391,7 @@ class CompleteTrainingSystem:
     
     def _pure_complete_train_step(self, training_state: CompleteTrainingState,
                                 initial_state: DroneState,
-                                target_position: chex.Array,
-                                target_velocity: chex.Array) -> Tuple[CompleteTrainingState, Dict[str, Any]]:
+                                target_position: chex.Array) -> Tuple[CompleteTrainingState, Dict[str, Any]]:
         """纯计算的完整训练步骤（JIT函数）"""
         
         # 计算损失和梯度
@@ -399,8 +399,7 @@ class CompleteTrainingSystem:
             training_state.policy_params,
             training_state.gnn_params,
             initial_state,
-            target_position,
-            target_velocity
+            target_position
         )
         
         # 策略网络更新
@@ -425,10 +424,13 @@ class CompleteTrainingSystem:
         )
         
         # 收集训练信息
+        def tree_norm(tree):
+            return jnp.sqrt(sum(jnp.sum(leaf**2) for leaf in jax.tree_util.tree_leaves(tree)))
+        
         train_info = {
             **loss_info,
-            'policy_grad_norm': optax.global_norm(policy_grads),
-            'gnn_grad_norm': optax.global_norm(gnn_grads),
+            'policy_grad_norm': tree_norm(policy_grads),
+            'gnn_grad_norm': tree_norm(gnn_grads),
             'step': training_state.step
         }
         
@@ -436,11 +438,10 @@ class CompleteTrainingSystem:
     
     def train_step(self, training_state: CompleteTrainingState,
                   initial_state: DroneState,
-                  target_position: chex.Array,
-                  target_velocity: chex.Array) -> Tuple[CompleteTrainingState, Dict[str, Any]]:
+                  target_position: chex.Array) -> Tuple[CompleteTrainingState, Dict[str, Any]]:
         """公共训练步骤接口"""
         return self._complete_train_step_fn(
-            training_state, initial_state, target_position, target_velocity
+            training_state, initial_state, target_position
         )
     
     def get_initial_training_state(self) -> CompleteTrainingState:
@@ -481,6 +482,8 @@ def test_gradient_flow(config: TrainingConfig = None) -> bool:
         print(f"梯度范数: {train_info['grad_norm']:.6f}")
         print(f"最终距离: {train_info['final_distance']:.4f}")
         print(f"最终位置: {train_info['final_position']}")
+        print(f"控制损失: {train_info['control_loss']:.4f}")
+        print(f"平均奖励: {train_info['mean_reward']:.4f}")
         
         # 检查梯度有效性
         if train_info['grad_norm'] > 1e-6:
@@ -514,14 +517,13 @@ def test_complete_gradient_flow() -> bool:
             velocity=jnp.array([0.0, 0.0, 0.0])
         )
         target_position = jnp.array([8.0, 8.0, 3.0])
-        target_velocity = jnp.array([2.0, 2.0, 0.0])
         
         print("执行完整训练步骤...")
         
         # 计算阶段
         training_state = complete_system.get_initial_training_state()
         new_training_state, train_info = complete_system.train_step(
-            training_state, initial_state, target_position, target_velocity
+            training_state, initial_state, target_position
         )
         
         print("✅ 完整训练步骤执行成功!")
