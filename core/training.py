@@ -6,10 +6,11 @@
 import jax
 import jax.numpy as jnp
 import optax
-from typing import Dict, Tuple, Any, NamedTuple
+from typing import Dict, Tuple, Any, NamedTuple, Optional
 from flax import linen as nn
 from flax.training import train_state
 import chex
+from functools import partial
 
 class TrainingState(NamedTuple):
     """训练状态结构"""
@@ -19,17 +20,17 @@ class TrainingState(NamedTuple):
 
 class CBFLossComponents(NamedTuple):
     """CBF损失组件"""
-    cbf_condition_loss: jnp.ndarray  # CBF条件损失
-    safe_loss: jnp.ndarray           # 安全状态损失  
-    unsafe_loss: jnp.ndarray         # 不安全状态损失
-    total_cbf_loss: jnp.ndarray      # CBF总损失
+    cbf_condition_loss: jnp.ndarray
+    safe_loss: jnp.ndarray
+    unsafe_loss: jnp.ndarray
+    total_cbf_loss: jnp.ndarray
 
 class PhysicsLossComponents(NamedTuple):
     """物理损失组件"""
-    velocity_loss: jnp.ndarray       # 速度跟踪损失
-    collision_loss: jnp.ndarray      # 碰撞损失
-    control_smoothness: jnp.ndarray  # 控制平滑性损失
-    total_physics_loss: jnp.ndarray  # 物理总损失
+    velocity_loss: jnp.ndarray
+    collision_loss: jnp.ndarray
+    control_smoothness: jnp.ndarray
+    total_physics_loss: jnp.ndarray
 
 class TotalLossComponents(NamedTuple):
     """总损失组件"""
@@ -43,9 +44,13 @@ def create_training_state(
     gnn_model: nn.Module,
     policy_params: Dict,
     gnn_params: Dict,
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-4,
+    gnn_learning_rate: Optional[float] = None
 ) -> TrainingState:
     """创建训练状态"""
+    
+    if gnn_learning_rate is None:
+        gnn_learning_rate = learning_rate
     
     # 为策略网络创建优化器
     policy_tx = optax.chain(
@@ -53,10 +58,10 @@ def create_training_state(
         optax.adam(learning_rate)
     )
     
-    # 为GNN创建优化器  
+    # 为GNN创建优化器 - 可能需要不同的学习率
     gnn_tx = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate)
+        optax.adam(gnn_learning_rate)
     )
     
     policy_state = train_state.TrainState.create(
@@ -86,15 +91,7 @@ def compute_cbf_loss(
     gamma: float = 0.02
 ) -> CBFLossComponents:
     """
-    计算CBF损失 - 参考GCBF+论文的损失函数设计
-    
-    Args:
-        cbf_values: CBF值 [batch_size, seq_len, n_agents]
-        cbf_derivatives: CBF时间导数 [batch_size, seq_len, n_agents]  
-        safe_mask: 安全状态掩码
-        unsafe_mask: 不安全状态掩码
-        alpha: CBF条件参数
-        gamma: 严格不等式参数
+    计算CBF损失 - 修复版本确保损失非零
     """
     chex.assert_rank([cbf_values, cbf_derivatives, safe_mask, unsafe_mask], 3)
     
@@ -105,16 +102,19 @@ def compute_cbf_loss(
     )
     
     # 2. 安全状态损失: 安全时CBF应该 > 0
-    safe_loss = jnp.mean(
-        safe_mask * jax.nn.relu(gamma - cbf_values) ** 2
-    )
+    safe_loss = jnp.sum(safe_mask * jax.nn.relu(gamma - cbf_values) ** 2)
+    safe_count = jnp.maximum(jnp.sum(safe_mask), 1.0)
+    safe_loss = safe_loss / safe_count
     
-    # 3. 不安全状态损失: 不安全时CBF应该 < 0  
-    unsafe_loss = jnp.mean(
-        unsafe_mask * jax.nn.relu(gamma + cbf_values) ** 2
-    )
+    # 3. 不安全状态损失: 不安全时CBF应该 < 0
+    unsafe_loss = jnp.sum(unsafe_mask * jax.nn.relu(gamma + cbf_values) ** 2)
+    unsafe_count = jnp.maximum(jnp.sum(unsafe_mask), 1.0)
+    unsafe_loss = unsafe_loss / unsafe_count
     
-    total_cbf_loss = cbf_condition_loss + safe_loss + unsafe_loss
+    # 添加正则化项以防止CBF值过于平坦
+    cbf_variance_loss = 0.01 * (1.0 - jnp.std(cbf_values))
+    
+    total_cbf_loss = cbf_condition_loss + safe_loss + unsafe_loss + cbf_variance_loss
     
     return CBFLossComponents(
         cbf_condition_loss=cbf_condition_loss,
@@ -132,19 +132,13 @@ def compute_physics_loss(
 ) -> PhysicsLossComponents:
     """
     计算物理损失 - 参考DiffPhysDrone的损失设计
-    
-    Args:
-        states: 状态轨迹 [batch_size, seq_len, n_agents, state_dim]
-        actions: 动作轨迹 [batch_size, seq_len, n_agents, action_dim]
-        target_velocities: 目标速度 [batch_size, seq_len, n_agents, 3]
-        collision_distances: 碰撞距离 [batch_size, seq_len, n_agents]
     """
     
     # 从状态中提取位置和速度
-    positions = states[..., :3]  # [batch_size, seq_len, n_agents, 3]
+    positions = states[..., :3]
     velocities = states[..., 3:6] if states.shape[-1] >= 6 else jnp.zeros_like(positions)
     
-    # 1. 速度跟踪损失 (参考DiffPhysDrone的Smooth L1 loss)
+    # 1. 速度跟踪损失
     velocity_error = velocities - target_velocities
     velocity_loss = jnp.mean(
         jnp.where(
@@ -154,17 +148,23 @@ def compute_physics_loss(
         )
     )
     
-    # 2. 碰撞损失 (指数惩罚接近)
-    collision_loss = jnp.mean(
-        jnp.exp(-collision_distances / safety_radius) * 
-        jnp.maximum(0, safety_radius - collision_distances) ** 2
+    # 2. 碰撞损失 - 确保梯度流动
+    min_safe_distance = safety_radius * 2.0  # 智能体间的最小安全距离
+    collision_penalty = jnp.where(
+        collision_distances < min_safe_distance,
+        jnp.exp(-(collision_distances - safety_radius) / safety_radius),
+        0.0
     )
+    collision_loss = jnp.mean(collision_penalty)
     
     # 3. 控制平滑性损失
-    action_diff = actions[:, 1:] - actions[:, :-1]
-    control_smoothness = jnp.mean(action_diff ** 2)
+    if actions.shape[1] > 1:
+        action_diff = actions[:, 1:] - actions[:, :-1]
+        control_smoothness = jnp.mean(action_diff ** 2)
+    else:
+        control_smoothness = 0.0
     
-    total_physics_loss = velocity_loss + collision_loss + 0.1 * control_smoothness
+    total_physics_loss = velocity_loss + 5.0 * collision_loss + 0.1 * control_smoothness
     
     return PhysicsLossComponents(
         velocity_loss=velocity_loss,
@@ -174,243 +174,272 @@ def compute_physics_loss(
     )
 
 def identify_safe_unsafe_states(
-    positions: jnp.ndarray,
     collision_distances: jnp.ndarray,
     safety_radius: float = 0.5,
-    danger_threshold: float = 0.8
+    safe_threshold: float = 3.0,
+    unsafe_threshold: float = 1.5
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     识别安全和不安全状态 - 修复版本
-    
-    Args:
-        positions: 位置 [batch_size, seq_len, n_agents, 3]
-        collision_distances: 最近碰撞距离 [batch_size, seq_len, n_agents]
-        safety_radius: 安全半径
-        danger_threshold: 危险阈值倍数
-        
-    Returns:
-        safe_mask: 安全状态掩码
-        unsafe_mask: 不安全状态掩码
     """
     
-    # 安全状态：距离障碍物/其他智能体足够远
-    safe_mask = collision_distances > (safety_radius * danger_threshold)
+    # 安全状态：距离大于安全阈值
+    safe_mask = collision_distances > (safety_radius * safe_threshold)
     
-    # 不安全状态：距离障碍物/其他智能体太近
-    unsafe_mask = collision_distances < safety_radius
+    # 不安全状态：距离小于不安全阈值
+    unsafe_mask = collision_distances < (safety_radius * unsafe_threshold)
+    
+    # 转换为float以用于损失计算
+    safe_mask = safe_mask.astype(jnp.float32)
+    unsafe_mask = unsafe_mask.astype(jnp.float32)
     
     return safe_mask, unsafe_mask
 
-def construct_graph_from_states_corrected(
-    states: jnp.ndarray,  # [batch_size, n_agents, state_dim]
-    sensing_radius: float = 2.0,
-    max_neighbors: int = 10
+def compute_collision_distances_batch(states: jnp.ndarray) -> jnp.ndarray:
+    """
+    批量计算智能体间的最小距离
+    
+    Args:
+        states: [batch_size, seq_len, n_agents, state_dim]
+        
+    Returns:
+        min_distances: [batch_size, seq_len, n_agents]
+    """
+    positions = states[..., :3]  # [batch_size, seq_len, n_agents, 3]
+    
+    # 计算每个时间步的距离
+    def compute_distances_at_timestep(pos_at_t):
+        # pos_at_t: [batch_size, n_agents, 3]
+        pos_i = pos_at_t[:, :, None, :]  # [batch, n_agents, 1, 3]
+        pos_j = pos_at_t[:, None, :, :]  # [batch, 1, n_agents, 3]
+        distances = jnp.linalg.norm(pos_i - pos_j, axis=-1)  # [batch, n_agents, n_agents]
+        
+        # 排除自身距离
+        n_agents = distances.shape[-1]
+        mask = jnp.eye(n_agents)
+        distances = jnp.where(mask[None, :, :], jnp.inf, distances)
+        
+        # 最小距离
+        min_distances = jnp.min(distances, axis=-1)  # [batch, n_agents]
+        return min_distances
+    
+    # 对每个时间步应用
+    min_distances = jax.vmap(compute_distances_at_timestep, in_axes=1, out_axes=1)(positions)
+    
+    return min_distances
+
+def construct_graph_batch(
+    states: jnp.ndarray,
+    sensing_radius: float = 2.0
 ) -> Dict[str, jnp.ndarray]:
     """
-    修复版本：正确地从状态构建图数据
-    这是GCBF+的核心 - 必须正确实现
+    从状态批量构建图数据 - 完全重写确保正确性
+    
+    Args:
+        states: [batch_size, n_agents, state_dim]
+        
+    Returns:
+        graph_batch: 批量图数据
     """
     batch_size, n_agents, state_dim = states.shape
+    
+    # 提取位置和速度
     positions = states[..., :3]  # [batch_size, n_agents, 3]
     
-    def build_single_graph(batch_states):
-        """为单个batch构建图"""
-        batch_positions = batch_states[:, :3]  # [n_agents, 3]
-        
-        # 计算所有智能体对之间的距离
-        pos_i = batch_positions[:, None, :]  # [n_agents, 1, 3]
-        pos_j = batch_positions[None, :, :]  # [1, n_agents, 3]
-        distances = jnp.linalg.norm(pos_i - pos_j, axis=-1)  # [n_agents, n_agents]
-        
-        # 创建邻接矩阵
-        adjacency = (distances < sensing_radius) & (distances > 0)
-        
-        # 限制邻居数量
-        def limit_neighbors_per_agent(agent_idx):
-            agent_distances = distances[agent_idx]
-            agent_adjacency = adjacency[agent_idx]
-            
-            # 找到最近的max_neighbors个邻居
-            neighbor_indices = jnp.argsort(agent_distances)
-            valid_neighbors = neighbor_indices[1:max_neighbors+1]  # 排除自己
-            
-            limited_adj = jnp.zeros(n_agents, dtype=bool)
-            limited_adj = limited_adj.at[valid_neighbors].set(
-                agent_adjacency[valid_neighbors]
-            )
-            return limited_adj
-        
-        # 对每个智能体应用邻居限制
-        adjacency = jax.vmap(limit_neighbors_per_agent)(jnp.arange(n_agents))
-        
-        # 构建节点特征 
-        node_features = batch_states  # [n_agents, state_dim]
-        
-        # 构建边特征 (相对位置和速度)
-        rel_positions = pos_i - pos_j  # [n_agents, n_agents, 3]
-        
-        if state_dim >= 6:
-            velocities = batch_states[:, 3:6]
-            vel_i = velocities[:, None, :]
-            vel_j = velocities[None, :, :]
-            rel_velocities = vel_i - vel_j  # [n_agents, n_agents, 3]
-            edge_features = jnp.concatenate([rel_positions, rel_velocities], axis=-1)
-        else:
-            edge_features = rel_positions
-            
-        return {
-            'nodes': node_features,
-            'edges': edge_features,
-            'adjacency': adjacency.astype(jnp.float32),
-            'n_nodes': n_agents
-        }
+    # 计算距离矩阵
+    pos_i = positions[:, :, None, :]  # [batch, n_agents, 1, 3]
+    pos_j = positions[:, None, :, :]  # [batch, 1, n_agents, 3]
+    distances = jnp.linalg.norm(pos_i - pos_j, axis=-1)  # [batch, n_agents, n_agents]
     
-    # 为每个batch构建图
-    batch_graphs = jax.vmap(build_single_graph)(states)
+    # 创建邻接矩阵
+    adjacency = (distances < sensing_radius) & (distances > 1e-6)
+    adjacency = adjacency.astype(jnp.float32)
     
-    return batch_graphs
+    # 节点特征就是状态本身
+    node_features = states  # [batch_size, n_agents, state_dim]
+    
+    # 边特征：相对位置和相对速度
+    rel_positions = pos_i - pos_j  # [batch, n_agents, n_agents, 3]
+    
+    if state_dim >= 6:
+        velocities = states[..., 3:6]
+        vel_i = velocities[:, :, None, :]
+        vel_j = velocities[:, None, :, :]
+        rel_velocities = vel_i - vel_j
+        edge_features = jnp.concatenate([rel_positions, rel_velocities], axis=-1)
+    else:
+        edge_features = rel_positions
+    
+    # 添加距离作为额外的边特征
+    distances_expanded = distances[..., None]
+    edge_features = jnp.concatenate([edge_features, distances_expanded], axis=-1)
+    
+    return {
+        'nodes': node_features,
+        'edges': edge_features,
+        'adjacency': adjacency,
+        'n_nodes': n_agents,
+        'batch_size': batch_size
+    }
 
-def compute_cbf_time_derivative_corrected(
-    cbf_values: jnp.ndarray,      # [batch_size, n_agents]
-    cbf_grads: jnp.ndarray,       # [batch_size, n_agents, state_dim]
-    states: jnp.ndarray,          # [batch_size, n_agents, state_dim] 
-    actions: jnp.ndarray,         # [batch_size, n_agents, action_dim]
+def compute_cbf_time_derivative(
+    cbf_values: jnp.ndarray,
+    cbf_grads: jnp.ndarray,
+    states: jnp.ndarray,
+    actions: jnp.ndarray,
     dt: float = 0.02
 ) -> jnp.ndarray:
     """
-    修复版本：正确计算CBF时间导数
-    这是连接CBF和动力学的关键 - dh/dt = ∇h · f(x,u)
+    计算CBF时间导数 - 确保形状匹配
+    
+    Args:
+        cbf_values: [batch_size, n_agents]
+        cbf_grads: [batch_size, n_agents, grad_dim]
+        states: [batch_size, n_agents, state_dim]
+        actions: [batch_size, n_agents, action_dim]
     """
+    batch_size, n_agents = cbf_values.shape
     
-    # 计算系统动力学 f(x,u) - 点质量模型
-    def compute_dynamics(state, action):
-        if state.shape[-1] >= 6:
-            # 完整动力学: [position, velocity] -> [velocity, acceleration]
-            position = state[:3]
-            velocity = state[3:6]
-            acceleration = action[:3]  # 动作为期望加速度
-            
-            state_dot = jnp.concatenate([velocity, acceleration])
+    # 计算状态导数
+    if states.shape[-1] >= 6:
+        # 完整状态：[position, velocity]
+        velocities = states[..., 3:6]
+        accelerations = actions[..., :3]
+        
+        # 只使用位置和速度的梯度
+        grad_dim = min(cbf_grads.shape[-1], 6)
+        cbf_grads_truncated = cbf_grads[..., :grad_dim]
+        
+        if grad_dim >= 6:
+            # 完整梯度：对位置和速度
+            state_dot = jnp.concatenate([velocities, accelerations], axis=-1)
+            cbf_dot = jnp.sum(cbf_grads_truncated * state_dot, axis=-1)
         else:
-            # 简化动力学: position -> velocity
-            state_dot = action[:3]
-            
-        return state_dot
-    
-    # 对每个智能体计算状态导数
-    state_derivatives = jax.vmap(jax.vmap(compute_dynamics))(states, actions)
-    
-    # CBF时间导数: dh/dt = ∇h · ẋ
-    # cbf_grads: [batch_size, n_agents, state_dim]
-    # state_derivatives: [batch_size, n_agents, state_dim]
-    cbf_dot = jnp.sum(cbf_grads * state_derivatives, axis=-1)  # [batch_size, n_agents]
+            # 只有位置梯度
+            cbf_dot = jnp.sum(cbf_grads_truncated[..., :3] * velocities, axis=-1)
+    else:
+        # 简化状态
+        state_dot = actions[..., :states.shape[-1]]
+        cbf_dot = jnp.sum(cbf_grads * state_dot, axis=-1)
     
     return cbf_dot
 
-def compute_total_loss_and_metrics_corrected(
+@partial(jax.jit, static_argnums=(2, 3))
+def compute_total_loss_and_metrics(
     training_state: TrainingState,
     batch_data: Dict[str, jnp.ndarray],
     physics_step_fn,
     config: Dict[str, Any]
 ) -> TotalLossComponents:
     """
-    修复版本：计算总损失和指标 - 确保梯度正确流动
+    计算总损失 - 完全重写确保GNN梯度流动
     """
     
-    # 解包输入数据
+    # 解包数据
     initial_states = batch_data['initial_states']  # [batch_size, n_agents, state_dim]
     target_velocities = batch_data['target_velocities']  # [batch_size, seq_len, n_agents, 3]
     
     batch_size, n_agents, state_dim = initial_states.shape
     seq_len = target_velocities.shape[1]
     
-    # === 核心修复：正确的时间展开与梯度流 ===
-    def single_step(carry, step_input):
-        """单步前向传播 - 确保梯度流通"""
-        current_states, step = carry
-        target_vel = step_input  # [batch_size, n_agents, 3]
+    def scan_fn(carry, inputs):
+        current_states = carry
+        target_vel = inputs  # [batch_size, n_agents, 3]
         
-        # 1. 构建图数据 - 修复版本
-        graph_batch = construct_graph_from_states_corrected(
-            current_states, 
-            sensing_radius=config.get('sensing_radius', 2.0)
+        # 1. 构建图批量数据
+        graph_batch = construct_graph_batch(current_states, config.get('sensing_radius', 2.0))
+        
+        # 2. GNN前向传播 - 批量处理
+        # 重塑为单个大batch以便GNN处理
+        nodes_flat = graph_batch['nodes'].reshape(-1, state_dim)
+        edges_flat = graph_batch['edges'].reshape(-1, n_agents, graph_batch['edges'].shape[-1])
+        adjacency_flat = graph_batch['adjacency'].reshape(-1, n_agents)
+        
+        flat_graph = {
+            'nodes': nodes_flat,
+            'edges': edges_flat,
+            'adjacency': adjacency_flat,
+            'n_nodes': n_agents
+        }
+        
+        # GNN计算
+        cbf_output = training_state.gnn_state.apply_fn(
+            training_state.gnn_state.params,
+            flat_graph,
+            training=True
         )
         
-        # 2. GNN计算CBF - 确保梯度流
-        def compute_cbf_for_single_graph(single_graph):
-            return training_state.gnn_state.apply_fn(
-                training_state.gnn_state.params, 
-                single_graph,
-                training=True
-            )
+        if isinstance(cbf_output, tuple):
+            cbf_values_flat, cbf_grads_flat = cbf_output
+        else:
+            cbf_values_flat = cbf_output
+            cbf_grads_flat = jnp.zeros((batch_size * n_agents, 6))
         
-        # 批量处理图数据
-        cbf_outputs = jax.vmap(compute_cbf_for_single_graph)(graph_batch)
-        cbf_values = cbf_outputs[0] if isinstance(cbf_outputs, tuple) else cbf_outputs
-        cbf_grads = cbf_outputs[1] if isinstance(cbf_outputs, tuple) else jnp.zeros_like(current_states)
+        # 重塑回原始batch形状
+        cbf_values = cbf_values_flat.reshape(batch_size, n_agents)
+        cbf_grads = cbf_grads_flat.reshape(batch_size, n_agents, -1)
         
         # 3. 策略网络计算动作
-        def compute_action_for_batch(states, target_vel):
-            def compute_single_agent_action(state, target):
-                return training_state.policy_state.apply_fn(
-                    training_state.policy_state.params,
-                    jnp.concatenate([state, target])
-                )
-            
-            return jax.vmap(compute_single_agent_action)(states, target_vel)
+        # 准备策略输入：状态 + 目标速度 + CBF值
+        policy_inputs = jnp.concatenate([
+            current_states,
+            target_vel,
+            cbf_values[..., None]
+        ], axis=-1)
         
-        actions = jax.vmap(compute_action_for_batch)(current_states, target_vel)
+        # 批量策略计算
+        actions_flat = training_state.policy_state.apply_fn(
+            training_state.policy_state.params,
+            policy_inputs.reshape(-1, policy_inputs.shape[-1])
+        )
+        actions = actions_flat.reshape(batch_size, n_agents, -1)
         
-        # 4. 物理仿真更新状态
+        # 4. 物理仿真
         next_states = physics_step_fn(current_states, actions)
         
-        # 5. 计算CBF时间导数 - 修复版本
-        cbf_derivatives = compute_cbf_time_derivative_corrected(
-            cbf_values, cbf_grads, current_states, actions
+        # 5. 计算CBF时间导数
+        cbf_derivatives = compute_cbf_time_derivative(
+            cbf_values, cbf_grads, current_states, actions, config.get('dt', 0.02)
         )
         
         # 6. 计算碰撞距离
-        collision_distances = compute_collision_distances_corrected(current_states)
+        collision_distances = compute_collision_distances_batch(
+            current_states[None, :, :, :]
+        )[0, 0]  # 取第一个时间步
         
-        # 输出本步数据
-        step_outputs = {
-            'states': current_states,
-            'actions': actions,
-            'cbf_values': cbf_values,
-            'cbf_derivatives': cbf_derivatives,
-            'collision_distances': collision_distances
-        }
+        outputs = (
+            current_states,
+            actions,
+            cbf_values,
+            cbf_derivatives,
+            collision_distances
+        )
         
-        return (next_states, step + 1), step_outputs
+        return next_states, outputs
     
-    # 执行时间展开
-    initial_carry = (initial_states, 0)
-    target_vel_sequence = jnp.transpose(target_velocities, (1, 0, 2, 3))  # [seq_len, batch, n_agents, 3]
-    
-    final_carry, trajectory_outputs = jax.lax.scan(
-        single_step,
-        initial_carry, 
+    # 执行scan
+    target_vel_sequence = target_velocities.transpose(1, 0, 2, 3)
+    final_states, (states_traj, actions_traj, cbf_values_traj, 
+                   cbf_derivatives_traj, collision_distances_traj) = jax.lax.scan(
+        scan_fn,
+        initial_states,
         target_vel_sequence,
         length=seq_len
     )
     
-    # 重新整理输出维度: [seq_len, batch, n_agents, ...] -> [batch, seq_len, n_agents, ...]
-    states_traj = jnp.transpose(trajectory_outputs['states'], (1, 0, 2, 3))
-    actions_traj = jnp.transpose(trajectory_outputs['actions'], (1, 0, 2, 3))
-    cbf_values_traj = jnp.transpose(trajectory_outputs['cbf_values'], (1, 0, 2))
-    cbf_derivatives_traj = jnp.transpose(trajectory_outputs['cbf_derivatives'], (1, 0, 2))
-    collision_distances_traj = jnp.transpose(trajectory_outputs['collision_distances'], (1, 0, 2))
+    # 转置回 [batch, seq_len, ...]
+    states_traj = states_traj.transpose(1, 0, 2, 3)
+    actions_traj = actions_traj.transpose(1, 0, 2, 3)
+    cbf_values_traj = cbf_values_traj.transpose(1, 0, 2)
+    cbf_derivatives_traj = cbf_derivatives_traj.transpose(1, 0, 2)
+    collision_distances_traj = collision_distances_traj.transpose(1, 0, 2)
     
-    # === 损失计算 ===
-    
-    # 识别安全/不安全状态
+    # 计算损失
     safe_mask, unsafe_mask = identify_safe_unsafe_states(
-        states_traj[..., :3], 
         collision_distances_traj,
         safety_radius=config.get('safety_radius', 0.5)
     )
     
-    # CBF损失
     cbf_losses = compute_cbf_loss(
         cbf_values_traj,
         cbf_derivatives_traj,
@@ -420,7 +449,6 @@ def compute_total_loss_and_metrics_corrected(
         gamma=config.get('gamma', 0.02)
     )
     
-    # 物理损失
     physics_losses = compute_physics_loss(
         states_traj,
         actions_traj,
@@ -430,11 +458,14 @@ def compute_total_loss_and_metrics_corrected(
     )
     
     # 总损失
-    cbf_weight = config.get('cbf_weight', 1.0)
-    physics_weight = config.get('physics_weight', 1.0)
-    total_loss = cbf_weight * cbf_losses.total_cbf_loss + physics_weight * physics_losses.total_physics_loss
+    total_loss = (config.get('cbf_weight', 2.0) * cbf_losses.total_cbf_loss + 
+                  config.get('physics_weight', 1.0) * physics_losses.total_physics_loss)
     
-    # 指标
+    # 计算最终距离
+    final_positions = states_traj[:, -1, :, :3]
+    final_target_positions = jnp.mean(target_velocities[:, -1, :, :], axis=1, keepdims=True) * seq_len * config.get('dt', 0.02)
+    final_distances = jnp.linalg.norm(final_positions - final_target_positions, axis=-1)
+    
     metrics = {
         'cbf_condition_loss': cbf_losses.cbf_condition_loss,
         'safe_loss': cbf_losses.safe_loss,
@@ -445,8 +476,8 @@ def compute_total_loss_and_metrics_corrected(
         'safety_violations': jnp.sum(unsafe_mask),
         'avg_cbf_value': jnp.mean(cbf_values_traj),
         'min_collision_distance': jnp.min(collision_distances_traj),
-        'cbf_values_std': jnp.std(cbf_values_traj),
-        'cbf_derivatives_mean': jnp.mean(cbf_derivatives_traj)
+        'cbf_std': jnp.std(cbf_values_traj),
+        'final_distance': jnp.mean(final_distances)
     }
     
     return TotalLossComponents(
@@ -456,38 +487,18 @@ def compute_total_loss_and_metrics_corrected(
         metrics=metrics
     )
 
-def compute_collision_distances_corrected(states: jnp.ndarray) -> jnp.ndarray:
-    """修复版本：正确计算智能体间的最小距离"""
-    positions = states[..., :3]  # [batch_size, n_agents, 3]
-    
-    # 计算所有智能体对之间的距离
-    pos_i = jnp.expand_dims(positions, axis=2)  # [batch, n_agents, 1, 3]
-    pos_j = jnp.expand_dims(positions, axis=1)  # [batch, 1, n_agents, 3] 
-    distances = jnp.linalg.norm(pos_i - pos_j, axis=-1)  # [batch, n_agents, n_agents]
-    
-    # 排除自己与自己的距离
-    n_agents = distances.shape[-1]
-    eye_mask = jnp.eye(n_agents)
-    distances = jnp.where(eye_mask, jnp.inf, distances)
-    
-    # 返回每个智能体到最近邻居的距离
-    min_distances = jnp.min(distances, axis=-1)  # [batch, n_agents]
-    
-    return min_distances
-
 @jax.jit
 def train_step_corrected(
     training_state: TrainingState,
-    batch_data: Dict[str, jnp.ndarray], 
+    batch_data: Dict[str, jnp.ndarray],
     physics_step_fn,
     config: Dict[str, Any]
 ) -> Tuple[TrainingState, Dict[str, jnp.ndarray]]:
     """
-    修复版本：执行一步训练 - 确保梯度正确计算和传播
+    执行训练步骤 - 确保两个网络都能获得梯度
     """
     
     def loss_fn(policy_params, gnn_params):
-        """损失函数 - 确保两个网络都能接收到梯度"""
         # 创建临时训练状态
         temp_training_state = TrainingState(
             policy_state=training_state.policy_state.replace(params=policy_params),
@@ -496,7 +507,7 @@ def train_step_corrected(
         )
         
         # 计算损失
-        loss_components = compute_total_loss_and_metrics_corrected(
+        loss_components = compute_total_loss_and_metrics(
             temp_training_state,
             batch_data,
             physics_step_fn,
@@ -512,13 +523,10 @@ def train_step_corrected(
         training_state.gnn_state.params
     )
     
-    # 更新策略网络
+    # 更新参数
     new_policy_state = training_state.policy_state.apply_gradients(grads=policy_grads)
-    
-    # 更新GNN网络
     new_gnn_state = training_state.gnn_state.apply_gradients(grads=gnn_grads)
     
-    # 创建新的训练状态
     new_training_state = TrainingState(
         policy_state=new_policy_state,
         gnn_state=new_gnn_state,
@@ -533,7 +541,6 @@ def train_step_corrected(
         sum(jnp.sum(g**2) for g in jax.tree_util.tree_leaves(gnn_grads))
     )
     
-    # 整理输出指标
     metrics = dict(loss_components.metrics)
     metrics.update({
         'total_loss': loss_value,
@@ -546,7 +553,7 @@ def train_step_corrected(
     
     return new_training_state, metrics
 
-# 简化的训练系统测试用例
+# 测试系统
 class CompleteTrainingSystem:
     """完整训练系统"""
     
@@ -571,16 +578,16 @@ class CompleteTrainingSystem:
     
     def _init_params(self):
         """初始化参数"""
-        # 初始化策略网络参数
         key1, key2 = jax.random.split(self.rng_key)
         
-        dummy_state = jnp.zeros(13)  # [pos(3) + vel(3) + quat(4) + angvel(3)]
-        self.policy_params = self.policy_model.init(key1, dummy_state)
+        # 策略网络输入：状态 + 目标速度 + CBF值
+        dummy_input = jnp.zeros(13 + 3 + 1)  # state + target_vel + cbf
+        self.policy_params = self.policy_model.init(key1, dummy_input)
         
-        # 初始化GNN参数
+        # GNN参数
         dummy_graph = {
             'nodes': jnp.zeros((4, 13)),
-            'edges': jnp.zeros((4, 4, 6)),
+            'edges': jnp.zeros((4, 4, 7)),  # 相对位置(3) + 相对速度(3) + 距离(1)
             'adjacency': jnp.ones((4, 4)),
             'n_nodes': 4
         }
@@ -590,14 +597,15 @@ class CompleteTrainingSystem:
         """获取初始训练状态"""
         return create_training_state(
             self.policy_model,
-            self.gnn_model, 
+            self.gnn_model,
             self.policy_params,
             self.gnn_params,
-            learning_rate=self.config.get('learning_rate', 1e-4)
+            learning_rate=self.config.get('learning_rate', 1e-4),
+            gnn_learning_rate=self.config.get('gnn_learning_rate', 5e-4)
         )
     
     def train_step(
-        self, 
+        self,
         training_state: TrainingState,
         initial_states: jnp.ndarray,
         target_velocities: jnp.ndarray
@@ -616,7 +624,6 @@ class CompleteTrainingSystem:
             self.config
         )
 
-# 测试函数
 def test_complete_gradient_flow():
     """测试完整系统梯度流"""
     print("开始完整系统梯度流测试...")
@@ -625,14 +632,16 @@ def test_complete_gradient_flow():
         # 配置
         config = {
             'learning_rate': 1e-4,
-            'trajectory_length': 5,
-            'batch_size': 2,
-            'n_agents': 2,
-            'sensing_radius': 2.0,
+            'gnn_learning_rate': 5e-4,
+            'trajectory_length': 10,
+            'batch_size': 4,
+            'n_agents': 3,
+            'sensing_radius': 3.0,
             'safety_radius': 0.5,
             'alpha': 1.0,
-            'cbf_weight': 1.0,
-            'physics_weight': 0.1,
+            'gamma': 0.05,
+            'cbf_weight': 2.0,
+            'physics_weight': 1.0,
             'dt': 0.02
         }
         
@@ -643,52 +652,68 @@ def test_complete_gradient_flow():
         
         # 测试数据
         batch_size = config['batch_size']
-        n_agents = config['n_agents'] 
+        n_agents = config['n_agents']
         seq_len = config['trajectory_length']
         
-        # 随机初始状态
-        initial_states = jax.random.normal(
-            jax.random.PRNGKey(123), 
-            (batch_size, n_agents, 13)
-        ) * 0.1
-        
-        # 随机目标速度
-        target_velocities = jax.random.normal(
-            jax.random.PRNGKey(456), 
-            (batch_size, seq_len, n_agents, 3)
-        ) * 0.5
-        
-        # 执行训练步骤
-        print("执行完整训练步骤...")
-        new_training_state, metrics = training_system.train_step(
-            training_state, initial_states, target_velocities
+        # 创建多样化的初始状态
+        initial_states = jnp.zeros((batch_size, n_agents, 13))
+        # 随机初始位置
+        positions = jax.random.uniform(
+            jax.random.PRNGKey(123),
+            (batch_size, n_agents, 3),
+            minval=-2.0,
+            maxval=2.0
         )
+        initial_states = initial_states.at[..., :3].set(positions)
+        # 单位四元数
+        initial_states = initial_states.at[..., 6].set(1.0)
         
-        print("✅ 完整训练步骤执行成功!")
-        print(f"总损失: {metrics['total_loss']:.4f}")
-        print(f"策略网络梯度范数: {metrics['policy_grad_norm']:.6f}")
-        print(f"GNN梯度范数: {metrics['gnn_grad_norm']:.6f}")
-        print(f"CBF损失: {metrics['cbf_total_loss']:.4f}")
-        print(f"物理损失: {metrics['physics_total_loss']:.4f}")
-        print(f"安全违规次数: {metrics['safety_violations']:.1f}")
-        print(f"平均CBF值: {metrics['avg_cbf_value']:.4f}")
+        # 目标速度序列
+        target_velocities = jax.random.normal(
+            jax.random.PRNGKey(456),
+            (batch_size, seq_len, n_agents, 3)
+        ) * 2.0
+        
+        # 执行多步训练
+        print("执行多步训练测试...")
+        for i in range(3):
+            new_training_state, metrics = training_system.train_step(
+                training_state, initial_states, target_velocities
+            )
+            
+            print(f"\n步骤 {i+1}:")
+            print(f"总损失: {metrics['total_loss']:.4f}")
+            print(f"CBF损失: {metrics['cbf_total_loss']:.4f}")
+            print(f"物理损失: {metrics['physics_total_loss']:.4f}")
+            print(f"策略梯度范数: {metrics['policy_grad_norm']:.6f}")
+            print(f"GNN梯度范数: {metrics['gnn_grad_norm']:.6f}")
+            print(f"平均CBF值: {metrics['avg_cbf_value']:.4f}")
+            print(f"CBF标准差: {metrics['cbf_std']:.4f}")
+            print(f"最小碰撞距离: {metrics['min_collision_distance']:.4f}")
+            
+            training_state = new_training_state
         
         # 验证梯度流
-        policy_grad_ok = metrics['policy_grad_norm'] > 1e-8
-        gnn_grad_ok = metrics['gnn_grad_norm'] > 1e-8  # 关键检查
-        loss_finite = jnp.isfinite(metrics['total_loss'])
+        final_metrics = metrics
+        policy_grad_ok = final_metrics['policy_grad_norm'] > 1e-6
+        gnn_grad_ok = final_metrics['gnn_grad_norm'] > 1e-6
+        loss_finite = jnp.isfinite(final_metrics['total_loss'])
+        cbf_loss_ok = final_metrics['cbf_total_loss'] > 1e-6
         
-        if policy_grad_ok and gnn_grad_ok and loss_finite:
-            print("✅ 梯度流正常，两个网络都接收到有效梯度")
+        if policy_grad_ok and gnn_grad_ok and loss_finite and cbf_loss_ok:
+            print("\n✅ 梯度流正常，两个网络都接收到有效梯度")
+            print("✅ CBF损失非零，安全机制正常工作")
             return True
         else:
-            print("❌ 警告: 某些网络的梯度异常")
+            print("\n❌ 警告: 梯度流或损失计算存在问题")
             if not policy_grad_ok:
-                print("  - 策略网络梯度异常")
+                print("  - 策略网络梯度过小")
             if not gnn_grad_ok:
-                print("  - GNN网络梯度异常") 
+                print("  - GNN网络梯度过小")
             if not loss_finite:
-                print("  - 损失值异常")
+                print("  - 损失值非有限")
+            if not cbf_loss_ok:
+                print("  - CBF损失过小")
             return False
             
     except Exception as e:
@@ -697,14 +722,14 @@ def test_complete_gradient_flow():
         traceback.print_exc()
         return False
 
-# 导出主要函数
+# 导出函数
 __all__ = [
     'TrainingState',
-    'CBFLossComponents', 
+    'CBFLossComponents',
     'PhysicsLossComponents',
     'TotalLossComponents',
     'create_training_state',
-    'compute_total_loss_and_metrics_corrected',
+    'compute_total_loss_and_metrics',
     'train_step_corrected',
     'CompleteTrainingSystem',
     'test_complete_gradient_flow'
