@@ -18,9 +18,19 @@ import time
 import sys
 from pathlib import Path
 
-# Configure JAX for optimal performance
+# Configure JAX for optimal performance - AUTO DETECT PLATFORM
 jax.config.update("jax_enable_x64", True)  # Enable 64-bit precision
-jax.config.update("jax_platform_name", "gpu")  # Prefer GPU if available
+
+# Auto-detect best available platform (GPU if available, fallback to CPU)
+try:
+    devices = jax.devices()
+    print(f"Available JAX devices: {devices}")
+    if any('gpu' in str(device).lower() for device in devices):
+        print("Using GPU acceleration")
+    else:
+        print("Using CPU (GPU not available)")
+except Exception as e:
+    print(f"JAX device detection: {e}")
 
 # Add project root to path
 project_root = Path(__file__).parent

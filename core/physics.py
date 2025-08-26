@@ -62,7 +62,6 @@ class PhysicsParams:
     """
     # Time integration
     dt: float = 1.0/15.0  # Simulation timestep
-    gravity: chex.Array = jnp.array([0.0, 0.0, -9.81])  # Gravitational acceleration
     
     # Drone physical properties
     mass: float = 0.027  # kg (Crazyflie mass)
@@ -81,6 +80,11 @@ class PhysicsParams:
     # Temporal gradient decay (DiffPhysDrone innovation)
     gradient_decay_alpha: float = 0.92  # Gradient decay rate
     enable_gradient_decay: bool = True
+
+    @property
+    def gravity(self) -> chex.Array:
+        """Gravitational acceleration - created at runtime."""
+        return jnp.array([0.0, 0.0, -9.81])
 
 
 # =============================================================================
