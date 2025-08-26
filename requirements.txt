@@ -1,48 +1,130 @@
-# Core JAX Dependencies
-jax>=0.4.20
-jaxlib>=0.4.20
-jax-md>=0.2.7
+# =============================================================================
+# CORE JAX DEPENDENCIES
+# =============================================================================
+# JAX ecosystem with version constraints for stability
+jax>=0.4.20,<0.5.0
+jaxlib>=0.4.20,<0.5.0
 
-# Neural Network Frameworks
-flax>=0.8.0
-optax>=0.1.7
-jraph>=0.0.6.dev
+# JAX-MD for optional advanced graph operations (if needed later)
+# Note: Only install if planning to use advanced molecular dynamics features
+# jax-md>=0.2.7
 
-# Differentiable QP Solver
+# =============================================================================
+# NEURAL NETWORK FRAMEWORKS
+# =============================================================================
+# Flax for neural networks with JAX
+flax>=0.8.0,<0.9.0
+
+# Optax for JAX-compatible optimizers  
+optax>=0.1.7,<0.2.0
+
+# Jraph for Graph Neural Networks
+jraph>=0.0.6.dev0
+
+# =============================================================================
+# DIFFERENTIABLE QP SOLVER
+# =============================================================================
+# QPax for differentiable QP solving (core requirement)
 qpax>=0.0.3
 
-# Configuration Management  
+# =============================================================================
+# CONFIGURATION MANAGEMENT
+# =============================================================================
+# ML Collections for structured configs
 ml_collections>=0.1.1
+
+# OmegaConf as alternative/supplement to ml_collections
 omegaconf>=2.3.0
 
-# Scientific Computing
-numpy>=1.24.0
-scipy>=1.10.0
+# =============================================================================
+# SCIENTIFIC COMPUTING CORE
+# =============================================================================
+# NumPy - stick to stable versions that work with JAX
+numpy>=1.24.0,<1.27.0
 
-# Data Handling and Visualization
+# SciPy for scientific computing
+scipy>=1.10.0,<1.12.0
+
+# =============================================================================
+# DATA HANDLING AND VISUALIZATION
+# =============================================================================
+# Matplotlib for plotting and visualization
 matplotlib>=3.6.0
+
+# Seaborn for statistical visualization
 seaborn>=0.12.0
+
+# Pandas for data manipulation
 pandas>=1.5.0
+
+# TQDM for progress bars
 tqdm>=4.64.0
 
-# Optional Dependencies for Advanced Features
-# JAX-MD for potential high-performance graph construction evaluation
-jax-md>=0.2.7
-
-# Testing and Development
+# =============================================================================
+# TESTING AND DEVELOPMENT TOOLS
+# =============================================================================
+# Pytest for testing framework
 pytest>=7.0.0
 pytest-cov>=4.0.0
+
+# Code formatting and linting
 black>=22.0.0
 isort>=5.10.0
 
-# Tensorboard for Logging
+# =============================================================================
+# LOGGING AND EXPERIMENT TRACKING
+# =============================================================================
+# TensorBoard for logging
 tensorboard>=2.10.0
-wandb>=0.13.0  # For experiment tracking
 
-# File I/O
+# Weights & Biases for experiment tracking  
+wandb>=0.13.0
+
+# =============================================================================
+# FILE I/O AND SERIALIZATION
+# =============================================================================
+# HDF5 support
 h5py>=3.7.0
-pickle5>=0.0.12
 
-# Utilities
+# NOTE: pickle5 removed - Python 3.8+ includes pickle protocol 5 natively
+# The pickle5 package is only needed for Python < 3.8
+# Since we're using modern Python, native pickle module is sufficient
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+# Click for CLI interfaces
 click>=8.1.0
+
+# Rich for beautiful terminal output
 rich>=12.0.0
+
+# Chex for JAX testing utilities
+chex>=0.1.7
+
+# =============================================================================
+# OPTIONAL DEPENDENCIES FOR ENHANCED FEATURES
+# =============================================================================
+# Uncomment these if you plan to use advanced features:
+
+# For advanced 3D rendering (if needed for complex visualization)
+# trimesh>=3.21.0
+# pyrender>=0.1.45
+
+# For additional math utilities
+# jaxopt>=0.6.0
+
+# For advanced optimization algorithms
+# optuna>=3.0.0  # For hyperparameter optimization
+
+# =============================================================================
+# PLATFORM-SPECIFIC NOTES
+# =============================================================================
+# Windows users: Ensure Visual Studio Build Tools are installed
+# macOS users: Ensure Xcode command line tools are installed  
+# Linux users: Ensure build-essential is installed
+
+# If you encounter CUDA issues with jaxlib:
+# pip install "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+# or for CUDA 12:
+# pip install "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
