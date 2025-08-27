@@ -167,7 +167,8 @@ class TestPointCloudToGraph:
         
         # Test with many points (should subsample)
         config_large = GraphConfig(max_points=3)
-        large_cloud = jnp.random.normal(0, 1, (20, 3))
+        rng_key = jax.random.PRNGKey(42)  # Use proper JAX random API
+        large_cloud = jax.random.normal(rng_key, (20, 3))
         graph_large, _ = pointcloud_to_graph(
             self.drone_state, large_cloud, config_large
         )

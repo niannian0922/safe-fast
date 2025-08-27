@@ -12,8 +12,8 @@ jaxlib>=0.4.20,<0.5.0
 # =============================================================================
 # NEURAL NETWORK FRAMEWORKS
 # =============================================================================
-# Flax for neural networks with JAX
-flax>=0.8.0,<0.9.0
+# Flax for neural networks with JAX (compatible with JAX 0.4.x)
+flax>=0.7.4,<0.8.0
 
 # Optax for JAX-compatible optimizers  
 optax>=0.1.7,<0.2.0

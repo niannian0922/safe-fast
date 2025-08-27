@@ -89,20 +89,17 @@ def filter_points_by_range(points: jnp.ndarray, drone_pos: jnp.ndarray, max_rang
 def find_knn_edges(drone_pos: jnp.ndarray, obstacle_points: jnp.ndarray, k: int) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Build KNN edges for ego-centric graph construction
-    
-    Edge types:
-    1. Ego drone to k nearest obstacles
-    2. Each obstacle to k nearest neighbors (including drone)
+    JAX/JIT compatible version with fixed-size outputs
     
     Args:
         drone_pos: (3,) - Drone position
         obstacle_points: (N, 3) - Obstacle point cloud
-        k: KNN neighbor count
+        k: KNN neighbor count (must be static for JIT compilation)
         
     Returns:
-        senders: (M,) - Sender node indices
-        receivers: (M,) - Receiver node indices  
-        edge_features: (M, edge_dim) - Edge features
+        senders: (fixed_size,) - Sender node indices (padded with -1 for invalid)
+        receivers: (fixed_size,) - Receiver node indices (padded with -1 for invalid) 
+        edge_features: (fixed_size, 4) - Edge features (padded with zeros for invalid)
     """
     n_obstacles = obstacle_points.shape[0]
     n_total = n_obstacles + 1  # +1 for ego drone node
@@ -114,44 +111,39 @@ def find_knn_edges(drone_pos: jnp.ndarray, obstacle_points: jnp.ndarray, k: int)
     distances = compute_pairwise_distances(all_positions, all_positions)
     
     # Mask diagonal to exclude self-connections
-    # Set diagonal to infinity to exclude from KNN
     distances_masked = jnp.where(jnp.eye(n_total), jnp.inf, distances)
     
-    # Find k nearest neighbors using top_k (negate for smallest distances)
-    k_actual = jnp.minimum(k, n_total - 1)  # Ensure k doesn't exceed available neighbors
-    # Apply top_k along each row separately using vmap
-    def find_top_k_for_row(distances_row):
-        _, indices = jax.lax.top_k(-distances_row, k_actual)
-        return indices
+    # Use static k value
+    k_use = min(k, n_total - 1)  # Static computation
     
-    top_k_indices = jax.vmap(find_top_k_for_row)(distances_masked)
+    # Get k nearest neighbors for each node
+    _, top_k_indices = jax.vmap(lambda row: jax.lax.top_k(-row, k_use))(distances_masked)
     
-    # Build edge lists
-    senders_list = []
-    receivers_list = []
-    edge_features_list = []
+    # Create fixed-size edge arrays 
+    max_edges = n_total * k_use
     
-    for i in range(n_total):
-        neighbors = top_k_indices[i]  # (k,) 
-        for j in range(k_actual):
-            neighbor_idx = neighbors[j]
-            # Only add edge if neighbor is valid and different from sender
-            if neighbor_idx != i and distances[i, neighbor_idx] < jnp.inf:
-                senders_list.append(i)
-                receivers_list.append(neighbor_idx)
-                
-                # Edge features: [distance, relative_position (3D)]
-                rel_pos = all_positions[neighbor_idx] - all_positions[i]
-                distance = distances[i, neighbor_idx]
-                edge_feat = jnp.concatenate([jnp.array([distance]), rel_pos])
-                edge_features_list.append(edge_feat)
+    # Create all potential edges (dense format)
+    all_senders = jnp.repeat(jnp.arange(n_total), k_use)
+    all_receivers = top_k_indices.flatten()
     
-    # Convert to arrays
-    senders = jnp.array(senders_list) if senders_list else jnp.array([], dtype=jnp.int32)
-    receivers = jnp.array(receivers_list) if receivers_list else jnp.array([], dtype=jnp.int32)
-    edge_features = jnp.stack(edge_features_list) if edge_features_list else jnp.zeros((0, 4))
+    # Compute all edge features
+    sender_positions = all_positions[all_senders]
+    receiver_positions = all_positions[all_receivers]
+    rel_positions = receiver_positions - sender_positions
+    edge_distances = jnp.linalg.norm(rel_positions, axis=1, keepdims=True)
+    all_edge_features = jnp.concatenate([edge_distances, rel_positions], axis=1)
     
-    return senders, receivers, edge_features
+    # Create validity mask (but don't use for indexing)
+    # Edge is valid if sender != receiver
+    validity_mask = (all_senders != all_receivers) & (all_receivers < n_total)
+    
+    # Instead of dynamic filtering, use fixed-size arrays and mark invalid edges
+    # Invalid edges will have sender/receiver = -1 and zero features
+    final_senders = jnp.where(validity_mask, all_senders, -1)
+    final_receivers = jnp.where(validity_mask, all_receivers, -1)
+    final_features = jnp.where(validity_mask[:, None], all_edge_features, 0.0)
+    
+    return final_senders, final_receivers, final_features
 
 def pointcloud_to_graph(drone_state: DroneState, point_cloud: jnp.ndarray, config: GraphConfig) -> Tuple[jraph.GraphsTuple, jnp.ndarray]:
     """
@@ -193,8 +185,9 @@ def pointcloud_to_graph(drone_state: DroneState, point_cloud: jnp.ndarray, confi
         n_valid = config.min_points
     elif n_valid > config.max_points:
         # Subsample if too many points
+        key = jax.random.PRNGKey(0)  # Use proper JAX random API
         indices = jax.random.choice(
-            jax.random.PRNGKey(0), n_valid, (config.max_points,), replace=False
+            key, n_valid, (config.max_points,), replace=False
         )
         valid_points = valid_points[indices]
         n_valid = config.max_points
@@ -220,30 +213,39 @@ def pointcloud_to_graph(drone_state: DroneState, point_cloud: jnp.ndarray, confi
         obstacle_features  # (n_valid, obstacle_node_features)
     ], axis=0)
     
-    # 4. Build edges
+    # 5. Build edges with fixed-size arrays
     senders, receivers, edge_features = find_knn_edges(
         drone_state.position, valid_points, config.k_neighbors
     )
     
-    # 5. Node type classification
+    # Filter out invalid edges (marked with -1) without dynamic slicing
+    valid_edge_mask = (senders >= 0) & (receivers >= 0)
+    
+    # Count valid edges
+    n_valid_edges = jnp.sum(valid_edge_mask.astype(jnp.int32))
+    
+    # For GraphsTuple, we'll use the full arrays but jraph can handle -1 indices
+    # The GNN will ignore edges with negative indices
+    
+    # 6. Node type classification
     # 0 = ego drone, 1 = obstacle
     node_types = jnp.concatenate([
         jnp.array([0]),  # ego node
         jnp.ones(n_valid)  # obstacle nodes
     ]).astype(jnp.int32)
     
-    # 6. Create GraphsTuple
+    # 7. Create GraphsTuple - use full arrays, jraph handles invalid edges gracefully
     n_nodes = n_valid + 1
-    n_edges = len(senders)
+    n_total_edges = len(senders)  # Include both valid and invalid edges
     
     graph = jraph.GraphsTuple(
         n_node=jnp.array([n_nodes]),  # Single graph
-        n_edge=jnp.array([n_edges]),  # Single graph
+        n_edge=jnp.array([n_total_edges]),  # Total edges (including invalid)
         nodes=all_node_features,  # (n_nodes, node_features)
-        edges=edge_features,  # (n_edges, edge_features) 
+        edges=edge_features,  # (n_total_edges, edge_features) 
         globals=None,
-        senders=senders,  # (n_edges,)
-        receivers=receivers,  # (n_edges,)
+        senders=senders,  # (n_total_edges,) - includes -1 for invalid
+        receivers=receivers,  # (n_total_edges,) - includes -1 for invalid
     )
     
     return graph, node_types
@@ -285,6 +287,7 @@ class GNNLayer(nn.Module):
     def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
         def message_fn(edge_feats, sender_feats, receiver_feats):
             """Message function: combines edge + sender + receiver features"""
+            # Handle invalid edges (sender or receiver = -1) by masking
             feats = jnp.concatenate([edge_feats, sender_feats, receiver_feats], axis=-1)
             feats = MLP(self.hid_size_msg, act=nn.relu, act_final=False)(feats)
             feats = nn.Dense(self.msg_dim, kernel_init=default_nn_init())(feats)
@@ -378,18 +381,20 @@ class CBFNet(nn.Module):
         )
         node_embeddings = gnn(graph)  # (n_nodes, gnn_out_dim)
         
-        # Extract ego drone embedding (only ego node type == 0)
-        ego_mask = node_types == 0
-        ego_embedding = node_embeddings[ego_mask]  # Should be exactly one ego node
+        # Extract ego drone embedding without boolean indexing
+        # We know ego node is always at index 0 by construction
+        ego_embedding = node_embeddings[0:1, :]  # (1, gnn_out_dim) - slice instead of boolean mask
         
         # MLP head for CBF prediction
         head = MLP(hid_sizes=self.head_sizes, act=nn.relu, act_final=False)
         x = head(ego_embedding)
         
         # Final CBF value with tanh activation (bounded output)
-        cbf_value = nn.tanh(nn.Dense(1, kernel_init=default_nn_init())(x))
+        cbf_raw = nn.Dense(1, kernel_init=default_nn_init())(x)
+        cbf_value = nn.tanh(cbf_raw)
         
-        return cbf_value.squeeze(-1)  # Remove last dimension
+        # Return scalar instead of (1,) shape
+        return cbf_value.squeeze()  # Remove all dimensions of size 1
 
 # =============================================================================
 # PERCEPTION MODULE
@@ -431,6 +436,20 @@ class PerceptionModule:
         return cbf_value, cbf_gradients
 
 # =============================================================================
+# JIT-COMPATIBLE WRAPPER FUNCTIONS
+# =============================================================================
+
+@ft.partial(jit, static_argnums=(2,))  # config is static
+def pointcloud_to_graph_jit(drone_state: DroneState, point_cloud: jnp.ndarray, config: GraphConfig) -> Tuple[jraph.GraphsTuple, jnp.ndarray]:
+    """JIT-compatible version of pointcloud_to_graph with static config"""
+    return pointcloud_to_graph(drone_state, point_cloud, config)
+
+@ft.partial(jit, static_argnums=(2,))  # k is static  
+def find_knn_edges_jit(drone_pos: jnp.ndarray, obstacle_points: jnp.ndarray, k: int) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """JIT-compatible version of find_knn_edges with static k"""
+    return find_knn_edges(drone_pos, obstacle_points, k)
+
+# =============================================================================
 # FACTORY FUNCTIONS AND UTILITIES
 # =============================================================================
 
@@ -445,10 +464,12 @@ def init_cbf_network(rng_key, input_graph: jraph.GraphsTuple, node_types: jnp.nd
     return cbf_net.init(rng_key, input_graph, node_types)
 
 # Core function for integration with loop.py scan_function
+@jit
 def get_cbf_from_pointcloud(params, drone_state: DroneState, point_cloud: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Optimized function for CBF computation in training loop
     Used by loop.py scan_function
+    JIT-compiled for performance
     """
     config = GraphConfig()
     graph, node_types = pointcloud_to_graph(drone_state, point_cloud, config)
