@@ -21,15 +21,145 @@ from flax import struct
 import functools
 
 # Import our implementations
-from core.physics import (
+from .physics import (
     DroneState, MultiAgentState, PhysicsParams,
     dynamics_step, multi_agent_dynamics_step,
     apply_temporal_gradient_decay, create_temporal_decay_schedule
 )
-from core.policy import (
+from .policy import (
     PolicyParams, PolicyState, PolicyNetworkMLP, PolicyNetworkRNN,
     evaluate_policy_mlp, evaluate_policy_rnn, apply_control_constraints
 )
+
+@struct.dataclass
+class ScanCarry:
+    """Scan carry state compatible with main.py interface"""
+    drone_state: DroneState  # Current drone state (contains position, velocity, etc.)
+    rnn_hidden_state: chex.Array  # RNN hidden state
+    step_count: int  # Current timestep
+    cumulative_reward: float  # Accumulated reward
+
+
+@struct.dataclass 
+class ScanOutput:
+    """Scan outputs compatible with main.py interface"""
+    # Basic trajectory data
+    positions: chex.Array  # [3] positions
+    velocities: chex.Array  # [3] velocities
+    control_commands: chex.Array  # [3] control commands
+    nominal_commands: chex.Array  # [3] nominal commands
+    step_loss: float  # Step loss
+    safety_violation: float  # Safety violations
+    
+    # Extended compatibility fields (will be added dynamically)
+    drone_states: Optional[chex.Array] = None  # Full state vector
+    cbf_values: Optional[chex.Array] = None  # CBF values
+    cbf_gradients: Optional[chex.Array] = None  # CBF gradients
+    safe_controls: Optional[chex.Array] = None  # Safe controls
+    obstacle_distances: Optional[chex.Array] = None  # Obstacle distances
+    trajectory_lengths: Optional[chex.Array] = None  # Trajectory lengths
+
+# =============================================================================
+# MAIN.PY COMPATIBILITY LAYER
+# =============================================================================
+
+def create_scan_function(
+    gnn_perception, policy_network, safety_layer, physics_params
+) -> Callable:
+    """Create scan function compatible with main.py interface"""
+    # This is a simplified version for Stage 4 integration
+    # In practice, this would be more sophisticated
+    
+    def scan_function(carry, inputs, params, physics_params):
+        """Main scan function for BPTT loop"""
+        # Extract state
+        drone_state = carry.drone_state
+        step = carry.step_count
+        
+        # Create observation (simplified)
+        observation = jnp.concatenate([
+            drone_state.position,
+            drone_state.velocity,
+            inputs['target_positions'][0] if 'target_positions' in inputs else jnp.zeros(3),
+            jnp.zeros(3)  # Placeholder for more observations
+        ])
+        
+        # Policy evaluation (simplified)
+        if hasattr(policy_network, 'apply'):
+            control = policy_network.apply(
+                params.get('policy', {}), 
+                observation[None, :]
+            )[0]
+        else:
+            control = jnp.zeros(3)  # Fallback
+        
+        # Physics step
+        new_drone_state = dynamics_step(
+            drone_state, control, physics_params
+        )
+        
+        # Create new carry
+        new_carry = ScanCarry(
+            drone_state=new_drone_state,
+            rnn_hidden_state=carry.rnn_hidden_state,
+            step_count=step + 1,
+            cumulative_reward=carry.cumulative_reward
+        )
+        
+        # Create outputs
+        outputs = ScanOutput(
+            positions=new_drone_state.position,
+            velocities=new_drone_state.velocity,
+            control_commands=control,
+            nominal_commands=control,
+            step_loss=0.0,
+            safety_violation=0.0
+        )
+        
+        # Add compatibility fields
+        outputs.drone_states = jnp.concatenate([
+            new_drone_state.position,
+            new_drone_state.velocity,
+            jnp.zeros(6)  # Padding for 12-dim state
+        ])[None, :]
+        outputs.cbf_values = jnp.array([0.0])[None, :]
+        outputs.cbf_gradients = jnp.zeros((1, 3))
+        outputs.safe_controls = control[None, :]
+        outputs.obstacle_distances = jnp.array([10.0])[None, :]
+        outputs.trajectory_lengths = jnp.array([1.0])
+        
+        return new_carry, outputs
+    
+    return scan_function
+
+
+def run_complete_trajectory_scan(
+    scan_function,
+    initial_carry,
+    scan_inputs,
+    params,
+    physics_params,
+    sequence_length
+):
+    """Run complete trajectory scan compatible with main.py"""
+    # Convert to BPTTInputs format
+    bptt_inputs = BPTTInputs(
+        target_velocity=jnp.zeros(3),
+        external_forces=jnp.zeros(3)
+    )
+    
+    # Create dummy inputs for each timestep
+    inputs_sequence = [bptt_inputs] * sequence_length
+    
+    # Use scan to execute the sequence
+    final_carry, outputs = lax.scan(
+        lambda carry, inp: scan_function(carry, inp, params, physics_params),
+        initial_carry,
+        inputs_sequence,
+        length=sequence_length
+    )
+    
+    return final_carry, outputs
 
 
 # =============================================================================

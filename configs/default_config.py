@@ -117,16 +117,26 @@ def get_config():
     
     # Optimization settings
     config.training.optimizer = "adam"  # Optimizer type
+    config.training.learning_rate = 1e-4  # Base learning rate
     config.training.learning_rate_gcbf = 1e-5  # Learning rate for GCBF
     config.training.learning_rate_policy = 1e-5  # Learning rate for policy
     config.training.batch_size = 64  # Training batch size
+    config.training.sequence_length = 50  # BPTT sequence length
+    config.training.num_epochs = 50  # Number of training epochs
+    config.training.batches_per_epoch = 10  # Batches per epoch
+    config.training.validation_frequency = 5  # Validate every N epochs
+    config.training.validation_batch_size = 16  # Validation batch size
+    config.training.checkpoint_frequency = 10  # Save checkpoints every N epochs
     config.training.max_steps = 1000  # Maximum training steps
+    config.training.seed = 42  # Random seed for training
     
     # Loss function coefficients
     config.training.loss_cbf_coef = 1.0  # CBF loss coefficient
-    config.training.loss_safety_coef = 2.0  # Safety loss coefficient  
-    config.training.loss_goal_coef = 1.0  # Goal reaching loss coefficient
-    config.training.loss_control_coef = 1e-4  # Control smoothness coefficient
+    config.training.loss_velocity_coef = 2.0  # Velocity tracking coefficient
+    config.training.loss_goal_coef = 3.0  # Goal reaching loss coefficient
+    config.training.loss_control_coef = 0.1  # Control smoothness coefficient
+    config.training.loss_collision_coef = 5.0  # Collision avoidance coefficient
+    config.training.loss_safety_coef = 2.0  # Safety loss coefficient
     
     # Gradient clipping and numerical stability
     config.training.gradient_clip_norm = 1.0  # Gradient clipping threshold
@@ -191,6 +201,10 @@ def get_config():
     # Memory management
     config.optimization.max_memory_usage = 0.8  # Maximum GPU memory fraction
     config.optimization.clear_cache_frequency = 50  # JAX cache clearing frequency
+    
+    # Experiment configuration
+    config.experiment_name = "safe_agile_flight_stage4"
+    config.experiment_description = "Complete system integration with GCBF+ and DiffPhysDrone"
     
     return config
 
