@@ -102,6 +102,9 @@ rich>=12.0.0
 # Chex for JAX testing utilities
 chex>=0.1.7
 
+# PSUtil for system memory monitoring
+psutil>=5.9.0
+
 # =============================================================================
 # OPTIONAL DEPENDENCIES FOR ENHANCED FEATURES
 # =============================================================================

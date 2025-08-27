@@ -26,7 +26,7 @@ from core.perception import (
     CBFNet, get_cbf_from_pointcloud,
     init_cbf_network
 )
-from core.safety_clean import (
+from core.safety import (
     SafetyConfig, SafetyLayer, 
     differentiable_safety_filter,
     create_default_safety_layer

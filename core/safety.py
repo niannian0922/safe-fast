@@ -87,8 +87,9 @@ class SafetyLayer:
         minimize: ||u - u_nom||^2
         subject to: grad_h^T * (f + g*u) >= -alpha * h
         """
-        # Cost function: minimize ||u - u_nom||^2
-        Q = 2.0 * jnp.eye(3)  # Factor of 2 for standard QP form
+        # Cost function: minimize ||u - u_nom||^2 with numerical stability
+        # Add regularization for better conditioning
+        Q = 2.0 * jnp.eye(3) + self.config.regularization * jnp.eye(3)
         q = -2.0 * u_nom
         
         # Simplified dynamics for point mass model:
@@ -140,9 +141,9 @@ class SafetyLayer:
         """
         beta = self.config.relaxation_penalty
         
-        # Extended cost matrix for [u, delta]
+        # Extended cost matrix for [u, delta] with regularization
         Q = jnp.block([
-            [2.0 * jnp.eye(3), jnp.zeros((3, 1))],
+            [2.0 * jnp.eye(3) + self.config.regularization * jnp.eye(3), jnp.zeros((3, 1))],
             [jnp.zeros((1, 3)), 2.0 * beta * jnp.ones((1, 1))]
         ])  # (4, 4)
         

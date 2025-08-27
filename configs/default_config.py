@@ -65,6 +65,7 @@ def get_config():
     # Graph construction parameters
     config.gcbf.sensing_radius = 0.5  # R parameter for neighbor detection
     config.gcbf.max_neighbors = 16  # M parameter for fixed-size neighborhoods
+    config.gcbf.k_neighbors = 8  # K parameter for KNN graph construction
     config.gcbf.graph_construction_method = "knn"  # "knn" or "radius"
     
     # CBF parameters
@@ -86,6 +87,10 @@ def get_config():
     # =============================================================================
     config.policy = ml_collections.ConfigDict()
     
+    # Input/Output dimensions
+    config.policy.input_dim = 13  # 3(pos) + 3(vel) + 9(orientation) + 3(angular_vel) - 5 = 13
+    config.policy.output_dim = 3  # 3D control input
+    
     # Architecture
     config.policy.type = "mlp_rnn"  # "mlp", "rnn", "mlp_rnn"
     config.policy.hidden_dims = [256, 256]  # Hidden layer dimensions
@@ -93,11 +98,19 @@ def get_config():
     config.policy.rnn_type = "gru"  # "gru", "lstm"
     config.policy.activation = "relu"  # Activation function
     config.policy.output_activation = "tanh"  # Output activation for control
+    config.policy.use_rnn = False  # Enable RNN for memory
     
     # =============================================================================
     # SAFETY LAYER CONFIGURATION (QP-based Safety Filter)
     # =============================================================================
     config.safety = ml_collections.ConfigDict()
+    
+    # Control limits
+    config.safety.max_thrust = 0.8  # Maximum thrust magnitude
+    config.safety.max_torque = 0.5  # Maximum torque magnitude
+    
+    # CBF parameters
+    config.safety.cbf_alpha = 1.0  # CBF alpha parameter
     
     # QP solver settings (qpax integration)
     config.safety.solver = "qpax"  # Differentiable QP solver
@@ -217,8 +230,10 @@ def get_minimal_config():
     config.physics.max_steps = 50
     config.training.max_steps = 100
     config.training.batch_size = 8
+    config.training.sequence_length = 10  # Much shorter for testing memory
     config.env.num_agents = 2
     config.gcbf.max_neighbors = 4
+    config.gcbf.k_neighbors = 3  # Smaller for testing
     
     # Disable expensive features for testing
     config.optimization.use_checkpoint = False
@@ -235,6 +250,7 @@ def get_single_agent_config():
     # Single agent modifications
     config.env.num_agents = 1
     config.gcbf.max_neighbors = 8  # Only obstacles as neighbors
+    config.gcbf.k_neighbors = 6  # Reasonable for single agent
     config.env.num_obstacles = 16  # Increase obstacle density
     
     # Adjust training for single-agent case

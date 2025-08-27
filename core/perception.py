@@ -458,16 +458,34 @@ def get_cbf_from_pointcloud(params, drone_state: DroneState, point_cloud: jnp.nd
     
     # Compute gradients w.r.t. drone position (needed for QP constraints)
     def cbf_wrt_position(pos):
+        # Add numerical stability checks
+        pos_clipped = jnp.clip(pos, -10.0, 10.0)  # Prevent extreme positions
+        
         modified_state = DroneState(
-            position=pos,
+            position=pos_clipped,
             velocity=drone_state.velocity,
             orientation=drone_state.orientation,
             angular_velocity=drone_state.angular_velocity
         )
         graph_mod, node_types_mod = pointcloud_to_graph(modified_state, point_cloud, config)
-        return cbf_net.apply(params, graph_mod, node_types_mod)
+        cbf_raw = cbf_net.apply(params, graph_mod, node_types_mod)
+        
+        # Apply numerical stability: prevent extreme CBF values
+        cbf_stable = jnp.clip(cbf_raw, -5.0, 5.0)
+        return cbf_stable
     
-    cbf_grad = jax.grad(lambda pos: cbf_wrt_position(pos).sum())(drone_state.position)
+    # Compute gradients with clipping
+    cbf_grad_raw = jax.grad(lambda pos: cbf_wrt_position(pos).sum())(drone_state.position)
+    
+    # Apply gradient clipping for numerical stability
+    grad_norm = jnp.linalg.norm(cbf_grad_raw)
+    max_grad_norm = 10.0  # Maximum allowed gradient norm
+    
+    cbf_grad = jnp.where(
+        grad_norm > max_grad_norm,
+        cbf_grad_raw * (max_grad_norm / (grad_norm + 1e-8)),
+        cbf_grad_raw
+    )
     
     return cbf_value, cbf_grad
 

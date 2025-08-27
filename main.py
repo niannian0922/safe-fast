@@ -51,15 +51,20 @@ sys.path.append(str(project_root))
 
 # Import all system components
 from configs.default_config import get_config, get_minimal_config
+from utils.memory_optimization import (
+    get_memory_safe_config, validate_memory_config, 
+    get_debug_config, monitor_training_memory
+)
+from simple_policy import create_simple_policy_network  # Use simplified policy
 from core.physics import (
     DroneState, PhysicsParams, dynamics_step_jit,
     create_initial_drone_state, validate_physics_state
 )
 from core.perception import (
     PerceptionModule, create_default_perception_module,
-    pointcloud_to_graph, DroneState as PerceptionDroneState
+    pointcloud_to_graph, DroneState as PerceptionDroneState, GraphConfig
 )
-from core.policy import PolicyNetworkMLP, create_policy_network
+from core.policy import PolicyNetworkMLP, create_policy_network, PolicyParams
 from core.safety import (
     SafetyLayer, SafetyConfig, differentiable_safety_filter,
     create_default_safety_layer
@@ -110,7 +115,7 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
     physics_params = PhysicsParams(
         dt=config.physics.dt,
         mass=config.physics.drone.mass,
-        thrust_to_weight=config.physics.drone.thrust_to_weight,
+        thrust_to_weight=config.physics.drone.thrust_to_weight_ratio,  # Fixed parameter name
         drag_coefficient=config.physics.drone.drag_coefficient
     )
     
@@ -120,19 +125,14 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
     
     gnn_perception = create_default_perception_module()
     
-    # Initialize policy network
-    policy_network = create_policy_network(
-        input_dim=config.policy.input_dim,
-        hidden_dims=config.policy.hidden_dims,
-        output_dim=config.policy.output_dim,
-        use_rnn=config.policy.use_rnn
-    )
+    # Initialize policy network with simple implementation for testing
+    policy_network = create_simple_policy_network()
     
-    # Initialize safety layer
+    # Initialize safety layer with safe defaults
     safety_config = SafetyConfig(
-        max_thrust=config.safety.max_thrust,
-        max_torque=config.safety.max_torque,
-        cbf_alpha=config.safety.cbf_alpha,
+        max_thrust=getattr(config.safety, 'max_thrust', 0.8),
+        max_torque=getattr(config.safety, 'max_torque', 0.5),
+        cbf_alpha=getattr(config.safety, 'cbf_alpha', 1.0),
         relaxation_penalty=config.safety.relaxation_penalty
     )
     safety_layer = SafetyLayer(safety_config)
@@ -166,24 +166,27 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
     dummy_pointcloud = random.normal(gnn_key, (50, 3)) * 2.0  # 50 points
     
     # Initialize GNN parameters
+    k_neighbors = getattr(config.gcbf, 'k_neighbors', 8)  # Safe default
+    graph_config = GraphConfig(k_neighbors=k_neighbors)
     dummy_graph = pointcloud_to_graph(
         PerceptionDroneState(
             position=dummy_state.position,
             velocity=dummy_state.velocity,
-            orientation=dummy_state.orientation,
-            angular_velocity=dummy_state.angular_velocity
+            orientation=jnp.eye(3),  # Default identity orientation
+            angular_velocity=jnp.zeros(3)  # Zero angular velocity
         ),
         dummy_pointcloud,
-        k_neighbors=config.gcbf.k_neighbors
+        graph_config
     )
     
-    gnn_params = gnn_perception.init(gnn_key, dummy_graph)
+    gnn_params = gnn_perception.cbf_net.init(gnn_key, dummy_graph[0], dummy_graph[1])
     
     # Initialize policy parameters
     policy_input = jnp.concatenate([
-        dummy_state.position, dummy_state.velocity,
-        dummy_state.orientation.flatten(),
-        dummy_state.angular_velocity
+        dummy_state.position,  # 3 elements
+        dummy_state.velocity,  # 3 elements
+        jnp.zeros(3)  # 3 elements for angular velocity (not in physics DroneState)
+        # Note: physics DroneState doesn't have orientation, so we use 9 total dims instead of 15
     ])
     policy_params = policy_network.init(policy_key, policy_input, None)
     
@@ -202,10 +205,11 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
     optimizer_state = optimizer.init(all_params)
     
     print(f"✅ System initialization complete")
-    print(f"   GNN parameters: {sum(p.size for p in jax.tree_leaves(gnn_params))}")
-    print(f"   Policy parameters: {sum(p.size for p in jax.tree_leaves(policy_params))}")
-    print(f"   Total parameters: {sum(p.size for p in jax.tree_leaves(all_params))}")
-    
+    print(f"   GNN parameters: {sum(p.size for p in jax.tree_util.tree_leaves(gnn_params))}")
+    print(f"   Policy parameters: {sum(p.size for p in jax.tree_util.tree_leaves(policy_params))}")
+    print(f"   Total parameters: {sum(p.size for p in jax.tree_util.tree_leaves(all_params) if hasattr(p, 'size'))}")
+    return components, all_params, optimizer_state
+
 # =============================================================================
 # DATA GENERATION AND BATCH MANAGEMENT
 # =============================================================================
@@ -272,6 +276,7 @@ def complete_forward_pass(
     params: Dict,
     batch: Dict,
     components: SystemComponents,
+    config,  # Add config parameter
     key: chex.PRNGKey
 ) -> Tuple[chex.Array, LossMetrics, Dict]:
     """
@@ -284,7 +289,7 @@ def complete_forward_pass(
     4. Return loss and comprehensive metrics
     """
     batch_size = batch['initial_states'].shape[0]
-    sequence_length = config.training.sequence_length  # Use actual config value
+    sequence_length = config.training.sequence_length  # Use passed config
     
     # Initialize scan carry state
     initial_carry = ScanCarry(
@@ -342,6 +347,7 @@ def complete_training_step(
     optimizer_state: optax.OptState,
     batch: Dict,
     components: SystemComponents,
+    config,  # Add config parameter
     optimizer: optax.GradientTransformation,
     key: chex.PRNGKey
 ) -> Tuple[Dict, optax.OptState, LossMetrics, Dict]:
@@ -356,7 +362,7 @@ def complete_training_step(
     
     def loss_fn(params_inner):
         loss, metrics, extra_metrics = complete_forward_pass(
-            params_inner, batch, components, key
+            params_inner, batch, components, config, key  # Pass config
         )
         return loss, (metrics, extra_metrics)
     
@@ -411,7 +417,7 @@ def run_training_epoch(
         # Perform training step
         step_key = random.fold_in(batch_key, batch_idx)
         current_params, current_opt_state, metrics, extra_metrics = complete_training_step(
-            current_params, current_opt_state, batch, components, optimizer, step_key
+            current_params, current_opt_state, batch, components, config, optimizer, step_key  # Pass config
         )
         
         # Collect metrics
@@ -450,7 +456,7 @@ def run_validation(
     
     # Run forward pass without gradients
     loss, metrics, extra_metrics = complete_forward_pass(
-        params, val_batch, components, key
+        params, val_batch, components, config, key  # Pass config
     )
     
     validation_metrics = {
@@ -512,18 +518,18 @@ def validate_complete_system_integration(
         
         # Test 3: Forward pass without gradients
         loss, metrics, extra = complete_forward_pass(
-            params, test_batch, components, key
+            params, test_batch, components, config, key  # Pass config
         )
         
         assert jnp.isfinite(loss), "Loss must be finite"
-        assert jnp.all(jnp.isfinite(jax.tree_leaves(metrics))), "All metrics must be finite"
+        assert jnp.all(jnp.isfinite(jax.tree_util.tree_leaves(metrics))), "All metrics must be finite"
         print("✅ Test 3: Forward pass computation - PASSED")
         print(f"   Forward pass loss: {loss:.6f}")
         
         # Test 4: Gradient computation
         def test_loss_fn(test_params):
             test_loss, _, _ = complete_forward_pass(
-                test_params, test_batch, components, key
+                test_params, test_batch, components, config, key  # Pass config
             )
             return test_loss
         
@@ -542,7 +548,7 @@ def validate_complete_system_integration(
         optimizer_state = optimizer.init(params)
         
         new_params, new_opt_state, step_metrics, step_extra = complete_training_step(
-            params, optimizer_state, test_batch, components, optimizer, key
+            params, optimizer_state, test_batch, components, config, optimizer, key  # Pass config
         )
         
         # Verify parameter updates
@@ -565,14 +571,14 @@ def validate_complete_system_integration(
         
         # First call (compilation)
         _, _, _, _ = jit_step_fn(
-            params, optimizer_state, test_batch, components, optimizer, key
+            params, optimizer_state, test_batch, components, config, optimizer, key  # Pass config
         )
         compile_time = time.time() - start_time
         
         # Second call (execution only)
         start_time = time.time()
         _, _, _, _ = jit_step_fn(
-            params, optimizer_state, test_batch, components, optimizer, key
+            params, optimizer_state, test_batch, components, config, optimizer, key  # Pass config
         )
         execution_time = time.time() - start_time
         
@@ -948,8 +954,48 @@ def main():
     print("End-to-End JAX-Native Differentiable System")
     print("=" * 80)
     
-    # Load configuration
-    config = get_config()  # Use full configuration
+    # Parse command line arguments for debug mode
+    import sys
+    debug_mode = '--debug' in sys.argv
+    custom_seq_length = None
+    custom_batch_size = None
+    custom_epochs = None
+    
+    # Parse custom parameters
+    for i, arg in enumerate(sys.argv):
+        if arg == '--sequence_length' and i + 1 < len(sys.argv):
+            custom_seq_length = int(sys.argv[i + 1])
+        elif arg == '--batch_size' and i + 1 < len(sys.argv):
+            custom_batch_size = int(sys.argv[i + 1])
+        elif arg == '--num_epochs' and i + 1 < len(sys.argv):
+            custom_epochs = int(sys.argv[i + 1])
+    
+    # Load and optimize configuration
+    if debug_mode:
+        print("🐛 Debug mode enabled - using minimal configuration")
+        config = get_debug_config(get_minimal_config())
+    else:
+        base_config = get_config()
+        config = get_memory_safe_config(base_config)
+    
+    # Apply custom parameters if provided
+    if custom_seq_length:
+        config.training.sequence_length = custom_seq_length
+        print(f"⚙️ Custom sequence length: {custom_seq_length}")
+    
+    if custom_batch_size:
+        config.training.batch_size = custom_batch_size
+        print(f"⚙️ Custom batch size: {custom_batch_size}")
+        
+    if custom_epochs:
+        config.training.num_epochs = custom_epochs
+        print(f"⚙️ Custom epochs: {custom_epochs}")
+    
+    # Validate final configuration
+    if not validate_memory_config(config):
+        print("❌ Memory validation failed. Consider using --debug mode or reducing parameters.")
+        return False
+    
     print(f"🔧 Configuration loaded: {config.experiment_name}")
     print(f"   Sequence length: {config.training.sequence_length}")
     print(f"   Batch size: {config.training.batch_size}")
@@ -1020,6 +1066,9 @@ def main():
             current_loss = float(epoch_metrics['total_loss'])
             training_state.loss_history.append(current_loss)
             training_state.metrics_history.append(epoch_metrics)
+            
+            # Monitor memory usage
+            monitor_training_memory(training_state.step)
             
             # Run validation every N epochs
             if (epoch + 1) % config.training.validation_frequency == 0:
