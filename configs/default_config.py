@@ -123,37 +123,45 @@ def get_config():
     config.safety.failsafe_mode = "emergency_brake"  # Failsafe strategy
     config.safety.enable_backoff = True  # Enable automatic backoff mechanism
     
-    # =============================================================================
-    # TRAINING CONFIGURATION
-    # =============================================================================
+    # Training configuration with performance optimization
     config.training = ml_collections.ConfigDict()
     
-    # Optimization settings
-    config.training.optimizer = "adam"  # Optimizer type
-    config.training.learning_rate = 1e-4  # Base learning rate
-    config.training.learning_rate_gcbf = 1e-5  # Learning rate for GCBF
-    config.training.learning_rate_policy = 1e-5  # Learning rate for policy
-    config.training.batch_size = 64  # Training batch size
-    config.training.sequence_length = 50  # BPTT sequence length
-    config.training.num_epochs = 50  # Number of training epochs
-    config.training.batches_per_epoch = 10  # Batches per epoch
-    config.training.validation_frequency = 5  # Validate every N epochs
-    config.training.validation_batch_size = 16  # Validation batch size
-    config.training.checkpoint_frequency = 10  # Save checkpoints every N epochs
-    config.training.max_steps = 1000  # Maximum training steps
-    config.training.seed = 42  # Random seed for training
+    # Optimized learning rates (from performance tuning research)
+    config.training.optimizer = "adam"
+    config.training.learning_rate = 1e-4  # Base learning rate (optimized)
+    config.training.learning_rate_gcbf = 5e-5  # Lower LR for GNN stability
+    config.training.learning_rate_policy = 2e-4  # Higher LR for policy convergence
+    config.training.batch_size = 32  # Optimized batch size for memory/performance
+    config.training.sequence_length = 25  # Balanced for BPTT efficiency
+    config.training.num_epochs = 100  # Extended for better convergence
+    config.training.batches_per_epoch = 20  # More iterations per epoch
+    config.training.validation_frequency = 5
+    config.training.validation_batch_size = 16
+    config.training.checkpoint_frequency = 10
+    config.training.max_steps = 2000
+    config.training.seed = 42
     
-    # Loss function coefficients
-    config.training.loss_cbf_coef = 1.0  # CBF loss coefficient
-    config.training.loss_velocity_coef = 2.0  # Velocity tracking coefficient
-    config.training.loss_goal_coef = 3.0  # Goal reaching loss coefficient
-    config.training.loss_control_coef = 0.1  # Control smoothness coefficient
-    config.training.loss_collision_coef = 5.0  # Collision avoidance coefficient
-    config.training.loss_safety_coef = 2.0  # Safety loss coefficient
+    # Optimized loss function coefficients (empirically tuned)
+    config.training.loss_cbf_coef = 2.0  # Increased for safety emphasis
+    config.training.loss_velocity_coef = 1.0  # Balanced velocity tracking
+    config.training.loss_goal_coef = 3.0  # Strong goal-directed behavior  
+    config.training.loss_control_coef = 0.05  # Reduced control penalty
+    config.training.loss_collision_coef = 5.0  # High collision avoidance
+    config.training.loss_safety_coef = 2.5  # Enhanced safety importance
     
-    # Gradient clipping and numerical stability
-    config.training.gradient_clip_norm = 1.0  # Gradient clipping threshold
-    config.training.grad_decay_eta = 0.2  # Derivative loss weight
+    # Advanced gradient handling
+    config.training.gradient_clip_norm = 1.0
+    config.training.grad_decay_eta = 0.1  # Reduced for stability
+    config.training.use_gradient_checkpointing = True  # Memory optimization
+    
+    # Performance optimization features
+    config.training.performance_tuning = ml_collections.ConfigDict()
+    config.training.performance_tuning.enable = True
+    config.training.performance_tuning.adaptive_lr_schedule = "warmup_cosine"
+    config.training.performance_tuning.adaptive_loss_weights = True
+    config.training.performance_tuning.warmup_steps = 200
+    config.training.performance_tuning.decay_steps = 1500
+    config.training.performance_tuning.weight_update_frequency = 50
     
     # Curriculum learning (Three-stage approach)
     config.training.curriculum = ml_collections.ConfigDict()

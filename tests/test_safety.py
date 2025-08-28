@@ -271,8 +271,9 @@ class TestDifferentiability:
             "regularization": 1e-8,
             "max_torque": 0.5,
             "safety_margin": 0.1,
-            "emergency_brake_force": -0.6,
-            "failure_penalty": 10000.0
+            "emergency_brake_force": 0.6,  # Positive value
+            "failure_penalty": 10000.0,
+            "use_differentiable_fallback": True  # Enable for gradient computation
         }
         
         self.drone_state = DroneState(
@@ -347,11 +348,22 @@ class TestDifferentiability:
             [0.0, 0.0, 1.0]
         ])
         
-        # Create batch of drone states
-        batch_states = [self.drone_state] * batch_size
+        # Create batch of drone states - convert to proper JAX arrays
+        # Create batched DroneState by stacking individual components
+        batch_positions = jnp.tile(self.drone_state.position[None, :], (batch_size, 1))
+        batch_velocities = jnp.tile(self.drone_state.velocity[None, :], (batch_size, 1))
+        batch_orientations = jnp.tile(self.drone_state.orientation[None, :, :], (batch_size, 1, 1))
+        batch_angular_velocities = jnp.tile(self.drone_state.angular_velocity[None, :], (batch_size, 1))
         
-        # Vectorize safety filter
-        def single_safety_filter(u_nom, h, grad_h, drone_state):
+        # Vectorize safety filter - need to handle DroneState components separately
+        def single_safety_filter(u_nom, h, grad_h, pos, vel, orient, ang_vel):
+            # Reconstruct DroneState inside the function
+            drone_state = DroneState(
+                position=pos,
+                velocity=vel,
+                orientation=orient,
+                angular_velocity=ang_vel
+            )
             u_safe, info = differentiable_safety_filter(
                 self.params_dict, u_nom, h, grad_h, drone_state
             )
@@ -359,7 +371,8 @@ class TestDifferentiability:
         
         batch_safety_filter = vmap(single_safety_filter)
         u_safe_batch = batch_safety_filter(
-            u_nom_batch, h_batch, grad_h_batch, batch_states
+            u_nom_batch, h_batch, grad_h_batch, 
+            batch_positions, batch_velocities, batch_orientations, batch_angular_velocities
         )
         
         # Verify batch processing

@@ -96,8 +96,289 @@ class LossMetrics(NamedTuple):
 
 
 # =============================================================================
-# CBF LOSS FUNCTIONS (GCBF+ Integration)
+# ADVANCED TRAINING FRAMEWORK WITH MULTI-OBJECTIVE OPTIMIZATION
 # =============================================================================
+
+class AdvancedTrainingFramework:
+    """Advanced training framework with multi-objective optimization and curriculum learning"""
+    
+    def __init__(self, loss_config: LossConfig, use_curriculum: bool = True):
+        self.loss_config = loss_config
+        self.use_curriculum = use_curriculum
+        self.training_stage = 0
+        self.loss_history = {'total': [], 'safety': [], 'efficiency': []}
+        self.curriculum_thresholds = {
+            'stage_1_to_2': {'min_efficiency': 0.7, 'max_safety_violations': 5},
+            'stage_2_to_3': {'min_efficiency': 0.85, 'max_safety_violations': 2}
+        }
+    
+    def compute_comprehensive_loss_with_curriculum(
+        self,
+        scan_outputs: ScanOutput,
+        target_positions: chex.Array,
+        target_velocities: chex.Array,
+        physics_params: PhysicsParams,
+        training_step: int = 0
+    ) -> Tuple[chex.Array, LossMetrics, dict]:
+        """
+        Compute comprehensive loss with curriculum learning adaptation
+        
+        Three-stage curriculum:
+        Stage 0: Focus on basic control and goal reaching (relaxed safety)
+        Stage 1: Introduce safety constraints gradually
+        Stage 2: Full safety enforcement with efficiency optimization
+        """
+        # Determine current curriculum stage
+        current_stage = self._get_current_curriculum_stage(training_step)
+        
+        # Adapt loss weights based on curriculum stage
+        adapted_config = self._adapt_loss_config(current_stage)
+        
+        # Compute base loss with adapted configuration
+        total_loss, metrics = compute_comprehensive_loss(
+            scan_outputs, target_positions, target_velocities,
+            adapted_config, physics_params
+        )
+        
+        # Add curriculum-specific components
+        curriculum_info = {
+            'current_stage': current_stage,
+            'stage_progress': self._get_stage_progress(training_step, current_stage),
+            'adapted_weights': self._get_weight_summary(adapted_config)
+        }
+        
+        # Update training history
+        self._update_training_history(total_loss, metrics)
+        
+        # Check for stage advancement
+        stage_advanced = self._check_stage_advancement(metrics, current_stage)
+        if stage_advanced:
+            print(f"🎓 Curriculum advanced from stage {current_stage} to {current_stage + 1}")
+            self.training_stage = current_stage + 1
+            curriculum_info['stage_advanced'] = True
+        
+        return total_loss, metrics, curriculum_info
+    
+    def _get_current_curriculum_stage(self, training_step: int) -> int:
+        """Determine current curriculum stage"""
+        if not self.use_curriculum:
+            return 2  # Full training
+        
+        # Override automatic progression if manually set
+        if hasattr(self, 'manual_stage_override'):
+            return self.manual_stage_override
+        
+        # Automatic progression based on training steps
+        stage_duration = 3000  # Steps per automatic stage
+        automatic_stage = min(2, training_step // stage_duration)
+        
+        # Use the higher of manual and automatic stage
+        return max(self.training_stage, automatic_stage)
+    
+    def _adapt_loss_config(self, stage: int) -> LossConfig:
+        """Adapt loss configuration based on curriculum stage"""
+        base_config = self.loss_config
+        
+        if stage == 0:  # Basic control stage
+            return LossConfig(
+                cbf_violation_coef=base_config.cbf_violation_coef * 0.2,  # Very relaxed
+                cbf_derivative_coef=base_config.cbf_derivative_coef * 0.1,
+                cbf_boundary_coef=base_config.cbf_boundary_coef * 0.1,
+                velocity_tracking_coef=base_config.velocity_tracking_coef * 1.5,  # Focus on control
+                collision_avoidance_coef=base_config.collision_avoidance_coef * 0.3,
+                control_smoothness_coef=base_config.control_smoothness_coef * 2.0,  # Encourage smooth control
+                goal_reaching_coef=base_config.goal_reaching_coef * 2.0,  # Focus on reaching goals
+                safety_layer_coef=base_config.safety_layer_coef * 0.1,
+                emergency_coef=base_config.emergency_coef * 0.5,
+                temporal_decay_alpha=base_config.temporal_decay_alpha,
+                spatial_decay_enable=base_config.spatial_decay_enable,
+                spatial_decay_range=base_config.spatial_decay_range
+            )
+        elif stage == 1:  # Safety-aware stage
+            return LossConfig(
+                cbf_violation_coef=base_config.cbf_violation_coef * 0.7,  # Moderate safety
+                cbf_derivative_coef=base_config.cbf_derivative_coef * 0.6,
+                cbf_boundary_coef=base_config.cbf_boundary_coef * 0.6,
+                velocity_tracking_coef=base_config.velocity_tracking_coef * 1.2,
+                collision_avoidance_coef=base_config.collision_avoidance_coef * 0.8,
+                control_smoothness_coef=base_config.control_smoothness_coef * 1.2,
+                goal_reaching_coef=base_config.goal_reaching_coef * 1.5,
+                safety_layer_coef=base_config.safety_layer_coef * 0.7,
+                emergency_coef=base_config.emergency_coef * 0.8,
+                temporal_decay_alpha=base_config.temporal_decay_alpha,
+                spatial_decay_enable=base_config.spatial_decay_enable,
+                spatial_decay_range=base_config.spatial_decay_range
+            )
+        else:  # Full training stage
+            return base_config
+    
+    def _get_stage_progress(self, training_step: int, current_stage: int) -> float:
+        """Get progress within current curriculum stage"""
+        stage_duration = 3000
+        stage_start = current_stage * stage_duration
+        progress = min(1.0, (training_step - stage_start) / stage_duration)
+        return progress
+    
+    def _get_weight_summary(self, config: LossConfig) -> dict:
+        """Get summary of current loss weights"""
+        return {
+            'safety_weight': config.cbf_violation_coef,
+            'efficiency_weight': config.goal_reaching_coef,
+            'control_weight': config.control_smoothness_coef
+        }
+    
+    def _update_training_history(self, total_loss: chex.Array, metrics: LossMetrics):
+        """Update training history for curriculum decisions"""
+        self.loss_history['total'].append(float(total_loss))
+        self.loss_history['safety'].append(float(metrics.safety_loss))
+        self.loss_history['efficiency'].append(float(metrics.efficiency_loss))
+        
+        # Keep history manageable
+        max_history = 1000
+        for key in self.loss_history:
+            if len(self.loss_history[key]) > max_history:
+                self.loss_history[key] = self.loss_history[key][-max_history//2:]
+    
+    def _check_stage_advancement(self, metrics: LossMetrics, current_stage: int) -> bool:
+        """Check if curriculum should advance to next stage"""
+        if current_stage >= 2:  # Already at final stage
+            return False
+        
+        # Need sufficient training history
+        if len(self.loss_history['total']) < 100:
+            return False
+        
+        # Compute recent performance metrics
+        recent_window = 50
+        recent_safety_violations = jnp.mean(jnp.array(self.loss_history['safety'][-recent_window:]))
+        recent_efficiency = 1.0 / (1.0 + jnp.mean(jnp.array(self.loss_history['efficiency'][-recent_window:])))
+        
+        # Check advancement criteria
+        if current_stage == 0:  # Stage 0 -> 1
+            criteria = self.curriculum_thresholds['stage_1_to_2']
+            return (recent_efficiency >= criteria['min_efficiency'] * 0.8 and  # Relaxed for stage 1
+                   recent_safety_violations <= criteria['max_safety_violations'] * 2.0)
+        elif current_stage == 1:  # Stage 1 -> 2
+            criteria = self.curriculum_thresholds['stage_2_to_3']
+            return (recent_efficiency >= criteria['min_efficiency'] and
+                   recent_safety_violations <= criteria['max_safety_violations'])
+        
+        return False
+
+class MultiObjectiveOptimizer:
+    """Multi-objective optimizer using gradient balancing techniques"""
+    
+    def __init__(self, balance_method: str = 'adaptive_weights'):
+        self.balance_method = balance_method
+        self.objective_history = {'safety': [], 'efficiency': [], 'control': []}
+        self.weight_adaptation_rate = 0.01
+        self.current_weights = {'safety': 1.0, 'efficiency': 1.0, 'control': 1.0}
+    
+    def compute_balanced_loss(
+        self,
+        safety_loss: chex.Array,
+        efficiency_loss: chex.Array,
+        control_loss: chex.Array,
+        training_step: int = 0
+    ) -> Tuple[chex.Array, dict]:
+        """Compute balanced multi-objective loss"""
+        
+        if self.balance_method == 'adaptive_weights':
+            return self._adaptive_weight_balancing(safety_loss, efficiency_loss, control_loss)
+        elif self.balance_method == 'gradient_cosine':
+            return self._gradient_cosine_balancing(safety_loss, efficiency_loss, control_loss)
+        elif self.balance_method == 'pareto_efficient':
+            return self._pareto_efficient_balancing(safety_loss, efficiency_loss, control_loss)
+        else:
+            # Simple weighted sum
+            weights = self.current_weights
+            total_loss = (weights['safety'] * safety_loss + 
+                         weights['efficiency'] * efficiency_loss + 
+                         weights['control'] * control_loss)
+            balance_info = {'method': 'fixed_weights', 'weights': weights}
+            return total_loss, balance_info
+    
+    def _adaptive_weight_balancing(
+        self, 
+        safety_loss: chex.Array, 
+        efficiency_loss: chex.Array, 
+        control_loss: chex.Array
+    ) -> Tuple[chex.Array, dict]:
+        """Adaptive weight balancing based on loss magnitudes"""
+        
+        # Update objective history
+        self.objective_history['safety'].append(float(safety_loss))
+        self.objective_history['efficiency'].append(float(efficiency_loss))
+        self.objective_history['control'].append(float(control_loss))
+        
+        # Compute adaptive weights based on recent loss magnitudes
+        window_size = min(50, len(self.objective_history['safety']))
+        if window_size > 10:
+            recent_safety = jnp.mean(jnp.array(self.objective_history['safety'][-window_size:]))
+            recent_efficiency = jnp.mean(jnp.array(self.objective_history['efficiency'][-window_size:]))
+            recent_control = jnp.mean(jnp.array(self.objective_history['control'][-window_size:]))
+            
+            # Inverse weighting: give more weight to smaller losses to balance objectives
+            total_magnitude = recent_safety + recent_efficiency + recent_control + 1e-6
+            target_weights = {
+                'safety': (recent_efficiency + recent_control) / (2 * total_magnitude) * 3,
+                'efficiency': (recent_safety + recent_control) / (2 * total_magnitude) * 3,
+                'control': (recent_safety + recent_efficiency) / (2 * total_magnitude) * 3
+            }
+            
+            # Smooth weight adaptation
+            for key in self.current_weights:
+                self.current_weights[key] = (
+                    (1 - self.weight_adaptation_rate) * self.current_weights[key] +
+                    self.weight_adaptation_rate * target_weights[key]
+                )
+        
+        # Compute balanced loss
+        weights = self.current_weights
+        total_loss = (weights['safety'] * safety_loss + 
+                     weights['efficiency'] * efficiency_loss + 
+                     weights['control'] * control_loss)
+        
+        balance_info = {
+            'method': 'adaptive_weights',
+            'weights': weights,
+            'weight_adaptation_rate': self.weight_adaptation_rate
+        }
+        
+        return total_loss, balance_info
+    
+    def _gradient_cosine_balancing(
+        self,
+        safety_loss: chex.Array,
+        efficiency_loss: chex.Array, 
+        control_loss: chex.Array
+    ) -> Tuple[chex.Array, dict]:
+        """Gradient cosine similarity balancing (simplified implementation)"""
+        # This would require gradient computation for full implementation
+        # For now, use magnitude-based approximation
+        
+        loss_magnitudes = jnp.array([safety_loss, efficiency_loss, control_loss])
+        
+        # Normalize to unit scale
+        normalized_losses = loss_magnitudes / (jnp.linalg.norm(loss_magnitudes) + 1e-8)
+        
+        # Equal weighting with normalization
+        equal_weights = jnp.ones(3) / 3.0
+        
+        # Balance based on deviation from equal contribution
+        weights = equal_weights + 0.1 * (equal_weights - normalized_losses)
+        weights = jnp.maximum(weights, 0.1)  # Minimum weight
+        weights = weights / jnp.sum(weights)  # Normalize
+        
+        total_loss = jnp.sum(weights * loss_magnitudes)
+        
+        balance_info = {
+            'method': 'gradient_cosine',
+            'weights': {'safety': weights[0], 'efficiency': weights[1], 'control': weights[2]},
+            'normalized_losses': normalized_losses
+        }
+        
+        return total_loss, balance_info
 
 def compute_cbf_violation_loss(
     h_values: chex.Array,

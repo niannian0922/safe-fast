@@ -5,6 +5,12 @@ This module implements the core differentiable physics simulation combining insi
 1. GCBF+ (MIT-REALM): Graph-based safety mechanisms and multi-agent coordination
 2. DiffPhysDrone (SJTU): Differentiable physics with temporal gradient decay
 
+CRITICAL DiffPhysDrone Integration:
+- Temporal gradient decay mechanism (g_decay function)
+- Control history modeling with exponential smoothing  
+- Thrust-to-weight ratio dynamics calibration
+- Numerical stability enhancements
+
 The physics engine is designed to be:
 - Pure functional (no side effects)  
 - JIT-compilable with JAX
@@ -27,16 +33,40 @@ from flax import struct
 
 @struct.dataclass 
 class DroneState:
-    """State representation for a single drone using point-mass dynamics.
+    """Simplified drone state for GCBF+ and DiffPhysDrone integration.
     
-    Based on DiffPhysDrone's simplified dynamics model, this represents
-    each drone as a point mass with position, velocity, and control history.
+    Follows DiffPhysDrone point-mass model with state representation compatible
+    with GCBF+ graph neural networks. Simplified from original complex structure
+    to focus on essential dynamics.
+    
+    Key Design Principles:
+    1. Point-mass dynamics (no orientation complexity)
+    2. Compatible with GCBF+ graph construction
+    3. Supports DiffPhysDrone temporal gradient decay
+    4. JAX-native pure functional design
     """
+    # Core state (point-mass model)
     position: chex.Array  # [3] - x, y, z coordinates in world frame
     velocity: chex.Array  # [3] - velocity components in world frame  
-    thrust_history: chex.Array  # [n_history, 3] - control input history for smoothing
-    mass: float  # Drone mass in kg
+    acceleration: chex.Array  # [3] - current acceleration (needed for integration)
+    
+    # Control state (DiffPhysDrone-style)
+    thrust_current: chex.Array  # [3] - current thrust command
+    thrust_previous: chex.Array  # [3] - previous thrust command (for smoothing)
+    
+    # Temporal state
     time: float  # Current simulation time
+    
+    # Agent identification (for GCBF+ multi-agent scenarios)
+    agent_id: int = 0  # Agent identifier for graph construction
+    
+    # Orientation (simplified - identity matrix for point mass)
+    orientation: chex.Array = None  # [3, 3] rotation matrix (defaults to identity)
+    
+    def __post_init__(self):
+        # Set default orientation to identity if not provided
+        if self.orientation is None:
+            object.__setattr__(self, 'orientation', jnp.eye(3))
 
 
 @struct.dataclass
@@ -55,36 +85,141 @@ class MultiAgentState:
 
 @struct.dataclass  
 class PhysicsParams:
-    """Physics simulation parameters.
+    """Physics simulation parameters matching DiffPhysDrone methodology.
     
-    Encapsulates all physical constants and simulation parameters to ensure
-    pure functional design and enable parameter optimization.
+    Parameters calibrated based on DiffPhysDrone experimental results:
+    - Crazyflie quadrotor specifications
+    - Control latency and smoothing from real hardware
+    - Gradient decay tuned for BPTT stability
     """
-    # Time integration
-    dt: float = 1.0/15.0  # Simulation timestep
+    # Time integration (DiffPhysDrone standard)
+    dt: float = 1.0/15.0  # 15 Hz control frequency
     
-    # Drone physical properties
-    mass: float = 0.027  # kg (Crazyflie mass)
-    drag_coefficient: float = 0.01  # Linear air drag coefficient
-    max_thrust: float = 0.8  # Maximum normalized thrust
-    thrust_to_weight: float = 3.0  # Thrust-to-weight ratio
+    # Physical constants (Crazyflie 2.1 specifications)
+    mass: float = 0.027  # kg
+    gravity_magnitude: float = 9.80665  # m/s²
     
-    # Control dynamics (from DiffPhysDrone calibration)
-    control_delay: float = 1.0/15.0  # Control latency tau
-    control_smoothing: float = 12.0  # Exponential smoothing lambda
+    # Thrust dynamics (from DiffPhysDrone paper)
+    thrust_to_weight_ratio: float = 3.0  # Aggressive flight capability
+    max_thrust_normalized: float = 0.8  # Normalized maximum thrust
     
-    # Safety parameters (GCBF+ integration)
-    safety_radius: float = 0.05  # Collision avoidance radius
-    sensing_radius: float = 0.5   # Neighbor detection radius
+    # Drag model (simplified)
+    drag_coefficient_linear: float = 0.01  # Linear drag
+    drag_coefficient_quadratic: float = 0.01  # Quadratic drag
     
-    # Temporal gradient decay (DiffPhysDrone innovation)
-    gradient_decay_alpha: float = 0.92  # Gradient decay rate
+    # Control dynamics (DiffPhysDrone key innovation)
+    control_delay_tau: float = 1.0/15.0  # Control latency (s)
+    exponential_smoothing_lambda: float = 12.0  # EMA parameter
+    
+    # GCBF+ safety parameters
+    safety_radius: float = 0.05  # Collision radius (m)
+    sensing_radius: float = 0.5  # Neighbor detection radius (m)
+    cbf_alpha: float = 1.0  # CBF class-K function parameter
+    
+    # Temporal gradient decay (DiffPhysDrone core)
+    gradient_decay_alpha: float = 0.4  # Original DiffPhysDrone value
     enable_gradient_decay: bool = True
+    
+    # Numerical stability
+    velocity_limit: float = 10.0  # Maximum velocity (m/s)
+    position_limit: float = 50.0  # Workspace boundary (m)
+    epsilon: float = 1e-8  # Numerical stability
 
     @property
-    def gravity(self) -> chex.Array:
-        """Gravitational acceleration - created at runtime."""
-        return jnp.array([0.0, 0.0, -9.81])
+    def gravity_vector(self) -> chex.Array:
+        """Standard gravity vector."""
+        return jnp.array([0.0, 0.0, -self.gravity_magnitude])
+        
+    @property
+    def max_thrust_force(self) -> float:
+        """Maximum thrust force in Newtons."""
+        return self.mass * self.thrust_to_weight_ratio * self.gravity_magnitude
+
+# =============================================================================
+# DIFFPHYSDRONE TEMPORAL GRADIENT DECAY (CORE INNOVATION)
+# =============================================================================
+
+def temporal_gradient_decay(x: chex.Array, alpha: float) -> chex.Array:
+    """
+    DiffPhysDrone temporal gradient decay mechanism - EXACT IMPLEMENTATION
+    
+    This is the core innovation from DiffPhysDrone paper:
+    "Learning Vision-based Agile Flight via Differentiable Physics"
+    
+    Original PyTorch implementation:
+        def g_decay(x, alpha):
+            return x * alpha + x.detach() * (1 - alpha)
+            
+    JAX equivalent using stop_gradient:
+        return x * alpha + jax.lax.stop_gradient(x) * (1 - alpha)
+    
+    The function creates a gradient flow control mechanism where:
+    - alpha controls how much gradient flows through
+    - (1-alpha) portion has stopped gradients (like .detach() in PyTorch)
+    - This enables stable training for long sequences
+    
+    Args:
+        x: Input tensor (any shape)
+        alpha: Gradient flow coefficient [0,1]
+               - alpha=1.0: full gradient flow
+               - alpha=0.0: no gradient flow (pure stop_gradient)
+               - alpha=0.4 (DiffPhysDrone default): balanced decay
+    
+    Returns:
+        Tensor with controlled gradient flow
+    """
+    return x * alpha + jax.lax.stop_gradient(x) * (1 - alpha)
+
+def apply_temporal_gradient_decay_to_state(
+    drone_state: DroneState, 
+    decay_alpha: float = 0.4  # DiffPhysDrone default
+) -> DroneState:
+    """
+    Apply temporal gradient decay to drone state components
+    
+    Critical for BPTT stability over long horizons. Implementation follows
+    exact DiffPhysDrone methodology with gradient flow control.
+    """
+    return DroneState(
+        position=temporal_gradient_decay(drone_state.position, decay_alpha),
+        velocity=temporal_gradient_decay(drone_state.velocity, decay_alpha),
+        acceleration=temporal_gradient_decay(drone_state.acceleration, decay_alpha),
+        thrust_current=temporal_gradient_decay(drone_state.thrust_current, decay_alpha),
+        thrust_previous=temporal_gradient_decay(drone_state.thrust_previous, decay_alpha),
+        orientation=drone_state.orientation,  # Orientation unchanged
+        time=drone_state.time,  # Time unchanged
+        agent_id=drone_state.agent_id  # ID unchanged
+    )
+
+def create_spatial_temporal_decay_schedule(
+    distance_to_obstacles: chex.Array,
+    base_alpha: float = 0.4,
+    min_distance: float = 0.5,
+    max_distance: float = 2.0
+) -> float:
+    """
+    Advanced: Spatial-temporal gradient decay adaptation
+    
+    Adapts gradient decay based on proximity to obstacles:
+    - Near obstacles: less decay (stronger gradients for safety)  
+    - Far from obstacles: more decay (focus on efficiency)
+    
+    This is an innovation beyond the original DiffPhysDrone paper.
+    """
+    # Compute minimum distance to any obstacle
+    min_dist = jnp.min(distance_to_obstacles)
+    
+    # Create adaptive alpha based on distance
+    normalized_dist = jnp.clip(
+        (min_dist - min_distance) / (max_distance - min_distance),
+        0.0, 1.0
+    )
+    
+    # Less decay when close to obstacles (need strong safety gradients)
+    # More decay when far from obstacles (focus on efficiency)
+    adaptive_alpha = base_alpha + (1.0 - base_alpha) * (1.0 - normalized_dist)
+    
+    return adaptive_alpha
 
 
 # =============================================================================
@@ -98,14 +233,17 @@ def dynamics_step(
     dt: Optional[float] = None
 ) -> DroneState:
     """
-    Single timestep of differentiable drone dynamics.
+    DiffPhysDrone-style differentiable physics step with control smoothing.
     
-    Implements point-mass dynamics with control delay and air drag based on
-    DiffPhysDrone methodology. This function is pure and JIT-compilable.
+    Implements key DiffPhysDrone innovations:
+    1. Exponential moving average for thrust smoothing
+    2. Control delay modeling
+    3. Point-mass dynamics with drag
+    4. Numerical stability through smooth saturation
     
     Args:
         state: Current drone state
-        control_input: [3] thrust command in body frame (normalized)
+        control_input: [3] thrust command (normalized [-1, 1])
         params: Physics parameters
         dt: Optional timestep override
         
@@ -118,80 +256,84 @@ def dynamics_step(
     # Extract state components
     pos = state.position
     vel = state.velocity
-    thrust_hist = state.thrust_history
+    acc = state.acceleration
+    thrust_prev = state.thrust_previous
     
-    # === INPUT SATURATION FOR NUMERICAL STABILITY ===
-    # Apply smooth input saturation to prevent extreme values
-    max_input_magnitude = 5.0  # Reasonable upper limit for normalized thrust
-    input_norm = jnp.linalg.norm(control_input)
+    # === DIFFPHYSDRONE CONTROL SMOOTHING ===
+    # Exponential moving average thrust smoothing (key innovation)
+    # This implements the control delay and smoothing from the original paper
     
-    # Smooth saturation using tanh (differentiable alternative to clipping)
-    # Only apply saturation if input norm exceeds the limit
-    saturation_factor = jnp.where(
-        input_norm > max_input_magnitude,
-        jnp.tanh(input_norm / max_input_magnitude) * max_input_magnitude / jnp.maximum(input_norm, 1e-8),
-        1.0  # No saturation needed if within limits
+    # Input saturation (normalized commands should be in [-1, 1])
+    saturated_input = jnp.tanh(control_input)  # Smooth saturation
+    
+    # Exponential moving average (EMA) thrust smoothing
+    # Formula: thrust_new = lambda * thrust_cmd + (1 - lambda) * thrust_prev
+    smoothing_factor = jnp.exp(-params.exponential_smoothing_lambda * dt)
+    smoothed_thrust = (
+        (1.0 - smoothing_factor) * saturated_input + 
+        smoothing_factor * thrust_prev
     )
-    saturated_input = control_input * saturation_factor
     
-    # === CONTROL PROCESSING (DiffPhysDrone approach) ===
-    # Apply exponential moving average for control smoothing
-    # This models the flight controller response with delay
-    alpha_smooth = jnp.exp(-params.control_smoothing * dt)
-    
-    # Update thrust history with new command
-    new_thrust_hist = jnp.roll(thrust_hist, shift=1, axis=0)
-    new_thrust_hist = new_thrust_hist.at[0].set(saturated_input)
-    
-    # Compute filtered thrust using exponential smoothing with numerical stability
-    weights = jnp.power(alpha_smooth, jnp.arange(thrust_hist.shape[0]))
-    # Add small epsilon to prevent division by zero
-    weight_sum = jnp.sum(weights) + 1e-12
-    weights = weights / weight_sum
-    filtered_thrust = jnp.sum(new_thrust_hist * weights[:, None], axis=0)
+    # Control delay simulation (first-order system)
+    # This models the delay between commanded and actual thrust
+    delay_factor = jnp.exp(-dt / params.control_delay_tau)
+    actual_thrust = (
+        (1.0 - delay_factor) * smoothed_thrust +
+        delay_factor * state.thrust_current
+    )
     
     # === FORCE COMPUTATION ===
-    # Convert normalized thrust to force (body frame to world frame)
-    max_force = params.mass * params.thrust_to_weight * 9.81
-    thrust_force = filtered_thrust * max_force
+    # Convert normalized thrust to physical force
+    thrust_force = actual_thrust * params.max_thrust_force
     
-    # Air drag force (opposing velocity) with numerical stability
+    # Drag forces (linear + quadratic)
     vel_norm = jnp.linalg.norm(vel)
-    # Use smooth approximation to avoid issues at zero velocity
-    smooth_vel_norm = jnp.sqrt(vel_norm**2 + 1e-8)
-    drag_force = -params.drag_coefficient * smooth_vel_norm * vel
+    vel_unit = vel / jnp.maximum(vel_norm, params.epsilon)
     
-    # Total external force
-    total_force = thrust_force + drag_force + params.mass * params.gravity
+    # Linear drag
+    drag_linear = -params.drag_coefficient_linear * vel
     
-    # === NUMERICAL INTEGRATION ===
-    # Using Euler integration (can be upgraded to RK4 for better accuracy)
-    acceleration = total_force / params.mass
+    # Quadratic drag (velocity squared)
+    drag_quadratic = -params.drag_coefficient_quadratic * vel_norm * vel_unit
     
-    # Update velocity and position
-    new_vel = vel + acceleration * dt
-    new_pos = pos + vel * dt + 0.5 * acceleration * dt**2  # Semi-implicit Euler
+    total_drag = drag_linear + drag_quadratic
     
-    # === STATE PROTECTION ===
-    # Apply smooth velocity limits to prevent runaway dynamics
-    max_velocity = 40.0  # Reasonable physical limit
-    vel_norm_new = jnp.linalg.norm(new_vel)
-    velocity_scale = jnp.minimum(1.0, max_velocity / jnp.maximum(vel_norm_new, 1e-8))
-    new_vel = new_vel * velocity_scale
+    # Gravitational force
+    gravity_force = params.mass * params.gravity_vector
     
-    # Apply position bounds (soft constraints)
-    max_position = 80.0  # Reasonable workspace limit
-    pos_norm = jnp.linalg.norm(new_pos)
-    position_scale = jnp.minimum(1.0, max_position / jnp.maximum(pos_norm, 1e-8))
-    new_pos = new_pos * position_scale
+    # === PHYSICS INTEGRATION (DiffPhysDrone style) ===
+    # Total external forces
+    total_force = thrust_force + total_drag + gravity_force
     
-    # === STATE UPDATE ===
+    # Compute acceleration
+    new_acceleration = total_force / params.mass
+    
+    # Semi-implicit Euler integration (stable for stiff systems)
+    # This follows the integration scheme from DiffPhysDrone
+    new_vel = vel + 0.5 * (acc + new_acceleration) * dt  # Trapezoidal velocity
+    new_pos = pos + vel * dt + 0.5 * new_acceleration * dt**2  # Position with acceleration
+    
+    # === PHYSICAL CONSTRAINTS ===
+    # Smooth velocity limiting (differentiable)
+    vel_magnitude = jnp.linalg.norm(new_vel)
+    vel_scale = jnp.minimum(1.0, params.velocity_limit / jnp.maximum(vel_magnitude, params.epsilon))
+    new_vel = new_vel * vel_scale
+    
+    # Smooth position bounds (workspace limits)
+    pos_magnitude = jnp.linalg.norm(new_pos)
+    pos_scale = jnp.minimum(1.0, params.position_limit / jnp.maximum(pos_magnitude, params.epsilon))
+    new_pos = new_pos * pos_scale
+    
+    # Create new state (point-mass model)
     new_state = DroneState(
         position=new_pos,
         velocity=new_vel, 
-        thrust_history=new_thrust_hist,
-        mass=state.mass,
-        time=state.time + dt
+        acceleration=new_acceleration,
+        thrust_current=actual_thrust,
+        thrust_previous=smoothed_thrust,  # Store for next step
+        orientation=state.orientation,  # Keep same orientation
+        time=state.time + dt,
+        agent_id=state.agent_id
     )
     
     return new_state
@@ -226,13 +368,15 @@ def multi_agent_dynamics_step(
     # === INDIVIDUAL DYNAMICS ===
     # Process each agent's dynamics (vectorized over agents)
     def single_agent_update(i: int) -> chex.Array:
-        # Extract individual drone state
+        # Extract individual drone state with simplified format
         drone_state = DroneState(
             position=state.drone_states[i, :3],
-            velocity=state.drone_states[i, 3:6], 
-            thrust_history=state.drone_states[i, 6:15].reshape(3, 3),
-            mass=params.mass,
-            time=state.global_time
+            velocity=state.drone_states[i, 3:6],
+            acceleration=state.drone_states[i, 6:9],
+            thrust_current=state.drone_states[i, 9:12],
+            thrust_previous=state.drone_states[i, 12:15],
+            time=state.global_time,
+            agent_id=i
         )
         
         # Apply dynamics
@@ -243,11 +387,13 @@ def multi_agent_dynamics_step(
             dt
         )
         
-        # Pack back into array format
+        # Pack back into array format (15-dimensional state per agent)
         new_state_array = jnp.concatenate([
-            new_drone_state.position,
-            new_drone_state.velocity,
-            new_drone_state.thrust_history.flatten()
+            new_drone_state.position,      # [0:3]
+            new_drone_state.velocity,      # [3:6] 
+            new_drone_state.acceleration,  # [6:9]
+            new_drone_state.thrust_current,  # [9:12]
+            new_drone_state.thrust_previous  # [12:15]
         ])
         
         return new_state_array
@@ -380,43 +526,50 @@ def create_temporal_decay_schedule(
 # =============================================================================
 
 def create_initial_drone_state(
-    position: chex.Array,
-    velocity: Optional[chex.Array] = None,
-    mass: float = 0.027,
-    thrust_history_length: int = 3,
+    position: chex.Array,  # [3]
+    velocity: Optional[chex.Array] = None,  # [3]
+    agent_id: int = 0,
     hover_initialization: bool = True
 ) -> DroneState:
     """
-    Create initial state for a single drone.
+    Create initial state for a single drone following DiffPhysDrone design.
+    
+    Simplified initialization for point-mass dynamics with proper
+    hover thrust setup for stability.
     
     Args:
         position: Initial position [3]
         velocity: Initial velocity [3] (default: zero)
-        mass: Drone mass in kg
-        thrust_history_length: Length of thrust history buffer
-        hover_initialization: If True, initialize thrust history with hover thrust
+        agent_id: Agent identifier for multi-agent scenarios
+        hover_initialization: Initialize with hover thrust for stability
         
     Returns:
         Initialized drone state
     """
     if velocity is None:
         velocity = jnp.zeros(3)
-        
-    # Initialize thrust history with intelligent defaults
+    
+    # Initialize acceleration to zero
+    acceleration = jnp.zeros(3)
+    
+    # Initialize thrust commands
     if hover_initialization:
-        # Initialize with theoretical hover thrust for stability
+        # Compute hover thrust (balances gravity)
         params = PhysicsParams()
-        hover_thrust = jnp.array([0.0, 0.0, 1.0 / params.thrust_to_weight])
-        thrust_history = jnp.tile(hover_thrust[None, :], (thrust_history_length, 1))
+        hover_thrust_magnitude = params.gravity_magnitude / params.thrust_to_weight_ratio
+        hover_thrust = jnp.array([0.0, 0.0, hover_thrust_magnitude])
     else:
-        thrust_history = jnp.zeros((thrust_history_length, 3))
+        hover_thrust = jnp.zeros(3)
     
     return DroneState(
         position=position,
         velocity=velocity,
-        thrust_history=thrust_history,
-        mass=mass,
-        time=0.0
+        acceleration=acceleration,
+        thrust_current=hover_thrust,
+        thrust_previous=hover_thrust,
+        orientation=jnp.eye(3),  # Identity orientation for point mass
+        time=0.0,
+        agent_id=agent_id
     )
 
 
@@ -452,13 +605,17 @@ def create_initial_multi_agent_state(
         obstacle_radii = jnp.zeros(0)
         
     # Create drone state array [n_agents, state_dim]
-    # State format: [pos(3), vel(3), thrust_hist(9)] = 15 dimensions
-    thrust_histories = jnp.zeros((n_agents, 3, 3))  # 3 history steps, 3D thrust
+    # New state format: [pos(3), vel(3), acc(3), thrust_curr(3), thrust_prev(3)] = 15 dimensions
+    accelerations = jnp.zeros((n_agents, 3))
+    thrust_current = jnp.zeros((n_agents, 3))
+    thrust_previous = jnp.zeros((n_agents, 3))
     
     drone_states = jnp.concatenate([
-        positions,                            # [n_agents, 3]
-        velocities,                          # [n_agents, 3] 
-        thrust_histories.reshape(n_agents, 9) # [n_agents, 9]
+        positions,        # [n_agents, 3] - [0:3]
+        velocities,       # [n_agents, 3] - [3:6]
+        accelerations,    # [n_agents, 3] - [6:9]
+        thrust_current,   # [n_agents, 3] - [9:12]
+        thrust_previous   # [n_agents, 3] - [12:15]
     ], axis=1)
     
     # Initialize adjacency matrix

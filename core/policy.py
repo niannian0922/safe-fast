@@ -106,16 +106,15 @@ class PolicyNetworkMLP(nn.Module):
     output_dim: int = 3  # 3D thrust commands
     
     def setup(self):
-        # Create MLP layers
-        self.layers = []
-        for i, features in enumerate(self.params.hidden_dims):
-            self.layers.append(
-                MLPBlock(
-                    features=features,
-                    activation=self.params.activation,
-                    dropout_rate=0.1 if i < len(self.params.hidden_dims) - 1 else 0.0
-                )
+        # Create MLP layers using list comprehension (Flax compatible)
+        self.layers = [
+            MLPBlock(
+                features=features,
+                activation=self.params.activation,
+                dropout_rate=0.1 if i < len(self.params.hidden_dims) - 1 else 0.0
             )
+            for i, features in enumerate(self.params.hidden_dims)
+        ]
         
         # Output layer with tanh activation for bounded control
         self.output_layer = nn.Dense(self.output_dim)
@@ -168,15 +167,13 @@ class PolicyNetworkRNN(nn.Module):
     output_dim: int = 3
     
     def setup(self):
-        # Feature extraction layers
-        self.feature_layers = []
-        for features in self.params.hidden_dims[:-1]:  # All but last
-            self.feature_layers.append(
-                MLPBlock(features=features, activation=self.params.activation)
-            )
+        # Feature extraction layers using list comprehension (Flax compatible)
+        self.feature_layers = [
+            MLPBlock(features=features, activation=self.params.activation)
+            for features in self.params.hidden_dims[:-1]  # All but last
+        ]
         
-        # Recurrent layer (GRU for efficiency)
-        self.rnn = nn.GRU(features=self.params.rnn_hidden_size)
+        # No need to setup RNN layer, we'll use GRUCell directly in __call__
         
         # Output projection
         final_hidden_dim = self.params.hidden_dims[-1] if self.params.hidden_dims else self.params.rnn_hidden_size
@@ -220,9 +217,9 @@ class PolicyNetworkRNN(nn.Module):
             # Combine with current features
             x = jnp.concatenate([x, action_features], axis=-1)
         
-        # RNN processing
-        rnn_output, new_rnn_state = self.rnn(x[:, None, :], rnn_state)  # Add time dimension
-        rnn_output = rnn_output[:, 0, :]  # Remove time dimension
+        # RNN processing - scan over time dimension
+        rnn_cell = nn.GRUCell(features=self.params.rnn_hidden_size)
+        new_rnn_state, rnn_output = rnn_cell(rnn_state, x)
         
         # Output projection
         x = self.output_projection(rnn_output)

@@ -127,7 +127,7 @@ def test_basic_safety_functionality():
         "regularization": 1e-8,
         "max_torque": 0.5,
         "safety_margin": 0.1,
-        "emergency_brake_force": -0.6,
+        "emergency_brake_force": 0.6,
         "failure_penalty": 10000.0
     }
     
@@ -197,7 +197,7 @@ def test_gradient_flow():
         params_dict = {
             "max_thrust": 0.8, "cbf_alpha": 1.0, "relaxation_penalty": 100.0,
             "max_iterations": 20, "tolerance": 1e-4, "regularization": 1e-6,
-            "max_torque": 0.5, "safety_margin": 0.1, "emergency_brake_force": -0.6,
+            "max_torque": 0.5, "safety_margin": 0.1, "emergency_brake_force": 0.6,
             "failure_penalty": 1000.0
         }
         h = jnp.array(0.3)
@@ -255,7 +255,7 @@ def test_end_to_end_integration():
     params_dict = {
         "max_thrust": 0.8, "cbf_alpha": 1.0, "relaxation_penalty": 50.0,
         "max_iterations": 30, "tolerance": 1e-4, "regularization": 1e-6,
-        "max_torque": 0.5, "safety_margin": 0.1, "emergency_brake_force": -0.6,
+        "max_torque": 0.5, "safety_margin": 0.1, "emergency_brake_force": 0.6,
         "failure_penalty": 500.0
     }
     

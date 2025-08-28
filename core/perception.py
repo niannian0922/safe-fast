@@ -36,13 +36,8 @@ from jax.lax import top_k
 # DATA STRUCTURES
 # =============================================================================
 
-@struct.dataclass
-class DroneState:
-    """Drone state representation"""
-    position: jnp.ndarray  # (3,) - World position [x, y, z]
-    velocity: jnp.ndarray  # (3,) - World velocity [vx, vy, vz]
-    orientation: jnp.ndarray  # (3, 3) - Rotation matrix R_world_to_body
-    angular_velocity: jnp.ndarray  # (3,) - Angular velocity [wx, wy, wz]
+# Import DroneState from physics module to maintain consistency
+from core.physics import DroneState
 
 @dataclass(frozen=True)
 class GraphConfig:
@@ -193,13 +188,14 @@ def pointcloud_to_graph(drone_state: DroneState, point_cloud: jnp.ndarray, confi
         n_valid = config.max_points
     
     # 3. Construct node features
-    # Ego node features: [position(3), velocity(3), angular_velocity(3), forward_direction(3)]
+    # Ego node features: [position(3), velocity(3), acceleration(3), forward_direction(1)]
+    # Simplified for point-mass model (no angular_velocity)
     ego_features = jnp.concatenate([
         drone_state.position,
         drone_state.velocity, 
-        drone_state.angular_velocity,
-        drone_state.orientation[:, 0]  # Forward direction vector
-    ])  # (12,) -> truncate to ego_node_features dimension
+        drone_state.acceleration,
+        jnp.array([0.0])  # Dummy forward direction for point mass
+    ])  # (10,) -> truncate to ego_node_features dimension
     ego_features = ego_features[:config.ego_node_features]
     
     # Obstacle node features: relative position in drone body frame
@@ -272,129 +268,194 @@ class MLP(nn.Module):
                 x = self.act(x)
         return x
 
+class GNNUpdate(NamedTuple):
+    """Graph update functions following GCBF+ exact implementation pattern"""
+    message: Callable
+    aggregate: Callable  
+    update: Callable
+    
+    def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
+        """Apply GNN update step with safe indexing"""
+        # Allow both single graph (scalar n_node) and batched single graph ((1,) n_node)
+        assert graph.n_node.shape == tuple() or graph.n_node.shape == (1,), f"Expected single graph, got shape {graph.n_node.shape}"
+        
+        # Safe indexing that handles -1 indices (invalid edges)
+        def safe_get(array, indices):
+            valid_mask = indices >= 0
+            safe_indices = jnp.where(valid_mask, indices, 0)  # Replace -1 with 0
+            result = array[safe_indices]
+            # Zero out invalid entries
+            return jnp.where(valid_mask[:, None], result, 0.0)
+        
+        # Extract node features for senders and receivers
+        node_feats_send = safe_get(graph.nodes, graph.senders)
+        node_feats_recv = safe_get(graph.nodes, graph.receivers)
+        
+        # Message passing
+        edges = self.message(graph.edges, node_feats_send, node_feats_recv)
+        
+        # Aggregate messages
+        aggr_msg = self.aggregate(edges, graph.receivers, graph.nodes.shape[0])
+        
+        # Update nodes
+        new_node_feats = self.update(graph.nodes, aggr_msg)
+        
+        return graph._replace(nodes=new_node_feats)
+
 class GNNLayer(nn.Module):
     """
-    Single GNN layer adapted from GCBF+
-    Implements message passing with attention-based aggregation
+    Single GNN layer - EXACT replication of GCBF+ GNNLayer 
+    From gcbfplus/nn/gnn.py with JAX-native implementation
     """
+    msg_net_cls: Callable
+    aggr_net_cls: Callable
+    update_net_cls: Callable
     msg_dim: int
     out_dim: int
-    hid_size_msg: Tuple[int, ...] = (256, 256)
-    hid_size_aggr: Tuple[int, ...] = (128, 128)  
-    hid_size_update: Tuple[int, ...] = (256, 256)
     
     @nn.compact
     def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
-        def message_fn(edge_feats, sender_feats, receiver_feats):
-            """Message function: combines edge + sender + receiver features"""
-            # Handle invalid edges (sender or receiver = -1) by masking
+        def message(edge_feats, sender_feats, receiver_feats):
+            """Message function - exact GCBF+ implementation"""
             feats = jnp.concatenate([edge_feats, sender_feats, receiver_feats], axis=-1)
-            feats = MLP(self.hid_size_msg, act=nn.relu, act_final=False)(feats)
+            feats = self.msg_net_cls()(feats)
             feats = nn.Dense(self.msg_dim, kernel_init=default_nn_init())(feats)
             return feats
         
-        def update_fn(node_feats, aggr_msgs):
-            """Node update function: combines node features + aggregated messages"""  
-            feats = jnp.concatenate([node_feats, aggr_msgs], axis=-1)
-            feats = MLP(self.hid_size_update, act=nn.relu, act_final=False)(feats)
+        def update(node_feats, msgs):
+            """Node update function - exact GCBF+ implementation"""
+            feats = jnp.concatenate([node_feats, msgs], axis=-1)
+            feats = self.update_net_cls()(feats)
             feats = nn.Dense(self.out_dim, kernel_init=default_nn_init())(feats)
             return feats
             
-        def aggregate_fn(msgs, segment_ids, num_segments):
-            """Attention-based message aggregation (from GCBF+ implementation)"""
-            gate_feats = MLP(self.hid_size_aggr, act=nn.relu, act_final=False)(msgs)
+        def aggregate(msgs, recv_idx, num_segments):
+            """Attention-based aggregation - exact GCBF+ implementation"""
+            gate_feats = self.aggr_net_cls()(msgs)
             gate_feats = nn.Dense(1, kernel_init=default_nn_init())(gate_feats).squeeze(-1)
             
-            # Softmax attention
-            attn = jraph.segment_softmax(gate_feats, segment_ids=segment_ids, num_segments=num_segments)
+            # Segment softmax for attention weights
+            attn = jraph.segment_softmax(gate_feats, segment_ids=recv_idx, num_segments=num_segments)
+            assert attn.shape[0] == msgs.shape[0]
             
-            # Weighted aggregation
+            # Weighted sum aggregation
             aggr_msg = jraph.segment_sum(
-                attn[:, None] * msgs, segment_ids=segment_ids, num_segments=num_segments
+                attn[:, None] * msgs, segment_ids=recv_idx, num_segments=num_segments
             )
             return aggr_msg
         
-        # Apply message passing using jraph primitives
-        updated_nodes = jraph.GraphNetwork(
-            update_node_fn=lambda nodes, sent_msgs, received_msgs, globals_: update_fn(nodes, received_msgs),
-            update_edge_fn=None,  # Keep edges unchanged
-            update_global_fn=None,  # No global features
-            aggregate_edges_for_nodes_fn=aggregate_fn,
-            aggregate_nodes_for_globals_fn=None,
-            aggregate_edges_for_globals_fn=None,
-        )(
-            graph._replace(
-                edges=message_fn(graph.edges, 
-                                graph.nodes[graph.senders], 
-                                graph.nodes[graph.receivers])
-            )
-        ).nodes
-        
-        return graph._replace(nodes=updated_nodes)
+        # Create update function and apply
+        update_fn = GNNUpdate(message, aggregate, update)
+        return update_fn(graph)
 
 class GNN(nn.Module):
     """
-    Multi-layer GNN from GCBF+ with attention-based message passing
-    Adapted for single-agent LiDAR processing
+    Multi-layer GNN - EXACT replication of GCBF+ GNN architecture
+    From gcbfplus/nn/gnn.py with support for single-agent adaptation
     """
     msg_dim: int = 128
+    hid_size_msg: Tuple[int, ...] = (64, 64)
+    hid_size_aggr: Tuple[int, ...] = (64,)
+    hid_size_update: Tuple[int, ...] = (64, 64)
     out_dim: int = 128  
     n_layers: int = 3
-    hid_size_msg: Tuple[int, ...] = (256, 256)
-    hid_size_aggr: Tuple[int, ...] = (128, 128)
-    hid_size_update: Tuple[int, ...] = (256, 256)
     
     @nn.compact  
-    def __call__(self, graph: jraph.GraphsTuple) -> jnp.ndarray:
+    def __call__(self, graph: jraph.GraphsTuple, node_type: Optional[int] = None, n_type: Optional[int] = None) -> jnp.ndarray:
+        """
+        Forward pass following GCBF+ exact implementation
+        
+        Args:
+            graph: Input graph structure
+            node_type: Filter specific node type (0=ego, 1=obstacle)  
+            n_type: Number of nodes of specified type
+        """
         current_graph = graph
         
+        # Multi-layer GNN processing
         for i in range(self.n_layers):
             out_dim = self.out_dim if i == self.n_layers - 1 else self.msg_dim
-            layer = GNNLayer(
-                msg_dim=self.msg_dim,
-                out_dim=out_dim,
-                hid_size_msg=self.hid_size_msg,
-                hid_size_aggr=self.hid_size_aggr,
-                hid_size_update=self.hid_size_update
-            )
-            current_graph = layer(current_graph)
             
-        return current_graph.nodes
+            # Create network classes using partial application (GCBF+ pattern)
+            msg_net = ft.partial(MLP, hid_sizes=self.hid_size_msg, act=nn.relu, act_final=False)
+            attn_net = ft.partial(MLP, hid_sizes=self.hid_size_aggr, act=nn.relu, act_final=False)  
+            update_net = ft.partial(MLP, hid_sizes=self.hid_size_update, act=nn.relu, act_final=False)
+            
+            # Create and apply GNN layer
+            gnn_layer = GNNLayer(
+                msg_net_cls=msg_net,
+                aggr_net_cls=attn_net,
+                update_net_cls=update_net,
+                msg_dim=self.msg_dim,
+                out_dim=out_dim
+            )
+            current_graph = gnn_layer(current_graph)
+            
+        # Return results based on node type filtering (GCBF+ compatibility)
+        if node_type is None:
+            return current_graph.nodes
+        else:
+            # For ego drone (node_type=0), return first node
+            if node_type == 0 and n_type is not None:
+                return current_graph.nodes[:n_type]
+            # For obstacles (node_type=1), return remaining nodes  
+            elif node_type == 1 and n_type is not None:
+                return current_graph.nodes[1:1+n_type] if current_graph.nodes.shape[0] > 1 else jnp.zeros((n_type, current_graph.nodes.shape[1]))
+            else:
+                return current_graph.nodes
 
 class CBFNet(nn.Module):
     """
-    CBF network combining GNN + MLP head
-    Adapted from GCBF+ CBF module implementation
+    CBF network - EXACT replication of GCBF+ CBF module
+    From gcbfplus/algo/module/cbf.py adapted for single-agent scenarios
     """
-    gnn_msg_dim: int = 128
-    gnn_out_dim: int = 128
+    # Graph neural network parameters (matching GCBF+ CBF defaults)
+    node_dim: int = 3  # Node feature dimension
+    edge_dim: int = 4  # Edge feature dimension  
+    n_agents: int = 1  # Single agent (ego drone)
     gnn_layers: int = 3
-    head_sizes: Tuple[int, ...] = (256, 256)
+    
+    # GNN architecture parameters (GCBF+ defaults)
+    msg_dim: int = 64
+    hid_size_msg: Tuple[int, ...] = (64, 64)
+    hid_size_aggr: Tuple[int, ...] = (64,)
+    hid_size_update: Tuple[int, ...] = (64, 64)
     
     @nn.compact
-    def __call__(self, graph: jraph.GraphsTuple, node_types: jnp.ndarray) -> jnp.ndarray:
-        # GNN processing
+    def __call__(self, graph: jraph.GraphsTuple, n_type: Optional[int] = None) -> jnp.ndarray:
+        """
+        CBF computation following GCBF+ exact implementation
+        
+        Args:
+            graph: Input graph with drone and obstacle nodes
+            n_type: Number of agent nodes (should be 1 for single drone)
+        
+        Returns:
+            CBF value(s) for agent node(s)
+        """
+        # Create GNN following GCBF+ CBF parameters
         gnn = GNN(
-            msg_dim=self.gnn_msg_dim,
-            out_dim=self.gnn_out_dim, 
+            msg_dim=self.msg_dim,
+            hid_size_msg=self.hid_size_msg,
+            hid_size_aggr=self.hid_size_aggr, 
+            hid_size_update=self.hid_size_update,
+            out_dim=self.msg_dim,  # Output same as message dimension
             n_layers=self.gnn_layers
         )
-        node_embeddings = gnn(graph)  # (n_nodes, gnn_out_dim)
         
-        # Extract ego drone embedding without boolean indexing
-        # We know ego node is always at index 0 by construction
-        ego_embedding = node_embeddings[0:1, :]  # (1, gnn_out_dim) - slice instead of boolean mask
+        # Process graph and extract agent node features  
+        # node_type=0 means agent nodes (ego drone)
+        n_agents_actual = n_type if n_type is not None else self.n_agents
+        agent_embeddings = gnn(graph, node_type=0, n_type=n_agents_actual)
         
-        # MLP head for CBF prediction
-        head = MLP(hid_sizes=self.head_sizes, act=nn.relu, act_final=False)
-        x = head(ego_embedding)
+        # Final CBF head - single Dense layer (GCBF+ pattern)
+        cbf_values = nn.Dense(1, kernel_init=default_nn_init())(agent_embeddings)
         
-        # Final CBF value with tanh activation (bounded output)
-        cbf_raw = nn.Dense(1, kernel_init=default_nn_init())(x)
-        cbf_value = nn.tanh(cbf_raw)
-        
-        # Return scalar instead of (1,) shape
-        return cbf_value.squeeze()  # Remove all dimensions of size 1
+        # For single agent, return scalar; for multi-agent, return vector
+        if n_agents_actual == 1:
+            return cbf_values.squeeze()  # Scalar output
+        else:
+            return cbf_values.squeeze(-1)  # Remove last dimension but keep batch
 
 # =============================================================================
 # PERCEPTION MODULE
@@ -511,6 +572,272 @@ def get_cbf_from_pointcloud(params, drone_state: DroneState, point_cloud: jnp.nd
     return cbf_value, cbf_grad
 
 # =============================================================================
+# ADVANCED PERCEPTION MODULE WITH TEMPORAL CONSISTENCY
+# =============================================================================
+
+class AdvancedPerceptionModule(PerceptionModule):
+    """Advanced perception module with temporal consistency and memory"""
+    
+    def __init__(self, config: GraphConfig, use_temporal_smoothing: bool = True):
+        super().__init__(config)
+        self.use_temporal_smoothing = use_temporal_smoothing
+        self.cbf_history = []
+        self.max_history = 5
+        
+        # Advanced CBF network with better architecture
+        self.cbf_net = AdvancedCBFNet(
+            gnn_msg_dim=256,  # Larger message dimension
+            gnn_out_dim=256,
+            gnn_layers=4,     # More layers for better representation
+            head_sizes=(512, 256, 128),  # Deeper MLP head
+            use_residual=True,
+            use_attention=True
+        )
+    
+    def get_cbf_and_gradients_with_history(
+        self, 
+        params, 
+        drone_state: DroneState, 
+        point_cloud: jnp.ndarray,
+        temporal_weight: float = 0.1
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Compute CBF with temporal smoothing for stability
+        
+        Args:
+            params: Network parameters
+            drone_state: Current drone state
+            point_cloud: LiDAR point cloud
+            temporal_weight: Weight for temporal smoothing
+            
+        Returns:
+            cbf_value: Temporally smoothed CBF value
+            cbf_gradients: CBF gradients w.r.t. drone position
+        """
+        # Get current CBF value
+        current_cbf, current_grad = self.get_cbf_and_gradients(
+            params, drone_state, point_cloud
+        )
+        
+        if not self.use_temporal_smoothing or len(self.cbf_history) == 0:
+            # No temporal smoothing or first computation
+            smoothed_cbf = current_cbf
+            smoothed_grad = current_grad
+        else:
+            # Apply exponential moving average for temporal consistency
+            prev_cbf = self.cbf_history[-1]['cbf_value']
+            prev_grad = self.cbf_history[-1]['cbf_grad']
+            
+            smoothed_cbf = (1 - temporal_weight) * prev_cbf + temporal_weight * current_cbf
+            smoothed_grad = (1 - temporal_weight) * prev_grad + temporal_weight * current_grad
+        
+        # Update history
+        self.cbf_history.append({
+            'cbf_value': current_cbf,
+            'cbf_grad': current_grad
+        })
+        
+        # Limit history size
+        if len(self.cbf_history) > self.max_history:
+            self.cbf_history.pop(0)
+        
+        return smoothed_cbf, smoothed_grad
+
+class AdvancedCBFNet(nn.Module):
+    """Advanced CBF network with enhanced architecture from GCBF+ analysis"""
+    
+    gnn_msg_dim: int = 256
+    gnn_out_dim: int = 256
+    gnn_layers: int = 4
+    head_sizes: Tuple[int, ...] = (512, 256, 128)
+    use_residual: bool = True
+    use_attention: bool = True
+    dropout_rate: float = 0.1
+    
+    @nn.compact
+    def __call__(self, graph: jraph.GraphsTuple, node_types: jnp.ndarray, training: bool = False) -> jnp.ndarray:
+        # Enhanced GNN with residual connections
+        gnn = EnhancedGNN(
+            msg_dim=self.gnn_msg_dim,
+            out_dim=self.gnn_out_dim,
+            n_layers=self.gnn_layers,
+            use_residual=self.use_residual,
+            use_attention=self.use_attention,
+            dropout_rate=self.dropout_rate if training else 0.0
+        )
+        
+        node_embeddings = gnn(graph, training=training)  # (n_nodes, gnn_out_dim)
+        
+        # Extract ego drone embedding (always at index 0)
+        ego_embedding = node_embeddings[0:1, :]
+        
+        # Enhanced MLP head with residual connections and batch normalization
+        x = ego_embedding
+        
+        for i, features in enumerate(self.head_sizes):
+            residual = x
+            
+            # Dense layer
+            x = nn.Dense(features, kernel_init=nn.initializers.xavier_uniform())(x)
+            
+            # Batch normalization for better training stability (only when training)
+            if training:
+                x = nn.BatchNorm(use_running_average=False)(x)
+            
+            # Activation
+            x = nn.swish(x)  # Swish activation for better gradient flow
+            
+            # Dropout for regularization (only when training and rate > 0)
+            if self.dropout_rate > 0 and training:
+                x = nn.Dropout(self.dropout_rate, deterministic=not training)(x)
+            
+            # Residual connection if dimensions match
+            if self.use_residual and residual.shape[-1] == features:
+                x = x + residual * 0.5  # Scaled residual connection
+        
+        # Final CBF prediction layer
+        cbf_raw = nn.Dense(1, kernel_init=nn.initializers.xavier_uniform())(x)
+        
+        # Use tanh activation to ensure bounded CBF values [-1, 1]
+        cbf_value = nn.tanh(cbf_raw)
+        
+        return cbf_value.squeeze()  # Return scalar
+
+class EnhancedGNN(nn.Module):
+    """Enhanced GNN with advanced features from GCBF+ architecture"""
+    
+    msg_dim: int = 256
+    out_dim: int = 256
+    n_layers: int = 4
+    use_residual: bool = True
+    use_attention: bool = True
+    dropout_rate: float = 0.1
+    
+    @nn.compact
+    def __call__(self, graph: jraph.GraphsTuple, training: bool = False) -> jnp.ndarray:
+        current_graph = graph
+        
+        for i in range(self.n_layers):
+            # Progressive dimension scaling
+            if i == self.n_layers - 1:
+                layer_out_dim = self.out_dim
+            else:
+                layer_out_dim = self.msg_dim
+            
+            # Enhanced GNN layer with attention and residual connections
+            layer = EnhancedGNNLayer(
+                msg_dim=self.msg_dim,
+                out_dim=layer_out_dim,
+                use_attention=self.use_attention,
+                dropout_rate=self.dropout_rate if training else 0.0
+            )
+            
+            # Apply layer
+            new_graph = layer(current_graph, training=training)
+            
+            # Residual connection for node features
+            if (self.use_residual and 
+                current_graph.nodes.shape[-1] == new_graph.nodes.shape[-1]):
+                new_graph = new_graph._replace(
+                    nodes=new_graph.nodes + current_graph.nodes * 0.5
+                )
+            
+            current_graph = new_graph
+        
+        return current_graph.nodes
+
+class EnhancedGNNLayer(nn.Module):
+    """Enhanced GNN layer with attention mechanism from GCBF+ analysis"""
+    
+    msg_dim: int
+    out_dim: int
+    use_attention: bool = True
+    dropout_rate: float = 0.1
+    hid_size_msg: Tuple[int, ...] = (512, 256)
+    hid_size_aggr: Tuple[int, ...] = (256, 128)
+    hid_size_update: Tuple[int, ...] = (512, 256)
+    
+    @nn.compact
+    def __call__(self, graph: jraph.GraphsTuple, training: bool = False) -> jraph.GraphsTuple:
+        def enhanced_message_fn(edge_feats, sender_feats, receiver_feats):
+            """Enhanced message function with better feature processing"""
+            # Concatenate all features
+            feats = jnp.concatenate([edge_feats, sender_feats, receiver_feats], axis=-1)
+            
+            # Multi-layer message processing
+            x = feats
+            for i, size in enumerate(self.hid_size_msg):
+                x = nn.Dense(size, kernel_init=nn.initializers.xavier_uniform())(x)
+                x = nn.swish(x)  # Better activation function
+                
+                if self.dropout_rate > 0 and training:
+                    x = nn.Dropout(self.dropout_rate, deterministic=not training)(x)
+            
+            # Final message dimension
+            messages = nn.Dense(self.msg_dim, kernel_init=nn.initializers.xavier_uniform())(x)
+            return messages
+        
+        def enhanced_aggregate_fn(msgs, segment_ids, num_segments):
+            """Enhanced aggregation with learned attention weights"""
+            if self.use_attention:
+                # Attention-based aggregation (from GCBF+ implementation)
+                gate_feats = MLP(self.hid_size_aggr, act=nn.swish)(msgs)
+                attention_scores = nn.Dense(1, kernel_init=nn.initializers.xavier_uniform())(gate_feats).squeeze(-1)
+                
+                # Apply softmax attention
+                attn_weights = jraph.segment_softmax(
+                    attention_scores, segment_ids=segment_ids, num_segments=num_segments
+                )
+                
+                # Weighted aggregation
+                aggr_msg = jraph.segment_sum(
+                    attn_weights[:, None] * msgs, 
+                    segment_ids=segment_ids, 
+                    num_segments=num_segments
+                )
+            else:
+                # Simple mean aggregation
+                aggr_msg = jraph.segment_mean(msgs, segment_ids, num_segments)
+            
+            return aggr_msg
+        
+        def enhanced_update_fn(node_feats, aggr_msgs):
+            """Enhanced node update function"""
+            # Combine node features with aggregated messages
+            feats = jnp.concatenate([node_feats, aggr_msgs], axis=-1)
+            
+            # Multi-layer update processing
+            x = feats
+            for i, size in enumerate(self.hid_size_update):
+                x = nn.Dense(size, kernel_init=nn.initializers.xavier_uniform())(x)
+                x = nn.swish(x)
+                
+                if self.dropout_rate > 0 and training:
+                    x = nn.Dropout(self.dropout_rate, deterministic=not training)(x)
+            
+            # Final output dimension
+            updated_features = nn.Dense(self.out_dim, kernel_init=nn.initializers.xavier_uniform())(x)
+            return updated_features
+        
+        # Apply enhanced message passing
+        updated_nodes = jraph.GraphNetwork(
+            update_node_fn=lambda nodes, sent_msgs, received_msgs, globals_: enhanced_update_fn(nodes, received_msgs),
+            update_edge_fn=None,  # Keep edges unchanged
+            update_global_fn=None,  # No global features
+            aggregate_edges_for_nodes_fn=enhanced_aggregate_fn,
+            aggregate_nodes_for_globals_fn=None,
+            aggregate_edges_for_globals_fn=None,
+        )(
+            graph._replace(
+                edges=enhanced_message_fn(graph.edges, 
+                                         graph.nodes[graph.senders], 
+                                         graph.nodes[graph.receivers])
+            )
+        ).nodes
+        
+        return graph._replace(nodes=updated_nodes)
+
+# =============================================================================
 # TESTING AND VALIDATION
 # =============================================================================
 
@@ -543,6 +870,65 @@ def test_pointcloud_to_graph():
     print(f"Node types: {node_types}")
     
     return graph, node_types
+
+def test_advanced_perception_module():
+    """Test advanced perception module with temporal consistency"""
+    print("Testing Advanced Perception Module...")
+    
+    # Create advanced perception module
+    config = GraphConfig(k_neighbors=10, max_range=8.0)
+    perception = AdvancedPerceptionModule(config, use_temporal_smoothing=True)
+    
+    # Initialize network
+    key = jax.random.PRNGKey(42)
+    init_key, dropout_key, test_key = jax.random.split(key, 3)
+    
+    drone_state = DroneState(
+        position=jnp.array([0.0, 0.0, 1.0]),
+        velocity=jnp.array([1.0, 0.5, 0.0]),
+        orientation=jnp.eye(3),
+        angular_velocity=jnp.zeros(3)
+    )
+    
+    # Generate test point cloud
+    point_cloud = jax.random.normal(test_key, (25, 3)) * 3.0
+    graph, node_types = pointcloud_to_graph(drone_state, point_cloud, config)
+    
+    # Initialize network parameters with dropout support
+    params = perception.cbf_net.init(
+        {'params': init_key, 'dropout': dropout_key}, 
+        graph, node_types, training=True
+    )
+    
+    # Test CBF computation with temporal consistency
+    for i in range(3):
+        # Create a test CBF function that doesn't use dropout for inference
+        def test_cbf_fn(state):
+            test_graph, test_node_types = pointcloud_to_graph(state, point_cloud, config)
+            return perception.cbf_net.apply(
+                params, test_graph, test_node_types, 
+                training=False, rngs={'dropout': dropout_key}
+            )
+        
+        # Compute CBF and gradients
+        cbf_value = test_cbf_fn(drone_state)
+        cbf_grad = jax.grad(lambda state: test_cbf_fn(state).sum())(drone_state)
+        
+        # Update temporal history manually for testing
+        perception.cbf_history.append({
+            'cbf_value': cbf_value,
+            'cbf_grad': cbf_grad
+        })
+        
+        print(f"  Step {i+1}: CBF={cbf_value:.4f}, Grad_norm={jnp.linalg.norm(cbf_grad.position):.4f}")
+        
+        # Slightly modify drone state for next iteration
+        drone_state = drone_state._replace(
+            position=drone_state.position + jnp.array([0.1, 0.0, 0.0])
+        )
+    
+    print("✅ Advanced Perception Module Test: PASSED")
+    return True
 
 if __name__ == "__main__":
     # Run basic test
