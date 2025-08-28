@@ -1024,3 +1024,173 @@ def differentiable_cbf_qp_solve(
     }
     
     return u_safe, info_dict
+
+class RobustSafetyLayer:
+    """
+    三层安全QP求解器 - 解决qpax数值不稳定问题
+    基于GCBF+论文的安全保障机制
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        self.qp_failure_count = 0
+    
+    def safety_filter(
+        self, 
+        u_nom: chex.Array, 
+        h: chex.Array, 
+        grad_h: chex.Array, 
+        drone_state
+    ) -> Tuple[chex.Array, Dict]:
+        """
+        三层安全过滤器：
+        Layer 1: 标准CBF-QP  
+        Layer 2: 松弛CBF-QP (with slack variables)
+        Layer 3: 紧急制动控制
+        """
+        
+        # Layer 1: 尝试标准CBF-QP求解
+        try:
+            u_safe, info = self._solve_layer1_qp(u_nom, h, grad_h, drone_state)
+            if info['feasible'] and self._validate_safety_constraints(u_safe, h, grad_h):
+                return u_safe, {**info, 'layer_used': 1}
+        except Exception as e:
+            self.qp_failure_count += 1
+        
+        # Layer 2: 松弛QP with slack variables
+        try:
+            u_safe, info = self._solve_layer2_relaxed_qp(u_nom, h, grad_h, drone_state)
+            if info['feasible']:
+                return u_safe, {**info, 'layer_used': 2}
+        except Exception as e:
+            self.qp_failure_count += 1
+        
+        # Layer 3: Emergency brake control
+        u_emergency = self._emergency_brake_control(drone_state)
+        return u_emergency, {
+            'feasible': True,
+            'layer_used': 3,
+            'emergency_activated': True,
+            'qp_failures': self.qp_failure_count
+        }
+    
+    def _solve_layer1_qp(self, u_nom, h, grad_h, drone_state):
+        """Layer 1: 标准CBF-QP"""
+        # 构建QP矩阵
+        Q = jnp.eye(3) * self.config.control_penalty_weight
+        q = -Q @ u_nom  # 最小化 ||u - u_nom||²
+        
+        # CBF约束: L_f h + L_g h * u >= -alpha * h
+        lf_h = self._compute_lie_derivative_f(h, drone_state)
+        lg_h = grad_h  # 简化：假设lg_h = grad_h
+        
+        G_cbf = -lg_h.reshape(1, -1)  # [1, 3]
+        h_cbf = jnp.array([self.config.cbf_alpha * h - lf_h])  # [1]
+        
+        # 控制约束: |u| <= u_max
+        G_control = jnp.vstack([jnp.eye(3), -jnp.eye(3)])  # [6, 3]
+        h_control = jnp.hstack([
+            jnp.ones(3) * self.config.max_thrust,
+            jnp.ones(3) * self.config.max_thrust
+        ])  # [6]
+        
+        # 组合约束
+        G = jnp.vstack([G_cbf, G_control])  # [7, 3]
+        h_constraint = jnp.hstack([h_cbf, h_control])  # [7]
+        
+        # 数值稳定化
+        Q_reg = Q + self.config.regularization * jnp.eye(3)
+        
+        # 求解QP
+        solution = qpax.solve_qp_primal(
+            Q_reg, q, 
+            jnp.zeros((0, 3)), jnp.zeros(0),  # 无等式约束
+            G, h_constraint,
+            solver_tol=self.config.tolerance
+        )
+        
+        # 验证解
+        constraint_violations = G @ solution - h_constraint
+        max_violation = jnp.max(constraint_violations)
+        feasible = max_violation <= self.config.tolerance * 10
+        
+        return solution, {
+            'feasible': feasible,
+            'max_violation': float(max_violation),
+            'solver_status': 'success' if feasible else 'infeasible'
+        }
+    
+    def _solve_layer2_relaxed_qp(self, u_nom, h, grad_h, drone_state):
+        """Layer 2: 松弛QP with slack variables"""
+        # 扩展QP维度：[u1, u2, u3, δ] where δ is slack variable
+        Q = jnp.zeros((4, 4))
+        Q = Q.at[:3, :3].set(jnp.eye(3) * self.config.control_penalty_weight)
+        Q = Q.at[3, 3].set(self.config.relaxation_penalty)  # 大的松弛惩罚
+        
+        q = jnp.zeros(4)
+        q = q.at[:3].set(-self.config.control_penalty_weight * u_nom)
+        
+        # 松弛CBF约束: L_f h + L_g h * u + δ >= -alpha * h
+        lf_h = self._compute_lie_derivative_f(h, drone_state)
+        G_cbf_relaxed = jnp.zeros((1, 4))
+        G_cbf_relaxed = G_cbf_relaxed.at[0, :3].set(-grad_h)  # -L_g h * u
+        G_cbf_relaxed = G_cbf_relaxed.at[0, 3].set(-1.0)      # -δ
+        h_cbf_relaxed = jnp.array([self.config.cbf_alpha * h - lf_h])
+        
+        # 控制约束保持不变，但扩展到4D
+        G_control = jnp.zeros((6, 4))
+        G_control = G_control.at[:3, :3].set(jnp.eye(3))      # u <= u_max
+        G_control = G_control.at[3:6, :3].set(-jnp.eye(3))    # u >= -u_max
+        h_control = jnp.ones(6) * self.config.max_thrust
+        
+        # 松弛变量约束: δ >= 0
+        G_slack = jnp.zeros((1, 4))
+        G_slack = G_slack.at[0, 3].set(-1.0)  # -δ <= 0
+        h_slack = jnp.array([0.0])
+        
+        # 组合所有约束
+        G = jnp.vstack([G_cbf_relaxed, G_control, G_slack])
+        h_constraint = jnp.hstack([h_cbf_relaxed, h_control, h_slack])
+        
+        # 求解
+        solution = qpax.solve_qp_primal(
+            Q, q,
+            jnp.zeros((0, 4)), jnp.zeros(0),
+            G, h_constraint,
+            solver_tol=self.config.tolerance
+        )
+        
+        u_safe = solution[:3]
+        slack_value = solution[3]
+        
+        return u_safe, {
+            'feasible': True,  # 松弛QP总是可行的
+            'slack_violation': float(jnp.maximum(slack_value, 0.0)),
+            'solver_status': 'relaxed_success'
+        }
+    
+    def _emergency_brake_control(self, drone_state):
+        """Layer 3: 紧急制动控制"""
+        velocity = drone_state.velocity
+        velocity_norm = jnp.linalg.norm(velocity)
+        
+        if velocity_norm < 1e-6:
+            # 已经静止，只需悬停
+            return jnp.array([0.0, 0.0, self.config.hover_thrust])
+        else:
+            # 反向制动
+            brake_direction = -velocity / velocity_norm
+            brake_magnitude = jnp.minimum(self.config.emergency_brake_force, velocity_norm)
+            
+            return brake_direction * brake_magnitude
+    
+    def _compute_lie_derivative_f(self, h, drone_state):
+        """计算Lie导数L_f h (简化实现)"""
+        # 简化：假设CBF主要依赖于位置
+        # 实际实现需要根据具体的CBF定义
+        return 0.0  # Placeholder
+    
+    def _validate_safety_constraints(self, u_safe, h, grad_h):
+        """验证安全约束是否满足"""
+        # 简化验证
+        return jnp.linalg.norm(u_safe) <= self.config.max_thrust * 1.1
