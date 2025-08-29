@@ -396,7 +396,14 @@ def stage4_validate_imports():
     
     print(f"   📊 导入状态:")
     print(f"      - 核心训练能力: {'✅ 就绪' if core_ready else '❌ 不可用'}")
-    print(f"      - GPU加速: {'✅ 可用' if 'gpu' in str(jax.devices()).lower() if import_status.get('jax') else '❌ 不可用'}")
+    # 检查GPU可用性
+    gpu_available = False
+    if import_status.get('jax'):
+        try:
+            gpu_available = 'gpu' in str(jax.devices()).lower()
+        except:
+            gpu_available = False
+    print(f"      - GPU加速: {'✅ 可用' if gpu_available else '❌ 不可用'}")
     
     return import_status, core_ready
 
@@ -857,7 +864,7 @@ SAFE AGILE FLIGHT - KAGGLE训练报告
 训练环境:
   • JAX版本: {jax.__version__ if import_status.get('jax') else 'N/A'}
   • 设备: {str(jax.devices()) if import_status.get('jax') else 'N/A'}  
-  • GPU加速: {'是' if 'gpu' in str(jax.devices()).lower() if import_status.get('jax') else '否'}
+  • GPU加速: {'是' if (import_status.get('jax') and 'gpu' in str(jax.devices()).lower()) else '否'}
   • 项目代码: {'可用' if code_available else '内嵌实现'}
 
 训练配置:
@@ -938,7 +945,17 @@ if training_results:
     print(f"   ✅ 端到端训练: 成功完成")
     print(f"   📊 训练轮数: {len(training_results['training_history'])}")
     print(f"   ⏱️ 训练时间: {training_results['total_time']:.1f}秒")
-    print(f"   📈 损失改善: {((training_results['training_history'][0]['loss'] - training_results['training_history'][-1]['loss']) / training_results['training_history'][0]['loss'] * 100):.1f}%" if training_results['training_history'][0]['loss'] > 0 else "N/A"}")
+    # 计算损失改善百分比
+    if training_results['training_history'] and len(training_results['training_history']) > 0:
+        initial_loss = training_results['training_history'][0]['loss']
+        final_loss = training_results['training_history'][-1]['loss']
+        if initial_loss > 0:
+            improvement = ((initial_loss - final_loss) / initial_loss * 100)
+            print(f"   📈 损失改善: {improvement:.1f}%")
+        else:
+            print(f"   📈 损失改善: N/A")
+    else:
+        print(f"   📈 损失改善: N/A")
 else:
     print(f"   ❌ 端到端训练: 未能完成")
 
