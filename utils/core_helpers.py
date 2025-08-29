@@ -1,6 +1,6 @@
 """
-Core helper functions for the Safe Agile Flight system
-Replacing functionality from deleted temporary files
+安全敏捷飞行系统的核心辅助函数
+替换已删除临时文件的功能
 """
 
 import jax
@@ -16,15 +16,15 @@ from core.loop import ScanCarry, ScanOutput
 def create_batch_compatible_scan_function(
     gnn_perception, policy_network, safety_layer, physics_params
 ):
-    """Create a scan function compatible with batched operations with advanced features."""
+    """创建与批操作兼容的扫描函数，具有高级功能。"""
     
     def scan_function(carry, inputs):
-        """Enhanced scan function for BPTT loop with full system integration."""
+        """具有完整系统集成的BPTT循环增强扫描函数。"""
         drone_state = carry.drone_state
         rnn_state = carry.rnn_hidden_state
         step_count = carry.step_count
         
-        # Determine batch size dynamically
+        # 动态确定批大小
         if hasattr(drone_state.position, 'shape') and len(drone_state.position.shape) > 1:
             batch_size = drone_state.position.shape[0]
             is_batched = True
@@ -32,11 +32,11 @@ def create_batch_compatible_scan_function(
             batch_size = 1
             is_batched = False
         
-        # Handle inputs properly
+        # 正确处理输入
         target_pos = inputs.get('target_positions', jnp.zeros((batch_size, 3)) if is_batched else jnp.zeros(3))
         obstacle_pointcloud = inputs.get('obstacle_pointclouds', jnp.zeros((batch_size, 50, 3)) if is_batched else jnp.zeros((50, 3)))
         
-        # Create comprehensive observations
+        # 创建综合观测
         if is_batched:
             obs = jnp.concatenate([
                 drone_state.position,

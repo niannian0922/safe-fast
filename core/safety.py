@@ -1,74 +1,73 @@
 """
-Complete Safety Layer Implementation for Safe Agile Flight System
+安全敏捷飞行系统的完整安全层实现
 
-This module implements the differentiable safety layer combining CBF constraints
-with quadratic programming (QP) for safe control synthesis.
+本模块实现可微分安全层，将CBF约束与二次规划(QP)结合用于安全控制合成。
 
-Key Components:
-1. QP-based safety filter using qpax for JAX-native differentiability
-2. Complete three-layer safety fallback mechanism for robustness
-3. CBF constraint construction and gradient integration
-4. Temporal gradient decay from DiffPhysDrone integration
+关键组件：
+1. 使用qpax的基于QP的安全过滤器，支持JAX原生可微分性
+2. 完整的三层安全回退机制以提高鲁棒性  
+3. CBF约束构建和梯度集成
+4. 来自DiffPhysDrone集成的时间梯度衰减
 
-Safety Hierarchy:
-1. Nominal QP solving (preferred)
-2. Relaxed QP with slack variables (fallback)  
-3. Emergency brake control (last resort)
+安全层次结构：
+1. 标准QP求解（首选）
+2. 带松弛变量的松弛QP（回退）
+3. 紧急制动控制（最后手段）
 """
 
 import jax
 import jax.numpy as jnp
 from jax import jit, grad
 import qpax
-from typing import Tuple, Optional, NamedTuple
+from typing import Dict, Tuple, Optional, NamedTuple
 import chex
 from dataclasses import dataclass
 
 from .perception import DroneState
 
 # =============================================================================
-# SAFETY CONFIGURATION AND STRUCTURES  
+# 安全配置和结构
 # =============================================================================
 
 @dataclass
 class SafetyConfig:
-    """Configuration parameters for safety layer"""
-    # QP solver settings
+    """安全层的配置参数"""
+    # QP求解器设置
     max_iterations: int = 100
     tolerance: float = 1e-6
     regularization: float = 1e-8
     
-    # Control constraints
-    max_thrust: float = 0.8  # Maximum thrust magnitude
-    max_torque: float = 0.5  # Maximum angular control
+    # 控制约束
+    max_thrust: float = 0.8  # 最大推力幅度
+    max_torque: float = 0.5  # 最大角度控制
     
-    # CBF parameters
-    cbf_alpha: float = 1.0  # CBF class-K function parameter
-    safety_margin: float = 0.1  # Additional safety buffer
-    relaxation_penalty: float = 1000.0  # Slack variable penalty (beta)
+    # CBF参数
+    cbf_alpha: float = 1.0  # CBF类K函数参数
+    safety_margin: float = 0.1  # 额外安全缓冲
+    relaxation_penalty: float = 1000.0  # 松弛变量惩罚(beta)
     
-    # Emergency fallback
-    emergency_brake_force: float = 0.6  # Emergency deceleration magnitude (positive)
-    failure_penalty: float = 10000.0  # Loss penalty for failures
-    use_differentiable_fallback: bool = False  # Use projected gradient QP when gradients needed
+    # 紧急回退
+    emergency_brake_force: float = 0.6  # 紧急减速幅度（正值）
+    failure_penalty: float = 10000.0  # 失败的损失惩罚
+    use_differentiable_fallback: bool = False  # 在需要梯度时使用投影梯度QP
 
 @dataclass
 class QSolutionInfo:
-    """QP solution information and diagnostics"""
-    u_safe: chex.Array  # Computed safe control
-    is_feasible: bool  # Whether QP was feasible
-    solver_status: int  # Solver status code (0=success, 1=infeasible, 2=failed)
-    slack_violation: float  # Magnitude of constraint relaxation
-    num_iterations: int  # Solver iterations used
+    """QP求解信息和诊断"""
+    u_safe: chex.Array  # 计算的安全控制
+    is_feasible: bool  # QP是否可行
+    solver_status: int  # 求解器状态代码（0=成功，1=不可行，2=失败）
+    slack_violation: float  # 约束松弛的幅度
+    num_iterations: int  # 求解器使用的迭代次数
     
 class SafetyLayer:
     """
-    Differentiable safety layer with QP-based control synthesis
+    基于QP控制合成的可微分安全层
     
-    Implements the complete three-layer safety architecture:
-    1. Standard CBF-QP (nominal operation)
-    2. Relaxed CBF-QP with slack variables (safety fallback)
-    3. Emergency braking (last resort)
+    实现完整的三层安全架构：
+    1. 标准CBF-QP（名义操作）
+    2. 带松弛变量的松弛CBF-QP（安全回退）
+    3. 紧急制动（最后手段）
     """
     
     def __init__(self, config: SafetyConfig):
@@ -82,44 +81,44 @@ class SafetyLayer:
         drone_state: DroneState
     ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
         """
-        Construct QP matrices for CBF constraint
+        为CBF约束构建QP矩阵
         
-        Standard CBF-QP formulation:
-        minimize: ||u - u_nom||^2
-        subject to: grad_h^T * g * u >= -grad_h^T * f - alpha * h
+        标准CBF-QP公式：
+        最小化： ||u - u_nom||^2
+        约束于： grad_h^T * g * u >= -grad_h^T * f - alpha * h
         
-        Note: For position-only CBF (grad_h is 3D), we only need position dynamics.
-        The key insight is that CBF constraints only care about position evolution.
+        注意：对于仅位置CBF（grad_h是3D），我们只需要位置动力学。
+        关键见解是CBF约束只关心位置演化。
         """
-        # Cost function: minimize ||u - u_nom||^2 with numerical stability
+        # 成本函数：最小化||u - u_nom||^2带数值稳定性
         Q = 2.0 * jnp.eye(3) + self.config.regularization * jnp.eye(3)
         q = -2.0 * u_nom
         
-        # For position-only CBF, we only need position dynamics:
-        # d_pos/dt = velocity (current drone velocity)
-        # The CBF constraint becomes: grad_h^T * (velocity + u_control) >= -alpha * h
-        # This is valid because control directly affects acceleration, which affects velocity,
-        # which affects position in the next time step.
+        # 对于仅位置CBF，我们只需要位置动力学：
+        # d_pos/dt = velocity （当前无人机速度）
+        # CBF约束变为： grad_h^T * (velocity + u_control) >= -alpha * h
+        # 这是有效的，因为控制直接影响加速度，进而影响速度，
+        # 在下一时间步中影响位置。
         
-        f_position_dynamics = drone_state.velocity  # (3,) position time derivative
+        f_position_dynamics = drone_state.velocity  # (3,) 位置时间导数
         
-        # Control affects position through direct thrust (simplified model)
-        g_position_matrix = jnp.eye(3)  # Direct position control
+        # 控制通过直接推力影响位置（简化模型）
+        g_position_matrix = jnp.eye(3)  # 直接位置控制
         
-        # Constraint matrix: -grad_h^T * g_position
+        # 约束矩阵： -grad_h^T * g_position
         G_cbf = -(grad_h @ g_position_matrix)[None, :]  # (1, 3)
         
-        # Constraint vector: grad_h^T * f_position + alpha * h
+        # 约束向量： grad_h^T * f_position + alpha * h
         h_cbf = grad_h @ f_position_dynamics + self.config.cbf_alpha * h
         
-        # Add control magnitude constraints: -max_thrust <= u_i <= max_thrust
+        # 添加控制幅度约束： -max_thrust <= u_i <= max_thrust
         G_control = jnp.vstack([
             jnp.eye(3),      # u_i <= max_thrust
-            -jnp.eye(3)      # -u_i <= max_thrust (i.e., u_i >= -max_thrust)
+            -jnp.eye(3)      # -u_i <= max_thrust (即 u_i >= -max_thrust)
         ])
         h_control = jnp.full(6, self.config.max_thrust)
         
-        # Combine constraints
+        # 组合约束
         G = jnp.vstack([G_cbf, G_control])  # (7, 3)
         h_constraint = jnp.concatenate([h_cbf[None], h_control])  # (7,)
         
@@ -133,18 +132,18 @@ class SafetyLayer:
         drone_state: DroneState
     ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
         """
-        Construct relaxed QP with slack variables
+        构建带松弛变量的松弛QP
         
-        Relaxed formulation:
-        minimize: ||u - u_nom||^2 + beta * ||delta||^2
-        subject to: grad_h^T * (f + g*u) >= -alpha * h - delta
+        松弛公式：
+        最小化： ||u - u_nom||^2 + beta * ||delta||^2
+        约束于： grad_h^T * (f + g*u) >= -alpha * h - delta
                    delta >= 0
         
-        Variables: [u (3), delta (1)] = (4,)
+        变量： [u (3), delta (1)] = (4,)
         """
         beta = self.config.relaxation_penalty
         
-        # Extended cost matrix for [u, delta] with regularization
+        # 带正则化的[u, delta]扩展成本矩阵
         Q = jnp.block([
             [2.0 * jnp.eye(3) + self.config.regularization * jnp.eye(3), jnp.zeros((3, 1))],
             [jnp.zeros((1, 3)), 2.0 * beta * jnp.ones((1, 1))]
@@ -152,7 +151,7 @@ class SafetyLayer:
         
         q = jnp.concatenate([-2.0 * u_nom, jnp.zeros(1)])  # (4,)
         
-        # Get original CBF constraint components
+        # 获取原始CBF约束组件
         _, _, G_orig, h_orig = self._construct_qp_matrices(u_nom, h, grad_h, drone_state)
         
         # Modify CBF constraint to include slack: G*[u, delta] <= h
@@ -181,7 +180,7 @@ class SafetyLayer:
         grad_h: chex.Array,
         drone_state: DroneState
     ) -> QSolutionInfo:
-        """Solve standard CBF-QP (Layer 1) with correct qpax API"""
+        """使用正确的qpax API求解标准CBF-QP（第1层）"""
         try:
             Q, q, G, h_constraint = self._construct_qp_matrices(u_nom, h, grad_h, drone_state)
             
@@ -235,7 +234,7 @@ class SafetyLayer:
         grad_h: chex.Array,
         drone_state: DroneState
     ) -> QSolutionInfo:
-        """Solve relaxed CBF-QP with slack variables (Layer 2)"""
+        """使用松弛变量求解松弛CBF-QP（第2层）"""
         try:
             Q, q, G, h_constraint = self._construct_relaxed_qp_matrices(
                 u_nom, h, grad_h, drone_state
@@ -262,7 +261,7 @@ class SafetyLayer:
             max_violation = jnp.max(constraint_violations)
             is_feasible = max_violation <= self.config.tolerance * 10
             
-            # Use jnp.where for differentiable fallback
+            # 使用jnp.where进行可微分回退
             u_safe = jnp.where(is_feasible, u_safe, u_nom)
             slack_violation = jnp.where(is_feasible, jnp.maximum(slack_value, 0.0), 1.0)
             
@@ -360,7 +359,7 @@ class SafetyLayer:
         return emergency_control, emergency_info
 
 # =============================================================================
-# LOSS FUNCTIONS FOR TRAINING
+# 训练损失函数
 # =============================================================================
 
 def compute_safety_loss(
@@ -368,28 +367,28 @@ def compute_safety_loss(
     config: SafetyConfig
 ) -> Tuple[chex.Array, dict]:
     """
-    Compute safety-related loss components for training
+    计算训练的安全相关损失组件
     
-    Loss components:
-    1. Relaxation penalty: penalize slack variable usage
-    2. Failure penalty: heavily penalize solver failures
-    3. Control magnitude: regularize control effort
+    损失组件：
+    1. 松弛惩罚：惩罚松弛变量的使用
+    2. 失败惩罚：大力惩罚求解器失败
+    3. 控制幅度：正则化控制助力
     
-    Returns:
-        total_loss: Combined safety loss
-        loss_dict: Individual loss components
+    返回：
+        total_loss: 组合安全损失
+        loss_dict: 单个损失组件
     """
-    # Relaxation penalty (encourage feasible solutions)
+    # 松弛惩罚（鼓励可行解）
     relaxation_loss = config.relaxation_penalty * jnp.maximum(0.0, solution_info.slack_violation)
     
-    # Failure penalty (strongly discourage solver failures)
+    # 失败惩罚（强烈阻止求解器失败）
     failure_penalty = jnp.where(
         solution_info.solver_status >= 2,
         config.failure_penalty,
         0.0
     )
     
-    # Control effort regularization
+    # 控制助力正则化
     control_magnitude_loss = 0.01 * jnp.sum(solution_info.u_safe ** 2)
     
     total_loss = relaxation_loss + failure_penalty + control_magnitude_loss
@@ -406,7 +405,7 @@ def compute_safety_loss(
     return total_loss, loss_dict
 
 # =============================================================================
-# DIFFERENTIABLE SAFETY LAYER INTERFACE
+# 可微分安全层接口
 # =============================================================================
 
 def differentiable_safety_filter(
@@ -417,30 +416,30 @@ def differentiable_safety_filter(
     drone_state: DroneState
 ) -> Tuple[chex.Array, dict]:
     """
-    JIT-compiled differentiable safety filter with automatic fallback
+    带自动回退的JIT编译可微分安全过滤器
     
-    This always uses the differentiable solver for JIT compatibility.
-    The original qpax-based solver is kept for non-JIT use cases.
+    为JIT兼容性，始终使用可微分求解器。
+    保留原始基于qpax的求解器用于非JIT用例。
     
-    Args:
-        params_dict: Configuration parameters (converted to static)
-        u_nom: Nominal control input
-        h: CBF value
-        grad_h: CBF gradient
-        drone_state: Current drone state
+    参数：
+        params_dict: 配置参数（转换为静态）
+        u_nom: 名义控制输入
+        h: CBF值
+        grad_h: CBF梯度
+        drone_state: 当前无人机状态
         
-    Returns:
-        u_safe: Safe control output
-        info_dict: Solution information for loss computation
+    返回：
+        u_safe: 安全控制输出
+        info_dict: 损失计算的求解信息
     """
     config = SafetyConfig(**params_dict)
     
-    # Always use differentiable solver for JIT compatibility
-    # This avoids the boolean conversion issue in JIT compilation
+    # 为JIT兼容性始终使用可微分求解器
+    # 这避免了JIT编译中的布尔转换问题
     return differentiable_cbf_qp_solve(u_nom, h, grad_h, drone_state, config)
 
 # =============================================================================
-# TEMPORAL GRADIENT DECAY (DiffPhysDrone Integration)
+# 时间梯度衰减（DiffPhysDrone集成）
 # =============================================================================
 
 def apply_temporal_gradient_decay(
@@ -450,26 +449,25 @@ def apply_temporal_gradient_decay(
     distance_to_obstacles: Optional[chex.Array] = None
 ) -> chex.Array:
     """
-    Apply temporal gradient decay for BPTT stability (from DiffPhysDrone)
+    应用时间梯度衰减以获得BPTT稳定性（来自DiffPhysDrone）
     
-    Implements the temporal gradient decay mechanism with additional 
-    spatial adaptation based on obstacle proximity.
+    实现时间梯度衰减机制，带有基于障碍物邻近度的额外空间适应。
     
-    Args:
-        gradients: Gradients from safety layer
-        time_step: Current time step in trajectory
-        decay_factor: Base decay factor
-        distance_to_obstacles: Distance to nearest obstacles (optional)
+    参数：
+        gradients: 来自安全层的梯度
+        time_step: 轨迹中的当前时间步
+        decay_factor: 基础衰减因子
+        distance_to_obstacles: 到最近障碍物的距离（可选）
         
-    Returns:
-        decayed_gradients: Scaled gradients
+    返回：
+        decayed_gradients: 缩放的梯度
     """
-    # Base temporal decay (exponential)
+    # 基础时间衰减（指数）
     temporal_decay = decay_factor ** time_step
     
-    # Spatial adaptation (stronger decay when far from obstacles)
+    # 空间适应（远离障碍物时更强的衰减）
     if distance_to_obstacles is not None:
-        # Increase decay factor when far from obstacles (less safety critical)
+        # 远离障碍物时增加衰减因子（安全性不那么关键）
         min_distance = jnp.min(distance_to_obstacles)
         spatial_factor = jnp.maximum(0.5, jnp.minimum(1.0, min_distance / 2.0))
         temporal_decay *= spatial_factor
@@ -477,7 +475,7 @@ def apply_temporal_gradient_decay(
     return gradients * temporal_decay
 
 # =============================================================================
-# FACTORY FUNCTIONS AND UTILITIES
+# 工厂函数和实用程序
 # =============================================================================
 
 def create_default_safety_layer() -> SafetyLayer:

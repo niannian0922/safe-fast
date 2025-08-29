@@ -1,15 +1,15 @@
 """
-BPTT (Backpropagation Through Time) loop implementation for safe agile flight.
+安全敏捷飞行的BPTT（时间反向传播）循环实现。
 
-This module implements the core training loop combining:
-1. GCBF+ (MIT-REALM): Graph-based safety constraints and multi-agent coordination
-2. DiffPhysDrone (SJTU): Temporal gradient decay and differentiable physics
+本模块实现核心训练循环，结合：
+1. GCBF+ (MIT-REALM): 基于图的安全约束和多智能体协调
+2. DiffPhysDrone (SJTU): 时间梯度衰减和可微分物理学
 
-The loop uses JAX's lax.scan for efficient compilation and supports:
-- Gradient checkpointing for memory efficiency
-- Temporal gradient decay for training stability  
-- Multi-agent coordination through graph structures
-- End-to-end differentiable physics simulation
+循环使用JAX的lax.scan进行高效编译并支持：
+- 用于内存效率的梯度检查点
+- 用于训练稳定性的时间梯度衰减
+- 通过图结构的多智能体协调
+- 端到端可微分物理仿真
 """
 
 import jax
@@ -20,7 +20,7 @@ import chex
 from flax import struct
 import functools
 
-# Import our implementations
+# 导入我们的实现
 from .physics import (
     DroneState, MultiAgentState, PhysicsParams,
     dynamics_step, multi_agent_dynamics_step,
@@ -33,21 +33,21 @@ from .policy import (
 
 @struct.dataclass
 class ScanCarry:
-    """Scan carry state compatible with main.py interface - supports batch processing"""
-    drone_state: Any  # DroneState or batched DroneState (flexible)
-    rnn_hidden_state: chex.Array  # [batch_size, hidden_dim] or [hidden_dim] for single
-    step_count: chex.Array  # [batch_size] or scalar for single
-    cumulative_reward: chex.Array  # [batch_size] or scalar for single
+    """与main.py接口兼容的扫描携带状态 - 支持批处理"""
+    drone_state: Any  # DroneState或批处理DroneState（灵活）
+    rnn_hidden_state: chex.Array  # [batch_size, hidden_dim]或单个[hidden_dim]
+    step_count: chex.Array  # [batch_size]或单个标量
+    cumulative_reward: chex.Array  # [batch_size]或单个标量
 
 
 @struct.dataclass 
 class ScanOutput:
-    """Scan outputs compatible with main.py interface"""
-    # Basic trajectory data
-    positions: chex.Array  # [3] positions
-    velocities: chex.Array  # [3] velocities
-    control_commands: chex.Array  # [3] control commands
-    nominal_commands: chex.Array  # [3] nominal commands
+    """与main.py接口兼容的扫描输出"""
+    # 基本轨迹数据
+    positions: chex.Array  # [3] 位置
+    velocities: chex.Array  # [3] 速度
+    control_commands: chex.Array  # [3] 控制命令
+    nominal_commands: chex.Array  # [3] 名义命令
     step_loss: float  # Step loss
     safety_violation: float  # Safety violations
     

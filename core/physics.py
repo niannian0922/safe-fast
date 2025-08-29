@@ -1,22 +1,22 @@
 """
-JAX-native differentiable physics engine for safe agile flight.
+基于JAX的可微分物理引擎，用于安全敏捷飞行。
 
-This module implements the core differentiable physics simulation combining insights from:
-1. GCBF+ (MIT-REALM): Graph-based safety mechanisms and multi-agent coordination
-2. DiffPhysDrone (SJTU): Differentiable physics with temporal gradient decay
+本模块实现核心可微分物理仿真，结合以下研究的见解：
+1. GCBF+ (MIT-REALM): 基于图的安全机制和多智能体协调
+2. DiffPhysDrone (SJTU): 具有时间梯度衰减的可微分物理学
 
-CRITICAL DiffPhysDrone Integration:
-- Temporal gradient decay mechanism (g_decay function)
-- Control history modeling with exponential smoothing  
-- Thrust-to-weight ratio dynamics calibration
-- Numerical stability enhancements
+关键DiffPhysDrone集成：
+- 时间梯度衰减机制（g_decay函数）
+- 带指数平滑的控制历史建模
+- 推重比动力学标定
+- 数值稳定性增强
 
-The physics engine is designed to be:
-- Pure functional (no side effects)  
-- JIT-compilable with JAX
-- End-to-end differentiable
-- Compatible with BPTT (Backpropagation Through Time)
-- Supports temporal gradient decay for training stability
+物理引擎设计特点：
+- 纯函数式（无副作用）
+- 可JIT编译的JAX代码
+- 端到端可微分
+- 兼容BPTT（时间反向传播）
+- 支持时间梯度衰减以提高训练稳定性
 """
 
 import jax
@@ -28,145 +28,144 @@ from flax import struct
 
 
 # =============================================================================
-# PHYSICS STATE REPRESENTATIONS
+# 物理状态表示
 # =============================================================================
 
 @struct.dataclass 
 class DroneState:
-    """Simplified drone state for GCBF+ and DiffPhysDrone integration.
+    """为GCBF+和DiffPhysDrone集成而简化的无人机状态。
     
-    Follows DiffPhysDrone point-mass model with state representation compatible
-    with GCBF+ graph neural networks. Simplified from original complex structure
-    to focus on essential dynamics.
+    遵循DiffPhysDrone点质量模型，状态表示兼容GCBF+图神经网络。
+    从原始复杂结构简化，专注于基本动力学。
     
-    Key Design Principles:
-    1. Point-mass dynamics (no orientation complexity)
-    2. Compatible with GCBF+ graph construction
-    3. Supports DiffPhysDrone temporal gradient decay
-    4. JAX-native pure functional design
+    关键设计原则：
+    1. 点质量动力学（无方向复杂性）
+    2. 兼容GCBF+图构建
+    3. 支持DiffPhysDrone时间梯度衰减
+    4. JAX原生纯函数设计
     """
-    # Core state (point-mass model)
-    position: chex.Array  # [3] - x, y, z coordinates in world frame
-    velocity: chex.Array  # [3] - velocity components in world frame  
-    acceleration: chex.Array  # [3] - current acceleration (needed for integration)
+    # 核心状态（点质量模型）
+    position: chex.Array  # [3] - 世界坐标系中的x, y, z坐标
+    velocity: chex.Array  # [3] - 世界坐标系中的速度分量
+    acceleration: chex.Array  # [3] - 当前加速度（积分所需）
     
-    # Control state (DiffPhysDrone-style)
-    thrust_current: chex.Array  # [3] - current thrust command
-    thrust_previous: chex.Array  # [3] - previous thrust command (for smoothing)
+    # 控制状态（DiffPhysDrone风格）
+    thrust_current: chex.Array  # [3] - 当前推力命令
+    thrust_previous: chex.Array  # [3] - 上一个推力命令（用于平滑）
     
-    # Temporal state
-    time: float  # Current simulation time
+    # 时间状态
+    time: float  # 当前仿真时间
     
-    # Agent identification (for GCBF+ multi-agent scenarios)
-    agent_id: int = 0  # Agent identifier for graph construction
+    # 智能体识别（用于GCBF+多智能体场景）
+    agent_id: int = 0  # 图构建的智能体标识符
     
-    # Orientation (simplified - identity matrix for point mass)
-    orientation: chex.Array = None  # [3, 3] rotation matrix (defaults to identity)
+    # 姿态（简化 - 点质量的恒等矩阵）
+    orientation: chex.Array = None  # [3, 3] 旋转矩阵（默认为恒等矩阵）
     
     def __post_init__(self):
-        # Set default orientation to identity if not provided
+        # 如果未提供，将默认姿态设为恒等矩阵
         if self.orientation is None:
             object.__setattr__(self, 'orientation', jnp.eye(3))
 
 
 @struct.dataclass
 class MultiAgentState:
-    """State representation for multi-agent scenarios.
+    """多智能体场景的状态表示。
     
-    Combines individual drone states with global environment information
-    needed for GCBF+ graph construction and safety verification.
+    将单个无人机状态与GCBF+图构建和安全验证所需的
+    全局环境信息相结合。
     """
-    drone_states: chex.Array  # [n_agents, state_dim] - individual drone states
-    adjacency_matrix: chex.Array  # [n_agents, n_agents] - graph connectivity
-    obstacle_positions: chex.Array  # [n_obstacles, 3] - static obstacle locations
-    obstacle_radii: chex.Array  # [n_obstacles] - obstacle radii
-    global_time: float  # Global simulation time
+    drone_states: chex.Array  # [n_agents, state_dim] - 单个无人机状态
+    adjacency_matrix: chex.Array  # [n_agents, n_agents] - 图连接性
+    obstacle_positions: chex.Array  # [n_obstacles, 3] - 静态障碍物位置
+    obstacle_radii: chex.Array  # [n_obstacles] - 障碍物半径
+    global_time: float  # 全局仿真时间
 
 
 @struct.dataclass  
 class PhysicsParams:
-    """Physics simulation parameters matching DiffPhysDrone methodology.
+    """匹配DiffPhysDrone方法的物理仿真参数。
     
-    Parameters calibrated based on DiffPhysDrone experimental results:
-    - Crazyflie quadrotor specifications
-    - Control latency and smoothing from real hardware
-    - Gradient decay tuned for BPTT stability
+    基于DiffPhysDrone实验结果校准的参数：
+    - Crazyflie四旋翼规格
+    - 来自真实硬件的控制延迟和平滑
+    - 为BPTT稳定性调整的梯度衰减
     """
-    # Time integration (DiffPhysDrone standard)
-    dt: float = 1.0/15.0  # 15 Hz control frequency
+    # 时间积分（DiffPhysDrone标准）
+    dt: float = 1.0/15.0  # 15 Hz控制频率
     
-    # Physical constants (Crazyflie 2.1 specifications)
+    # 物理常数（Crazyflie 2.1规格）
     mass: float = 0.027  # kg
     gravity_magnitude: float = 9.80665  # m/s²
     
-    # Thrust dynamics (from DiffPhysDrone paper)
-    thrust_to_weight_ratio: float = 3.0  # Aggressive flight capability
-    max_thrust_normalized: float = 0.8  # Normalized maximum thrust
+    # 推力动力学（来自DiffPhysDrone论文）
+    thrust_to_weight_ratio: float = 3.0  # 激进飞行能力
+    max_thrust_normalized: float = 0.8  # 标准化最大推力
     
-    # Drag model (simplified)
-    drag_coefficient_linear: float = 0.01  # Linear drag
-    drag_coefficient_quadratic: float = 0.01  # Quadratic drag
+    # 阻力模型（简化）
+    drag_coefficient_linear: float = 0.01  # 线性阻力
+    drag_coefficient_quadratic: float = 0.01  # 二次阻力
     
-    # Control dynamics (DiffPhysDrone key innovation)
-    control_delay_tau: float = 1.0/15.0  # Control latency (s)
-    exponential_smoothing_lambda: float = 12.0  # EMA parameter
+    # 控制动力学（DiffPhysDrone关键创新）
+    control_delay_tau: float = 1.0/15.0  # 控制延迟（秒）
+    exponential_smoothing_lambda: float = 12.0  # EMA参数
     
-    # GCBF+ safety parameters
-    safety_radius: float = 0.05  # Collision radius (m)
-    sensing_radius: float = 0.5  # Neighbor detection radius (m)
-    cbf_alpha: float = 1.0  # CBF class-K function parameter
+    # GCBF+安全参数
+    safety_radius: float = 0.05  # 碰撞半径（米）
+    sensing_radius: float = 0.5  # 邻居检测半径（米）
+    cbf_alpha: float = 1.0  # CBF类K函数参数
     
-    # Temporal gradient decay (DiffPhysDrone core)
-    gradient_decay_alpha: float = 0.4  # Original DiffPhysDrone value
+    # 时间梯度衰减（DiffPhysDrone核心）
+    gradient_decay_alpha: float = 0.4  # 原始DiffPhysDrone值
     enable_gradient_decay: bool = True
     
-    # Numerical stability
-    velocity_limit: float = 10.0  # Maximum velocity (m/s)
-    position_limit: float = 50.0  # Workspace boundary (m)
-    epsilon: float = 1e-8  # Numerical stability
+    # 数值稳定性
+    velocity_limit: float = 10.0  # 最大速度（m/s）
+    position_limit: float = 50.0  # 工作空间边界（米）
+    epsilon: float = 1e-8  # 数值稳定性
 
     @property
     def gravity_vector(self) -> chex.Array:
-        """Standard gravity vector."""
+        """标准重力向量。"""
         return jnp.array([0.0, 0.0, -self.gravity_magnitude])
         
     @property
     def max_thrust_force(self) -> float:
-        """Maximum thrust force in Newtons."""
+        """最大推力（牛顿）。"""
         return self.mass * self.thrust_to_weight_ratio * self.gravity_magnitude
 
 # =============================================================================
-# DIFFPHYSDRONE TEMPORAL GRADIENT DECAY (CORE INNOVATION)
+# DIFFPHYSDRONE时间梯度衰减（核心创新）
 # =============================================================================
 
 def temporal_gradient_decay(x: chex.Array, alpha: float) -> chex.Array:
     """
-    DiffPhysDrone temporal gradient decay mechanism - EXACT IMPLEMENTATION
+    DiffPhysDrone时间梯度衰减机制 - 精确实现
     
-    This is the core innovation from DiffPhysDrone paper:
+    这是DiffPhysDrone论文的核心创新：
     "Learning Vision-based Agile Flight via Differentiable Physics"
     
-    Original PyTorch implementation:
+    原始PyTorch实现：
         def g_decay(x, alpha):
             return x * alpha + x.detach() * (1 - alpha)
             
-    JAX equivalent using stop_gradient:
+    使用stop_gradient的JAX等价实现：
         return x * alpha + jax.lax.stop_gradient(x) * (1 - alpha)
     
-    The function creates a gradient flow control mechanism where:
-    - alpha controls how much gradient flows through
-    - (1-alpha) portion has stopped gradients (like .detach() in PyTorch)
-    - This enables stable training for long sequences
+    该函数创建了一个梯度流控制机制：
+    - alpha控制梯度流通的量
+    - (1-alpha)部分停止梯度（类似PyTorch中的.detach()）
+    - 这使得长序列的稳定训练成为可能
     
-    Args:
-        x: Input tensor (any shape)
-        alpha: Gradient flow coefficient [0,1]
-               - alpha=1.0: full gradient flow
-               - alpha=0.0: no gradient flow (pure stop_gradient)
-               - alpha=0.4 (DiffPhysDrone default): balanced decay
+    参数：
+        x: 输入张量（任意形状）
+        alpha: 梯度流系数 [0,1]
+               - alpha=1.0: 全梯度流
+               - alpha=0.0: 无梯度流（纯停止梯度）
+               - alpha=0.4 (DiffPhysDrone默认): 平衡衰减
     
-    Returns:
-        Tensor with controlled gradient flow
+    返回：
+        具有可控梯度流的张量
     """
     return x * alpha + jax.lax.stop_gradient(x) * (1 - alpha)
 
@@ -175,10 +174,10 @@ def apply_temporal_gradient_decay_to_state(
     decay_alpha: float = 0.4  # DiffPhysDrone default
 ) -> DroneState:
     """
-    Apply temporal gradient decay to drone state components
+    对无人机状态组件应用时间梯度衰减
     
-    Critical for BPTT stability over long horizons. Implementation follows
-    exact DiffPhysDrone methodology with gradient flow control.
+    对于长距离的BPTT稳定性至关重要。实现遵循DiffPhysDrone的
+    精确方法，具有梯度流控制。
     """
     return DroneState(
         position=temporal_gradient_decay(drone_state.position, decay_alpha),
@@ -186,9 +185,9 @@ def apply_temporal_gradient_decay_to_state(
         acceleration=temporal_gradient_decay(drone_state.acceleration, decay_alpha),
         thrust_current=temporal_gradient_decay(drone_state.thrust_current, decay_alpha),
         thrust_previous=temporal_gradient_decay(drone_state.thrust_previous, decay_alpha),
-        orientation=drone_state.orientation,  # Orientation unchanged
-        time=drone_state.time,  # Time unchanged
-        agent_id=drone_state.agent_id  # ID unchanged
+        orientation=drone_state.orientation,  # 姿态不变
+        time=drone_state.time,  # 时间不变
+        agent_id=drone_state.agent_id  # ID不变
     )
 
 def create_spatial_temporal_decay_schedule(
@@ -198,32 +197,32 @@ def create_spatial_temporal_decay_schedule(
     max_distance: float = 2.0
 ) -> float:
     """
-    Advanced: Spatial-temporal gradient decay adaptation
+    高级：空间-时间梯度衰减适应
     
-    Adapts gradient decay based on proximity to obstacles:
-    - Near obstacles: less decay (stronger gradients for safety)  
-    - Far from obstacles: more decay (focus on efficiency)
+    根据与障碍物的距离适应梯度衰减：
+    - 靠近障碍物：更少衰减（为安全提供更强的梯度）
+    - 远离障碍物：更多衰减（专注于效率）
     
-    This is an innovation beyond the original DiffPhysDrone paper.
+    这是超越原始DiffPhysDrone论文的创新。
     """
-    # Compute minimum distance to any obstacle
+    # 计算到任意障碍物的最小距离
     min_dist = jnp.min(distance_to_obstacles)
     
-    # Create adaptive alpha based on distance
+    # 基于距离创建自适应alpha
     normalized_dist = jnp.clip(
         (min_dist - min_distance) / (max_distance - min_distance),
         0.0, 1.0
     )
     
-    # Less decay when close to obstacles (need strong safety gradients)
-    # More decay when far from obstacles (focus on efficiency)
+    # 靠近障碍物时更少衰减（需要强安全梯度）
+    # 远离障碍物时更多衰减（专注于效率）
     adaptive_alpha = base_alpha + (1.0 - base_alpha) * (1.0 - normalized_dist)
     
     return adaptive_alpha
 
 
 # =============================================================================
-# CORE PHYSICS FUNCTIONS
+# 核心物理函数
 # =============================================================================
 
 def dynamics_step(
@@ -233,105 +232,105 @@ def dynamics_step(
     dt: Optional[float] = None
 ) -> DroneState:
     """
-    DiffPhysDrone-style differentiable physics step with control smoothing.
+    DiffPhysDrone风格的可微分物理步进，具有控制平滑。
     
-    Implements key DiffPhysDrone innovations:
-    1. Exponential moving average for thrust smoothing
-    2. Control delay modeling
-    3. Point-mass dynamics with drag
-    4. Numerical stability through smooth saturation
+    实现关键DiffPhysDrone创新：
+    1. 用于推力平滑的指数移动平均
+    2. 控制延迟建模
+    3. 带阻力的点质量动力学
+    4. 通过平滑饱和的数值稳定性
     
-    Args:
-        state: Current drone state
-        control_input: [3] thrust command (normalized [-1, 1])
-        params: Physics parameters
-        dt: Optional timestep override
+    参数：
+        state: 当前无人机状态
+        control_input: [3] 推力命令（标准化 [-1, 1]）
+        params: 物理参数
+        dt: 可选的时间步长覆盖
         
-    Returns:
-        Updated drone state after one simulation step
+    返回：
+        一个仿真步骤后的更新无人机状态
     """
     if dt is None:
         dt = params.dt
         
-    # Extract state components
+    # 提取状态组件
     pos = state.position
     vel = state.velocity
     acc = state.acceleration
     thrust_prev = state.thrust_previous
     
-    # === DIFFPHYSDRONE CONTROL SMOOTHING ===
-    # Exponential moving average thrust smoothing (key innovation)
-    # This implements the control delay and smoothing from the original paper
+    # === DIFFPHYSDRONE控制平滑 ===
+    # 指数移动平均推力平滑（关键创新）
+    # 这实现了原论文中的控制延迟和平滑
     
-    # Input saturation (normalized commands should be in [-1, 1])
+    # 输入饱和（标准化命令应在[-1, 1]范围内）
     saturated_input = jnp.tanh(control_input)  # Smooth saturation
     
-    # Exponential moving average (EMA) thrust smoothing
-    # Formula: thrust_new = lambda * thrust_cmd + (1 - lambda) * thrust_prev
+    # 指数移动平均(EMA)推力平滑
+    # 公式： thrust_new = lambda * thrust_cmd + (1 - lambda) * thrust_prev
     smoothing_factor = jnp.exp(-params.exponential_smoothing_lambda * dt)
     smoothed_thrust = (
         (1.0 - smoothing_factor) * saturated_input + 
         smoothing_factor * thrust_prev
     )
     
-    # Control delay simulation (first-order system)
-    # This models the delay between commanded and actual thrust
+    # 控制延迟仿真（一阶系统）
+    # 这建模了命令推力和实际推力之间的延迟
     delay_factor = jnp.exp(-dt / params.control_delay_tau)
     actual_thrust = (
         (1.0 - delay_factor) * smoothed_thrust +
         delay_factor * state.thrust_current
     )
     
-    # === FORCE COMPUTATION ===
-    # Convert normalized thrust to physical force
+    # === 力计算 ===
+    # 将标准化推力转换为物理力
     thrust_force = actual_thrust * params.max_thrust_force
     
-    # Drag forces (linear + quadratic)
+    # 阻力（线性 + 二次）
     vel_norm = jnp.linalg.norm(vel)
     vel_unit = vel / jnp.maximum(vel_norm, params.epsilon)
     
-    # Linear drag
+    # 线性阻力
     drag_linear = -params.drag_coefficient_linear * vel
     
-    # Quadratic drag (velocity squared)
+    # 二次阻力（速度平方）
     drag_quadratic = -params.drag_coefficient_quadratic * vel_norm * vel_unit
     
     total_drag = drag_linear + drag_quadratic
     
-    # Gravitational force
+    # 重力
     gravity_force = params.mass * params.gravity_vector
     
-    # === PHYSICS INTEGRATION (DiffPhysDrone style) ===
-    # Total external forces
+    # === 物理积分（DiffPhysDrone风格） ===
+    # 总外力
     total_force = thrust_force + total_drag + gravity_force
     
-    # Compute acceleration
+    # 计算加速度
     new_acceleration = total_force / params.mass
     
-    # Semi-implicit Euler integration (stable for stiff systems)
-    # This follows the integration scheme from DiffPhysDrone
-    new_vel = vel + 0.5 * (acc + new_acceleration) * dt  # Trapezoidal velocity
-    new_pos = pos + vel * dt + 0.5 * new_acceleration * dt**2  # Position with acceleration
+    # 半隐式欧拉积分（对刘性系统稳定）
+    # 这遵循DiffPhysDrone的积分方案
+    new_vel = vel + 0.5 * (acc + new_acceleration) * dt  # 梯形速度
+    new_pos = pos + vel * dt + 0.5 * new_acceleration * dt**2  # 带加速度的位置
     
-    # === PHYSICAL CONSTRAINTS ===
-    # Smooth velocity limiting (differentiable)
+    # === 物理约束 ===
+    # 平滑速度限制（可微分）
     vel_magnitude = jnp.linalg.norm(new_vel)
     vel_scale = jnp.minimum(1.0, params.velocity_limit / jnp.maximum(vel_magnitude, params.epsilon))
     new_vel = new_vel * vel_scale
     
-    # Smooth position bounds (workspace limits)
+    # 平滑位置边界（工作空间限制）
     pos_magnitude = jnp.linalg.norm(new_pos)
     pos_scale = jnp.minimum(1.0, params.position_limit / jnp.maximum(pos_magnitude, params.epsilon))
     new_pos = new_pos * pos_scale
     
-    # Create new state (point-mass model)
+    # 创建新状态（点质量模型）
     new_state = DroneState(
         position=new_pos,
         velocity=new_vel, 
         acceleration=new_acceleration,
         thrust_current=actual_thrust,
-        thrust_previous=smoothed_thrust,  # Store for next step
-        orientation=state.orientation,  # Keep same orientation
+        thrust_previous=smoothed_thrust,  # 为下一步存储
+        orientation=state.orientation,  # 保持相同姿态
         time=state.time + dt,
         agent_id=state.agent_id
     )
@@ -346,29 +345,28 @@ def multi_agent_dynamics_step(
     dt: Optional[float] = None
 ) -> MultiAgentState:
     """
-    Multi-agent dynamics step with graph structure updates.
+    多智能体动力学步进，带有图结构更新。
     
-    Processes all agents simultaneously while maintaining graph connectivity
-    information needed for GCBF+ safety verification.
+    同时处理所有智能体，同时维护GCBF+安全验证所需的图连接信息。
     
-    Args:
-        state: Multi-agent system state
-        control_inputs: Control commands for all agents [n_agents, 3]
-        params: Physics parameters
-        dt: Optional timestep override
+    参数：
+        state: 多智能体系统状态
+        control_inputs: 所有智能体的控制命令 [n_agents, 3]
+        params: 物理参数
+        dt: 可选的时间步长覆盖
         
-    Returns:
-        Updated multi-agent state
+    返回：
+        更新的多智能体状态
     """
     if dt is None:
         dt = params.dt
         
     n_agents = state.drone_states.shape[0]
     
-    # === INDIVIDUAL DYNAMICS ===
-    # Process each agent's dynamics (vectorized over agents)
+    # === 单个动力学 ===
+    # 处理每个智能体的动力学（在智能体上向量化）
     def single_agent_update(i: int) -> chex.Array:
-        # Extract individual drone state with simplified format
+        # 使用简化格式提取单个无人机状态
         drone_state = DroneState(
             position=state.drone_states[i, :3],
             velocity=state.drone_states[i, 3:6],
@@ -379,7 +377,7 @@ def multi_agent_dynamics_step(
             agent_id=i
         )
         
-        # Apply dynamics
+        # 应用动力学
         new_drone_state = dynamics_step(
             drone_state, 
             control_inputs[i], 
@@ -387,7 +385,7 @@ def multi_agent_dynamics_step(
             dt
         )
         
-        # Pack back into array format (15-dimensional state per agent)
+        # 打包回数组格式（每个智能体15维状态）
         new_state_array = jnp.concatenate([
             new_drone_state.position,      # [0:3]
             new_drone_state.velocity,      # [3:6] 
@@ -398,26 +396,26 @@ def multi_agent_dynamics_step(
         
         return new_state_array
     
-    # Vectorized application across all agents
+    # 在所有智能体上的向量化应用
     new_drone_states = jax.vmap(single_agent_update)(jnp.arange(n_agents))
     
-    # === GRAPH CONNECTIVITY UPDATE (GCBF+ integration) ===
-    # Recompute adjacency matrix based on sensing radius
-    positions = new_drone_states[:, :3]  # Extract positions
+    # === 图连接性更新（GCBF+集成） ===
+    # 基于传感半径重新计算邻接矩阵
+    positions = new_drone_states[:, :3]  # 提取位置
     
-    # Compute pairwise distances
+    # 计算成对距离
     diff = positions[:, None, :] - positions[None, :, :]  # [n, n, 3]
     distances = jnp.linalg.norm(diff, axis=-1)  # [n, n]
     
-    # Create adjacency matrix (within sensing radius)
+    # 创建邻接矩阵（在传感半径内）
     new_adjacency = (distances < params.sensing_radius) & (distances > 0)
     
-    # === COLLISION DETECTION ===
-    # Check for inter-agent collisions
+    # === 碰撞检测 ===
+    # 检查智能体间碰撞
     collision_matrix = distances < (2 * params.safety_radius)
     collision_detected = jnp.any(collision_matrix & ~jnp.eye(n_agents, dtype=bool))
     
-    # Check for obstacle collisions
+    # 检查障碍物碰撞
     obstacle_collisions = check_obstacle_collisions(
         positions, 
         state.obstacle_positions, 
@@ -425,7 +423,7 @@ def multi_agent_dynamics_step(
         params.safety_radius
     )
     
-    # === STATE ASSEMBLY ===
+    # === 状态组装 ===
     new_state = MultiAgentState(
         drone_states=new_drone_states,
         adjacency_matrix=new_adjacency,
@@ -444,33 +442,33 @@ def check_obstacle_collisions(
     safety_radius: float
 ) -> chex.Array:
     """
-    Check for collisions between agents and static obstacles.
+    检查智能体与静态障碍物之间的碰撞。
     
-    Args:
-        positions: Agent positions
-        obstacle_positions: Obstacle center positions
-        obstacle_radii: Obstacle radii
-        safety_radius: Agent safety radius
+    参数：
+        positions: 智能体位置
+        obstacle_positions: 障碍物中心位置
+        obstacle_radii: 障碍物半径
+        safety_radius: 智能体安全半径
         
-    Returns:
-        [n_agents] boolean array indicating collision status
+    返回：
+        [n_agents] 指示碰撞状态的布尔数组
     """
-    # Compute distances from each agent to each obstacle
+    # 计算每个智能体到每个障碍物的距离
     agent_obs_diff = positions[:, None, :] - obstacle_positions[None, :, :]
     agent_obs_distances = jnp.linalg.norm(agent_obs_diff, axis=-1)
     
-    # Check collision condition (agent safety radius + obstacle radius)
+    # 检查碰撞条件（智能体安全半径 + 障碍物半径）
     collision_distances = safety_radius + obstacle_radii[None, :]
     collisions = agent_obs_distances < collision_distances
     
-    # Any collision per agent
+    # 每个智能体的任意碰撞
     agent_collisions = jnp.any(collisions, axis=1)
     
     return agent_collisions
 
 
 # =============================================================================
-# TEMPORAL GRADIENT DECAY (DiffPhysDrone Innovation)
+# 时间梯度衰减（DiffPhysDrone创新）
 # =============================================================================
 
 def apply_temporal_gradient_decay(
@@ -480,21 +478,20 @@ def apply_temporal_gradient_decay(
     dt: float = 1.0/15.0
 ) -> chex.Array:
     """
-    Apply temporal gradient decay to mitigate gradient explosion in BPTT.
+    应用时间梯度衰减以缓解BPTT中的梯度爆炸。
     
-    This implements the key innovation from DiffPhysDrone for stable training
-    of long-horizon differentiable physics simulations. The decay mechanism
-    ensures that gradients from distant future states don't overwhelm
-    near-term supervision signals.
+    这实现了DiffPhysDrone的关键创新，用于稳定训练
+    长距离可微分物理仿真。衰减机制确保来自遥远未来状态的
+    梯度不会压倒近期监督信号。
     
-    Args:
-        gradient: Gradient tensor to be decayed
-        time_step: Current timestep in the BPTT sequence  
-        alpha: Decay rate parameter (0 < alpha < 1)
-        dt: Simulation timestep
+    参数：
+        gradient: 要衰减的梯度张量
+        time_step: BPTT序列中的当前时间步
+        alpha: 衰减率参数 (0 < alpha < 1)
+        dt: 仿真时间步
         
-    Returns:
-        Decayed gradient with exponential time weighting
+    返回：
+        带指数时间加权的衰减梯度
     """
     decay_factor = jnp.power(alpha, time_step * dt)
     return gradient * decay_factor
@@ -506,15 +503,15 @@ def create_temporal_decay_schedule(
     dt: float = 1.0/15.0
 ) -> chex.Array:
     """
-    Create a temporal decay schedule for an entire BPTT sequence.
+    为整个BPTT序列创建时间衰减计划。
     
-    Args:
-        sequence_length: Length of the BPTT sequence
-        alpha: Decay rate parameter
-        dt: Simulation timestep
+    参数：
+        sequence_length: BPTT序列的长度
+        alpha: 衰减率参数
+        dt: 仿真时间步
         
-    Returns:
-        [sequence_length] array of decay factors
+    返回：
+        [sequence_length] 衰减因子数组
     """
     time_steps = jnp.arange(sequence_length)
     decay_factors = jnp.power(alpha, time_steps * dt)
@@ -522,7 +519,7 @@ def create_temporal_decay_schedule(
 
 
 # =============================================================================
-# PHYSICS ENGINE INITIALIZATION AND UTILITIES  
+# 物理引擎初始化和实用程序
 # =============================================================================
 
 def create_initial_drone_state(
@@ -532,29 +529,28 @@ def create_initial_drone_state(
     hover_initialization: bool = True
 ) -> DroneState:
     """
-    Create initial state for a single drone following DiffPhysDrone design.
+    遵循DiffPhysDrone设计为单个无人机创建初始状态。
     
-    Simplified initialization for point-mass dynamics with proper
-    hover thrust setup for stability.
+    点质量动力学的简化初始化，带有适当的悬停推力设置以保持稳定性。
     
-    Args:
-        position: Initial position [3]
-        velocity: Initial velocity [3] (default: zero)
-        agent_id: Agent identifier for multi-agent scenarios
-        hover_initialization: Initialize with hover thrust for stability
+    参数：
+        position: 初始位置 [3]
+        velocity: 初始速度 [3] （默认：零）
+        agent_id: 多智能体场景的智能体标识符
+        hover_initialization: 为稳定性使用悬停推力初始化
         
-    Returns:
-        Initialized drone state
+    返回：
+        初始化的无人机状态
     """
     if velocity is None:
         velocity = jnp.zeros(3)
     
-    # Initialize acceleration to zero
+    # 将加速度初始化为零
     acceleration = jnp.zeros(3)
     
-    # Initialize thrust commands
+    # 初始化推力命令
     if hover_initialization:
-        # Compute hover thrust (balances gravity)
+        # 计算悬停推力（平衡重力）
         params = PhysicsParams()
         hover_thrust_magnitude = params.gravity_magnitude / params.thrust_to_weight_ratio
         hover_thrust = jnp.array([0.0, 0.0, hover_thrust_magnitude])
@@ -567,7 +563,7 @@ def create_initial_drone_state(
         acceleration=acceleration,
         thrust_current=hover_thrust,
         thrust_previous=hover_thrust,
-        orientation=jnp.eye(3),  # Identity orientation for point mass
+        orientation=jnp.eye(3),  # 点质量的恒等方向
         time=0.0,
         agent_id=agent_id
     )
@@ -581,17 +577,17 @@ def create_initial_multi_agent_state(
     params: PhysicsParams = PhysicsParams()
 ) -> MultiAgentState:
     """
-    Create initial state for multi-agent system.
+    为多智能体系统创建初始状态。
     
-    Args:
-        positions: Initial agent positions [n_agents, 3]
-        velocities: Initial agent velocities [n_agents, 3]
-        obstacle_positions: Static obstacle positions [n_obstacles, 3]
-        obstacle_radii: Static obstacle radii [n_obstacles]
-        params: Physics parameters
+    参数：
+        positions: 初始智能体位置 [n_agents, 3]
+        velocities: 初始智能体速度 [n_agents, 3]
+        obstacle_positions: 静态障碍物位置 [n_obstacles, 3]
+        obstacle_radii: 静态障碍物半径 [n_obstacles]
+        params: 物理参数
         
-    Returns:
-        Initialized multi-agent state
+    返回：
+        初始化的多智能体状态
     """
     n_agents = positions.shape[0]
     
@@ -604,8 +600,8 @@ def create_initial_multi_agent_state(
     if obstacle_radii is None:
         obstacle_radii = jnp.zeros(0)
         
-    # Create drone state array [n_agents, state_dim]
-    # New state format: [pos(3), vel(3), acc(3), thrust_curr(3), thrust_prev(3)] = 15 dimensions
+    # 创建无人机状态数组 [n_agents, state_dim]
+    # 新状态格式: [pos(3), vel(3), acc(3), thrust_curr(3), thrust_prev(3)] = 15维
     accelerations = jnp.zeros((n_agents, 3))
     thrust_current = jnp.zeros((n_agents, 3))
     thrust_previous = jnp.zeros((n_agents, 3))
@@ -618,7 +614,7 @@ def create_initial_multi_agent_state(
         thrust_previous   # [n_agents, 3] - [12:15]
     ], axis=1)
     
-    # Initialize adjacency matrix
+    # 初始化邻接矩阵
     distances = jnp.linalg.norm(
         positions[:, None, :] - positions[None, :, :], 
         axis=-1
@@ -636,15 +632,15 @@ def create_initial_multi_agent_state(
 
 def validate_physics_state(state: DroneState) -> bool:
     """
-    Validate drone state for numerical stability and physical constraints.
+    验证无人机状态的数值稳定性和物理约束。
     
-    Args:
-        state: Drone state to validate
+    参数：
+        state: 要验证的无人机状态
         
-    Returns:
-        True if state is valid, False otherwise
+    返回：
+        如果状态有效则为True，否则为False
     """
-    # Check for NaN or infinite values
+    # 检查NaN或无限值
     if not jnp.all(jnp.isfinite(state.position)):
         return False
     if not jnp.all(jnp.isfinite(state.velocity)):
@@ -652,28 +648,28 @@ def validate_physics_state(state: DroneState) -> bool:
     if not jnp.all(jnp.isfinite(state.thrust_history)):
         return False
         
-    # Check reasonable physical bounds (updated for the new constraints)
-    max_position = 100.0  # meters
-    max_velocity = 50.0   # m/s (updated to match test expectation)
+    # 检查合理的物理边界（为新约束更新）
+    max_position = 100.0  # 米
+    max_velocity = 50.0   # m/s （更新以匹配测试期望）
     
     if jnp.any(jnp.abs(state.position) > max_position):
         return False
-    if jnp.linalg.norm(state.velocity) > max_velocity:  # Use norm instead of component-wise check
+    if jnp.linalg.norm(state.velocity) > max_velocity:  # 使用范数而非逐分量检查
         return False
         
     return True
 
 
 # =============================================================================
-# JIT-COMPILED VERSIONS FOR PERFORMANCE
+# JIT编译版本以获得性能
 # =============================================================================
 
-# JIT compile the core dynamics functions for maximum performance
+# JIT编译核心动力学函数以获得最大性能
 dynamics_step_jit = jax.jit(dynamics_step)
 multi_agent_dynamics_step_jit = jax.jit(multi_agent_dynamics_step)
 check_obstacle_collisions_jit = jax.jit(check_obstacle_collisions)
 
-# Make functions available for import
+# 使函数可供导入
 __all__ = [
     'DroneState',
     'MultiAgentState', 

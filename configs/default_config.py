@@ -1,60 +1,59 @@
 """
-Default configuration for the Safe Agile Flight system combining GCBF+ and DiffPhysDrone methodologies.
+结合GCBF+和DiffPhysDrone方法的安全敏捷飞行系统的默认配置。
 
-This configuration file defines all hyperparameters, model settings, and environment parameters
-for the unified JAX-based framework implementing neural graph control barrier functions
-with differentiable physics simulation.
+此配置文件定义了统一基于JAX框架的所有超参数、模型设置和环境参数，
+该框架实现了带有可微分物理仿真的神经图控制屏障函数。
 """
 
 import ml_collections
 
 
 def get_config():
-    """Returns the default configuration as a ConfigDict."""
+    """返回作为ConfigDict的默认配置。"""
     config = ml_collections.ConfigDict()
     
     # =============================================================================
-    # SYSTEM CONFIGURATION
+    # 系统配置
     # =============================================================================
     config.system = ml_collections.ConfigDict()
-    config.system.framework = "jax"  # Primary framework
-    config.system.precision = "float32"  # JAX precision setting
-    config.system.enable_jit = True  # Enable JIT compilation
-    config.system.enable_x64 = False  # Enable 64-bit precision
-    config.system.device = "auto"  # Device selection: "cpu", "gpu", "tpu", "auto"
+    config.system.framework = "jax"  # 主要框架
+    config.system.precision = "float32"  # JAX精度设置
+    config.system.enable_jit = True  # 启用JIT编译
+    config.system.enable_x64 = False  # 启用64位精度
+    config.system.device = "auto"  # 设备选择："cpu", "gpu", "tpu", "auto"
     
-    # Random seed configuration
+    # 随机种子配置
     config.system.seed = 42
     config.system.deterministic = True
     
     # =============================================================================
-    # PHYSICS SIMULATION PARAMETERS (Core DiffPhysDrone Integration)
+    # 物理仿真参数（核心DiffPhysDrone集成）
     # =============================================================================
     config.physics = ml_collections.ConfigDict()
     
-    # Time integration settings
-    config.physics.dt = 1.0/15.0  # Simulation timestep (consistent with DiffPhysDrone)
+    # 时间积分设置
+    config.physics.dt = 1.0/15.0  # 15Hz控制频率
     config.physics.integration_method = "euler"  # "euler", "rk4", "adaptive"
-    config.physics.max_steps = 150  # Maximum simulation steps per episode
+    config.physics.max_steps = 150  # 每集最大仿真步数
     
-    # Drone dynamics parameters (Point-mass model from DiffPhysDrone)
+    # 无人机动力学参数（来自DiffPhysDrone的点质量模型）
     config.physics.drone = ml_collections.ConfigDict()
-    config.physics.drone.mass = 0.027  # kg (Crazyflie mass)
-    config.physics.drone.thrust_to_weight_ratio = 3.0  # Maximum thrust ratio
-    config.physics.drone.max_acceleration = 29.4  # m/s^2 (3*g for aggressive flight)
-    config.physics.drone.drag_coefficient = 0.01  # Linear drag coefficient
-    config.physics.drone.radius = 0.05  # Safety radius for collision detection
+    config.physics.drone.mass = 0.027   # Crazyflie质量
+    config.physics.drone.thrust_to_weight_ratio = 3.0  # 最大推重比
+    config.physics.drone.max_acceleration = 29.4  # m/s^2 （激进飞行的3*g）
+    config.physics.drone.drag_coefficient = 0.01  # 线性阻力系数
+    config.physics.drone.radius = 0.05  # 碰撞检测的安全半径
     
-    # Control constraints
+    # 控制约束
     config.physics.control = ml_collections.ConfigDict()
-    config.physics.control.max_thrust = 0.8  # Normalized maximum thrust
+    config.physics.control.max_thrust = 0.8  # 标准化最大推力
     config.physics.control.min_thrust = 0.0  # Normalized minimum thrust
     config.physics.control.thrust_delay = 1.0/15.0  # Control delay (tau parameter)
     config.physics.control.smoothing_factor = 12.0  # Exponential smoothing (lambda parameter)
     
     # Temporal gradient decay (Critical DiffPhysDrone innovation)
     config.physics.gradient_decay = ml_collections.ConfigDict()
-    config.physics.gradient_decay.alpha = 0.92  # Decay rate for temporal gradients
+    config.physics.gradient_decay.alpha = 0.92  # 时间梯度衰减
     config.physics.gradient_decay.enable = True  # Enable gradient decay mechanism
     
     # =============================================================================
@@ -65,17 +64,17 @@ def get_config():
     # Graph construction parameters
     config.gcbf.sensing_radius = 0.5  # R parameter for neighbor detection
     config.gcbf.max_neighbors = 16  # M parameter for fixed-size neighborhoods
-    config.gcbf.k_neighbors = 8  # K parameter for KNN graph construction
+    config.gcbf.k_neighbors = 8  # KNN图构建
     config.gcbf.graph_construction_method = "knn"  # "knn" or "radius"
     
     # CBF parameters
-    config.gcbf.alpha = 1.0  # CBF alpha parameter (class-K function coefficient)
+    config.gcbf.alpha = 1.0  # CBF类K函数参数
     config.gcbf.gamma = 0.02  # Margin parameter for strict inequalities
     config.gcbf.look_ahead_horizon = 32  # T parameter for control invariant set computation
     
     # GNN architecture (from GCBF+ paper)
     config.gcbf.gnn = ml_collections.ConfigDict()
-    config.gcbf.gnn.hidden_dims = [256, 256, 128]  # Hidden layer dimensions
+    config.gcbf.gnn.hidden_dims = [256, 256, 128]  # GNN架构
     config.gcbf.gnn.output_dim = 1  # CBF scalar output
     config.gcbf.gnn.activation = "relu"  # Activation function
     config.gcbf.gnn.use_attention = True  # Graph attention mechanism
@@ -112,10 +111,10 @@ def get_config():
     # CBF parameters
     config.safety.cbf_alpha = 1.0  # CBF alpha parameter
     
-    # QP solver settings (qpax integration)
+    #安全层配置 (qpax集成)
     config.safety.solver = "qpax"  # Differentiable QP solver
     config.safety.max_iterations = 100  # Maximum QP iterations
-    config.safety.tolerance = 1e-6  # Convergence tolerance
+    config.safety.tolerance = 1e-6  # 松弛变量惩罚
     config.safety.regularization = 1e-8  # Regularization parameter
     
     # Three-layer safety mechanism parameters
@@ -129,10 +128,10 @@ def get_config():
     # Optimized learning rates (from performance tuning research)
     config.training.optimizer = "adam"
     config.training.learning_rate = 1e-4  # Base learning rate (optimized)
-    config.training.learning_rate_gcbf = 5e-5  # Lower LR for GNN stability
-    config.training.learning_rate_policy = 2e-4  # Higher LR for policy convergence
+    config.training.learning_rate_gcbf = 5e-5  # GNN稳定性
+    config.training.learning_rate_policy = 2e-4  # 策略收敛
     config.training.batch_size = 32  # Optimized batch size for memory/performance
-    config.training.sequence_length = 25  # Balanced for BPTT efficiency
+    config.training.sequence_length = 25  # BPTT效率平衡
     config.training.num_epochs = 100  # Extended for better convergence
     config.training.batches_per_epoch = 20  # More iterations per epoch
     config.training.validation_frequency = 5

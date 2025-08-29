@@ -1,18 +1,18 @@
 """
-Complete Training Framework for Safe Agile Flight System
+安全敏捷飞行系统的完整训练框架
 
-This module implements the comprehensive training methodology combining:
-1. GCBF+ (MIT-REALM) CBF loss formulations
-2. DiffPhysDrone (SJTU) physics-driven losses
-3. Multi-objective optimization with temporal gradient decay
-4. JAX-native implementation for maximum performance
+本模块实现综合训练方法，结合：
+1. GCBF+ (MIT-REALM) CBF损失公式
+2. DiffPhysDrone (SJTU) 物理驱动损失
+3. 带时间梯度衰减的多目标优化
+4. 最大性能的JAX原生实现
 
-Key Components:
-- Multi-objective loss function (efficiency + safety + control)
-- CBF constraint violations and derivative conditions  
-- Physics-driven losses from DiffPhysDrone methodology
-- Temporal and spatial gradient decay mechanisms
-- MGDA (Multi-Gradient Descent Algorithm) for balanced optimization
+关键组件：
+- 多目标损失函数（效率 + 安全 + 控制）
+- CBF约束违反和导数条件
+- 来自DiffPhysDrone方法的物理驱动损失
+- 时间和空间梯度衰减机制
+- 用于平衡优化的MGDA（多梯度下降算法）
 """
 
 import jax
@@ -31,33 +31,33 @@ from .loop import ScanCarry, ScanOutput
 
 
 # =============================================================================
-# LOSS CONFIGURATION AND COMPONENTS
+# 损失配置和组件
 # =============================================================================
 
 @dataclass 
 class LossConfig:
-    """Configuration for loss function components"""
-    # GCBF+ loss coefficients
-    cbf_violation_coef: float = 5.0       # CBF constraint violation penalty
-    cbf_derivative_coef: float = 3.0      # CBF derivative condition penalty
-    cbf_boundary_coef: float = 2.0        # CBF boundary smoothness
+    """损失函数组件的配置"""
+    # GCBF+损失系数
+    cbf_violation_coef: float = 5.0       # CBF约束违反惩罚
+    cbf_derivative_coef: float = 3.0      # CBF导数条件惩罚
+    cbf_boundary_coef: float = 2.0        # CBF边界平滑性
     
-    # DiffPhysDrone physics-driven losses
-    velocity_tracking_coef: float = 1.0   # Target velocity tracking
-    collision_avoidance_coef: float = 4.0 # Collision penalty
-    control_smoothness_coef: float = 0.1  # Control effort regularization
-    control_jerk_coef: float = 0.05       # Control jerk penalty
+    # DiffPhysDrone物理驱动损失
+    velocity_tracking_coef: float = 1.0   # 目标速度跟踪
+    collision_avoidance_coef: float = 4.0 # 碰撞惩罚
+    control_smoothness_coef: float = 0.1  # 控制动力正则化
+    control_jerk_coef: float = 0.05       # 控制急动惩罚
     
-    # Efficiency losses
-    goal_reaching_coef: float = 2.0       # Distance to goal penalty
-    time_efficiency_coef: float = 0.1     # Time-to-goal penalty
+    # 效率损失
+    goal_reaching_coef: float = 2.0       # 到目标的距离惩罚
+    time_efficiency_coef: float = 0.1     # 到目标的时间惩罚
     
-    # Safety system losses
-    safety_layer_coef: float = 1.0        # Safety filter penalties
-    emergency_coef: float = 100.0         # Emergency brake penalty
+    # 安全系统损失
+    safety_layer_coef: float = 1.0        # 安全过滤器惩罚
+    emergency_coef: float = 100.0         # 紧急制动惩罚
     
-    # Gradient decay parameters
-    temporal_decay_alpha: float = 0.95    # Base temporal decay factor
+    # 梯度衰减参数
+    temporal_decay_alpha: float = 0.95    # 基础时间衰减因子
     spatial_decay_enable: bool = True     # Enable spatial adaptation
     spatial_decay_range: float = 2.0      # Distance range for spatial decay
 
@@ -947,6 +947,173 @@ def mgda_gradient_balancing(
     updated_weights = dict(zip(gradients_dict.keys(), new_weights))
     
     return balanced_gradients, updated_weights
+
+
+# =============================================================================
+# SIMPLE WEIGHTED LOSS FOR MVP STAGE 4
+# =============================================================================
+
+def compute_simple_weighted_loss(
+    scan_outputs: ScanOutput,
+    target_positions: chex.Array,
+    target_velocities: chex.Array,
+    physics_params: PhysicsParams,
+    alpha_efficiency: float = 1.0,
+    beta_safety: float = 2.0
+) -> Tuple[chex.Array, Dict[str, chex.Array]]:
+    """
+    计算简单的加权损失函数：L_total = α * L_efficiency + β * L_safety
+    
+    这是MVP阶段4的核心损失函数，使用简单加权和替代复杂的MGDA。
+    
+    Args:
+        scan_outputs: BPTT扫描输出
+        target_positions: 目标位置 (B, 3)
+        target_velocities: 目标速度 (T, B, 3)
+        physics_params: 物理参数
+        alpha_efficiency: 效率损失权重
+        beta_safety: 安全损失权重
+        
+    Returns:
+        total_loss: 总损失
+        loss_breakdown: 损失组件分解
+    """
+    T, B = scan_outputs.drone_states.shape[:2]
+    
+    # 提取轨迹组件
+    positions = scan_outputs.drone_states[:, :, :3]  # (T, B, 3)
+    velocities = scan_outputs.drone_states[:, :, 3:6]  # (T, B, 3)
+    
+    # CBF值和控制输入
+    h_values = getattr(scan_outputs, 'cbf_values', jnp.zeros((T, B)))
+    control_inputs = getattr(scan_outputs, 'safe_controls', 
+                           getattr(scan_outputs, 'controls', jnp.zeros((T, B, 3))))
+    
+    # ========== 效率损失 L_efficiency ==========
+    
+    # 1. 目标到达损失（最重要）
+    final_positions = positions[-1]  # (B, 3)
+    goal_distance_error = jnp.linalg.norm(final_positions - target_positions, axis=-1)
+    goal_reaching_loss = jnp.mean(goal_distance_error ** 2)
+    
+    # 2. 速度跟踪损失
+    velocity_error = velocities - target_velocities
+    velocity_tracking_loss = jnp.mean(jnp.sum(velocity_error ** 2, axis=-1))
+    
+    # 3. 路径效率损失
+    trajectory_length = jnp.sum(
+        jnp.linalg.norm(jnp.diff(positions, axis=0), axis=-1), axis=0
+    )  # (B,)
+    direct_distance = jnp.linalg.norm(positions[-1] - positions[0], axis=-1)  # (B,)
+    path_efficiency = direct_distance / (trajectory_length + 1e-8)
+    path_efficiency_loss = jnp.mean((1.0 - path_efficiency) ** 2)
+    
+    # 总效率损失
+    L_efficiency = (
+        2.0 * goal_reaching_loss +        # 最重要：到达目标
+        1.0 * velocity_tracking_loss +    # 重要：速度跟踪
+        0.2 * path_efficiency_loss        # 次要：路径效率
+    )
+    
+    # ========== 安全损失 L_safety ==========
+    
+    # 1. CBF约束违反损失（核心安全）
+    h_dots = jnp.gradient(h_values, axis=0) / physics_params.dt
+    cbf_alpha = getattr(physics_params, 'cbf_alpha', 1.0)
+    cbf_constraint = h_dots + cbf_alpha * h_values
+    cbf_violation = jnp.mean(jnp.maximum(0.0, -cbf_constraint) ** 2)
+    
+    # 2. 基本避障损失（简化版）
+    min_altitude = 0.3  # 最小安全高度
+    altitude_violation = jnp.mean(jnp.maximum(0.0, min_altitude - positions[:, :, 2]) ** 2)
+    
+    # 3. 控制约束违反
+    max_control_magnitude = 1.0  # 最大控制幅度
+    control_violation = jnp.mean(
+        jnp.maximum(0.0, jnp.linalg.norm(control_inputs, axis=-1) - max_control_magnitude) ** 2
+    )
+    
+    # 总安全损失
+    L_safety = (
+        3.0 * cbf_violation +          # 最重要：CBF约束
+        2.0 * altitude_violation +     # 重要：基本避障
+        1.0 * control_violation        # 次要：控制约束
+    )
+    
+    # ========== 总损失 ==========
+    L_total = alpha_efficiency * L_efficiency + beta_safety * L_safety
+    
+    # 损失分解（用于监控）
+    loss_breakdown = {
+        'total_loss': L_total,
+        'efficiency_loss': L_efficiency,
+        'safety_loss': L_safety,
+        'goal_reaching_loss': goal_reaching_loss,
+        'velocity_tracking_loss': velocity_tracking_loss,
+        'path_efficiency_loss': path_efficiency_loss,
+        'cbf_violation_loss': cbf_violation,
+        'altitude_violation_loss': altitude_violation,
+        'control_violation_loss': control_violation,
+        'final_goal_distance': jnp.mean(goal_distance_error),
+        'average_cbf_value': jnp.mean(h_values),
+        'control_magnitude': jnp.mean(jnp.linalg.norm(control_inputs, axis=-1))
+    }
+    
+    return L_total, loss_breakdown
+
+
+def simple_training_step(
+    params_dict: Dict,
+    optimizer_state: optax.OptState,
+    batch_data: Dict,
+    physics_params: PhysicsParams,
+    optimizer: optax.GradientTransformation,
+    alpha_efficiency: float = 1.0,
+    beta_safety: float = 2.0
+) -> Tuple[Dict, optax.OptState, Dict[str, chex.Array]]:
+    """
+    MVP阶段4的简化训练步骤，使用简单加权损失函数
+    
+    Args:
+        params_dict: 模型参数字典
+        optimizer_state: 优化器状态
+        batch_data: 批次数据
+        physics_params: 物理参数
+        optimizer: 优化器
+        alpha_efficiency: 效率损失权重
+        beta_safety: 安全损失权重
+        
+    Returns:
+        updated_params: 更新的参数
+        updated_opt_state: 更新的优化器状态
+        loss_breakdown: 损失分解
+    """
+    def loss_fn(params):
+        """损失函数"""
+        scan_outputs = batch_data['scan_outputs']
+        target_positions = batch_data['target_positions']
+        target_velocities = batch_data['target_velocities']
+        
+        loss, loss_breakdown = compute_simple_weighted_loss(
+            scan_outputs, target_positions, target_velocities, 
+            physics_params, alpha_efficiency, beta_safety
+        )
+        return loss, loss_breakdown
+    
+    # 计算损失和梯度
+    (loss, loss_breakdown), gradients = jax.value_and_grad(loss_fn, has_aux=True)(params_dict)
+    
+    # 应用梯度更新
+    updates, new_optimizer_state = optimizer.update(gradients, optimizer_state, params_dict)
+    updated_params = optax.apply_updates(params_dict, updates)
+    
+    # 添加梯度信息到损失分解
+    gradient_norm = jnp.sqrt(sum(
+        jnp.sum(g ** 2) for g in jax.tree_util.tree_leaves(gradients)
+    ))
+    loss_breakdown['gradient_norm'] = gradient_norm
+    
+    return updated_params, new_optimizer_state, loss_breakdown
 
 
 # =============================================================================

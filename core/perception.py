@@ -1,22 +1,22 @@
 """
-Perception Module for Safe Agile Flight System
+安全敏捷飞行系统的感知模块
 
-This module integrates GCBF+ GNN architecture with LiDAR point cloud processing
-for single-agent CBF-based safe control.
+本模块将GCBF+ GNN架构与LiDAR点云处理相集成，
+用于单智能体基于CBF的安全控制。
 
-Key Components:
-1. Point cloud to graph conversion (pointcloud_to_graph)
-2. GNN-based CBF value and gradient computation
-3. JAX native implementation with JIT compilation support
+关键组件：
+1. 点云到图的转换（pointcloud_to_graph）
+2. 基于GNN的CBF值和梯度计算
+3. 支持JIT编译的JAX原生实现
 
-Integration from GCBF+ codebase:
-- GNN architecture from gcbfplus/nn/gnn.py
-- Graph construction from gcbfplus/utils/graph.py
-- CBF network from gcbfplus/algo/module/cbf.py
+来自GCBF+代码库的集成：
+- 来自gcbfplus/nn/gnn.py的GNN架构
+- 来自gcbfplus/utils/graph.py的图构建
+- 来自gcbfplus/algo/module/cbf.py的CBF网络
 
-Adaptations:
-- Multi-agent neighbor discovery -> single-agent LiDAR processing
-- cvxpylayers -> qpax (handled in safety.py)
+适配内容：
+- 多智能体邻居发现 -> 单智能体LiDAR处理
+- cvxpylayers -> qpax（在safety.py中处理）
 """
 
 import jax
@@ -28,112 +28,112 @@ import functools as ft
 from typing import Tuple, Callable, Optional, NamedTuple
 from dataclasses import dataclass
 
-# JAX utilities
+# JAX实用程序
 from jax import vmap, jit
 from jax.lax import top_k
 
 # =============================================================================
-# DATA STRUCTURES
+# 数据结构
 # =============================================================================
 
-# Import DroneState from physics module to maintain consistency
+# 从physics模块导入DroneState以保持一致性
 from core.physics import DroneState
 
 @dataclass(frozen=True)
 class GraphConfig:
-    """Graph construction parameters"""
-    k_neighbors: int = 8  # KNN neighbor count
-    max_range: float = 5.0  # Maximum sensing range
-    min_points: int = 10  # Minimum point cloud size
-    max_points: int = 1000  # Maximum point cloud size (for memory control)
-    ego_node_features: int = 10  # Ego node feature dimension
-    obstacle_node_features: int = 3  # Obstacle node feature dimension
-    edge_features: int = 4  # Edge feature dimension
+    """图构建参数"""
+    k_neighbors: int = 8  # KNN邻居数量
+    max_range: float = 5.0  # 最大传感范围
+    min_points: int = 10  # 最小点云大小
+    max_points: int = 1000  # 最大点云大小（用于内存控制）
+    ego_node_features: int = 10  # 自身节点特征维度
+    obstacle_node_features: int = 3  # 障碍物节点特征维度
+    edge_features: int = 4  # 边特征维度
 
 # =============================================================================
-# POINT CLOUD TO GRAPH CONVERSION
+# 点云到图的转换
 # =============================================================================
 
 def compute_pairwise_distances(points1: jnp.ndarray, points2: jnp.ndarray) -> jnp.ndarray:
     """
-    Compute pairwise distances between two point sets
-    JAX-native implementation with vmap support
+    计算两个点集之间的成对距离
+    支持vmap的JAX原生实现
     
-    Args:
-        points1: (N, 3) - First point set
-        points2: (M, 3) - Second point set
-    Returns:
-        distances: (N, M) - Pairwise distance matrix
+    参数：
+        points1: (N, 3) - 第一个点集
+        points2: (M, 3) - 第二个点集
+    返回：
+        distances: (N, M) - 成对距离矩阵
     """
-    # Vectorized distance computation: ||p1 - p2||_2
+    # 向量化距离计算： ||p1 - p2||_2
     diff = points1[:, None, :] - points2[None, :, :]  # (N, M, 3)
     distances = jnp.linalg.norm(diff, axis=2)  # (N, M)
     return distances
 
 def filter_points_by_range(points: jnp.ndarray, drone_pos: jnp.ndarray, max_range: float) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Filter point cloud by distance range from drone
+    按与无人机的距离范围过滤点云
     """
     distances = jnp.linalg.norm(points - drone_pos, axis=1)
     mask = distances <= max_range
-    # Use jnp.where to avoid boolean indexing issues
+    # 使用jnp.where避免布尔索引问题
     valid_indices = jnp.where(mask, size=points.shape[0], fill_value=0)[0]
     valid_points = points[valid_indices]
     return valid_points, mask
 
 def find_knn_edges(drone_pos: jnp.ndarray, obstacle_points: jnp.ndarray, k: int) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Build KNN edges for ego-centric graph construction
-    JAX/JIT compatible version with fixed-size outputs
+    为以自我为中心的图构建建立KNN边
+    具有固定大小输出的JAX/JIT兼容版本
     
-    Args:
-        drone_pos: (3,) - Drone position
-        obstacle_points: (N, 3) - Obstacle point cloud
-        k: KNN neighbor count (must be static for JIT compilation)
+    参数：
+        drone_pos: (3,) - 无人机位置
+        obstacle_points: (N, 3) - 障碍物点云
+        k: KNN邻居数量（对于JIT编译必须是静态的）
         
-    Returns:
-        senders: (fixed_size,) - Sender node indices (padded with -1 for invalid)
-        receivers: (fixed_size,) - Receiver node indices (padded with -1 for invalid) 
-        edge_features: (fixed_size, 4) - Edge features (padded with zeros for invalid)
+    返回：
+        senders: (fixed_size,) - 发送者节点索引（无效的用-1填充）
+        receivers: (fixed_size,) - 接收者节点索引（无效的用-1填充）
+        edge_features: (fixed_size, 4) - 边特征（无效的用零填充）
     """
     n_obstacles = obstacle_points.shape[0]
     n_total = n_obstacles + 1  # +1 for ego drone node
     
-    # Combined position array: [drone, obstacle1, obstacle2, ...]
+    # 组合位置数组： [无人机, 障碍物1, 障碍物2, ...]
     all_positions = jnp.concatenate([drone_pos[None, :], obstacle_points], axis=0)
     
-    # Compute all pairwise distances
+    # 计算所有成对距离
     distances = compute_pairwise_distances(all_positions, all_positions)
     
-    # Mask diagonal to exclude self-connections
+    # 遮罩对角线以排除自连接
     distances_masked = jnp.where(jnp.eye(n_total), jnp.inf, distances)
     
-    # Use static k value
-    k_use = min(k, n_total - 1)  # Static computation
+    # 使用静态k值
+    k_use = min(k, n_total - 1)  # 静态计算
     
-    # Get k nearest neighbors for each node
+    # 获取每个节点的k个最近邻居
     _, top_k_indices = jax.vmap(lambda row: jax.lax.top_k(-row, k_use))(distances_masked)
     
-    # Create fixed-size edge arrays 
+    # 创建固定大小的边数组
     max_edges = n_total * k_use
     
-    # Create all potential edges (dense format)
+    # 创建所有潜在的边（密集格式）
     all_senders = jnp.repeat(jnp.arange(n_total), k_use)
     all_receivers = top_k_indices.flatten()
     
-    # Compute all edge features
+    # 计算所有边特征
     sender_positions = all_positions[all_senders]
     receiver_positions = all_positions[all_receivers]
     rel_positions = receiver_positions - sender_positions
     edge_distances = jnp.linalg.norm(rel_positions, axis=1, keepdims=True)
     all_edge_features = jnp.concatenate([edge_distances, rel_positions], axis=1)
     
-    # Create validity mask (but don't use for indexing)
-    # Edge is valid if sender != receiver
+    # 创建有效性遮罩（但不用于索引）
+    # 如果发送者 != 接收者，则边有效
     validity_mask = (all_senders != all_receivers) & (all_receivers < n_total)
     
-    # Instead of dynamic filtering, use fixed-size arrays and mark invalid edges
-    # Invalid edges will have sender/receiver = -1 and zero features
+    # 不使用动态过滤，使用固定大小的数组并标记无效边
+    # 无效边将有发送者/接收者 = -1和零特征
     final_senders = jnp.where(validity_mask, all_senders, -1)
     final_receivers = jnp.where(validity_mask, all_receivers, -1)
     final_features = jnp.where(validity_mask[:, None], all_edge_features, 0.0)
@@ -142,21 +142,21 @@ def find_knn_edges(drone_pos: jnp.ndarray, obstacle_points: jnp.ndarray, k: int)
 
 def pointcloud_to_graph(drone_state: DroneState, point_cloud: jnp.ndarray, config: GraphConfig) -> Tuple[jraph.GraphsTuple, jnp.ndarray]:
     """
-    Convert LiDAR point cloud to jraph.GraphsTuple for GNN processing
+    将LiDAR点云转换为jraph.GraphsTuple以进行GNN处理
     
-    This is the core adaptation from GCBF+'s multi-agent neighbor discovery
-    to single-agent LiDAR processing (replacing multi-agent environment).
+    这是从“GCBF+的多智能体邻居发现”到“单智能体LiDAR处理”的核心适配
+    （替换多智能体环境）。
     
-    Args:
-        drone_state: Current drone state
-        point_cloud: (N, 3) LiDAR point cloud in drone body frame
-        config: Graph construction configuration
+    参数：
+        drone_state: 当前无人机状态
+        point_cloud: (N, 3) 无人机机体坐标系中的LiDAR点云
+        config: 图构建配置
     
-    Returns:
-        graph: jraph.GraphsTuple - Graph structure for GNN
-        node_types: Node type array for processing
+    返回：
+        graph: jraph.GraphsTuple - GNN的图结构
+        node_types: 用于处理的节点类型数组
         
-    Graph structure:
+    图结构：
         - Node 0: Ego drone node with state features
         - Nodes 1~N: Obstacle nodes (LiDAR points) with position features
         - Edges: Spatial connectivity based on KNN

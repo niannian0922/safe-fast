@@ -1,12 +1,12 @@
 """
-Policy networks for safe agile flight system.
+安全敏捷飞行系统的策略网络。
 
-This module implements neural network policies combining insights from:
-1. GCBF+ (MIT-REALM): Distributed safe control with graph neural networks
-2. DiffPhysDrone (SJTU): End-to-end vision-based flight control
+本模块实现神经网络策略，结合以下研究的见解：
+1. GCBF+ (MIT-REALM): 使用图神经网络的分布式安全控制
+2. DiffPhysDrone (SJTU): 端到端基于视觉的飞行控制
 
-The policy architecture supports both single-agent and multi-agent scenarios
-with recurrent memory for temporal consistency and safety awareness.
+策略架构支持单智能体和多智能体场景，
+具有用于时间一致性和安全意识的循环记忆。
 """
 
 import jax
@@ -20,45 +20,45 @@ import optax
 
 
 # =============================================================================
-# POLICY STATE REPRESENTATIONS  
+# 策略状态表示
 # =============================================================================
 
 @struct.dataclass
 class PolicyState:
-    """State representation for policy networks with memory."""
-    rnn_state: chex.Array  # Hidden state for recurrent networks
-    step_count: int  # Current step counter for curriculum learning
-    action_history: chex.Array  # History of previous actions for smoothness
+    """带记忆的策略网络的状态表示。"""
+    rnn_state: chex.Array  # 循环网络的隐藏状态
+    step_count: int  # 课程学习的当前步骤计数器
+    action_history: chex.Array  # 用于平滑性的先前动作历史
 
 
 @struct.dataclass 
 class PolicyParams:
-    """Parameters for policy network configuration."""
-    # Network architecture
+    """策略网络配置的参数。"""
+    # 网络架构
     hidden_dims: Tuple[int, ...] = (256, 256)
     rnn_hidden_size: int = 256
     activation: str = "relu"
     use_rnn: bool = True
     
-    # Control constraints
+    # 控制约束
     max_thrust: float = 0.8
-    thrust_smoothing: float = 0.95  # Exponential smoothing factor
+    thrust_smoothing: float = 0.95  # 指数平滑因子
     
-    # Safety integration
+    # 安全集成
     enable_cbf_integration: bool = True
     safety_margin: float = 0.1
     
-    # Training hyperparameters
+    # 训练超参数
     action_penalty_coef: float = 0.01
     smoothness_penalty_coef: float = 0.001
 
 
 # =============================================================================
-# BASE POLICY NETWORK
+# 基础策略网络
 # =============================================================================
 
 class MLPBlock(nn.Module):
-    """Multi-layer perceptron block with configurable activation."""
+    """具有可配置激活函数的多层感知器块。"""
     
     features: int
     activation: str = "relu"
@@ -75,7 +75,7 @@ class MLPBlock(nn.Module):
     def __call__(self, x: chex.Array, training: bool = False) -> chex.Array:
         x = self.dense(x)
         
-        # Apply activation
+        # 应用激活函数
         if self.activation == "relu":
             x = nn.relu(x)
         elif self.activation == "tanh":
@@ -85,9 +85,9 @@ class MLPBlock(nn.Module):
         elif self.activation == "gelu":
             x = nn.gelu(x)
         else:
-            raise ValueError(f"Unsupported activation: {self.activation}")
+            raise ValueError(f"不支持的激活函数: {self.activation}")
             
-        # Apply dropout if specified
+        # 如果指定则应用dropout
         if self.dropout is not None:
             x = self.dropout(x, deterministic=not training)
             
@@ -96,17 +96,17 @@ class MLPBlock(nn.Module):
 
 class PolicyNetworkMLP(nn.Module):
     """
-    Basic MLP policy network for single-agent control.
+    单智能体控制的基础MLP策略网络。
     
-    Based on DiffPhysDrone's lightweight architecture but enhanced with
-    JAX/Flax implementation and improved numerical stability.
+    基于DiffPhysDrone的轻量级架构，但通过JAX/Flax实现增强，
+    并改善了数值稳定性。
     """
     
     params: PolicyParams
-    output_dim: int = 3  # 3D thrust commands
+    output_dim: int = 3  # 3D推力命令
     
     def setup(self):
-        # Create MLP layers using list comprehension (Flax compatible)
+        # 使用列表推导式创建MLP层（兼容Flax）
         self.layers = [
             MLPBlock(
                 features=features,
@@ -116,7 +116,7 @@ class PolicyNetworkMLP(nn.Module):
             for i, features in enumerate(self.params.hidden_dims)
         ]
         
-        # Output layer with tanh activation for bounded control
+        # 带tanh激活的输出层用于有界控制
         self.output_layer = nn.Dense(self.output_dim)
     
     def __call__(
@@ -125,62 +125,62 @@ class PolicyNetworkMLP(nn.Module):
         training: bool = False
     ) -> chex.Array:
         """
-        Forward pass through MLP policy.
+        通过MLP策略的前向传递。
         
-        Args:
-            observations: Input observations 
-            training: Whether in training mode
+        参数：
+            observations: 输入观测值
+            training: 是否在训练模式
             
-        Returns:
-            Control commands in [-1, 1] range
+        返回：
+            [-1, 1]范围内的控制命令
         """
         x = observations
         
-        # Forward through hidden layers
+        # 通过隐藏层前向传递
         for layer in self.layers:
             x = layer(x, training=training)
         
-        # Output layer
+        # 输出层
         x = self.output_layer(x)
         
-        # Apply tanh for bounded output
+        # 应用tanh获得有界输出
         control_output = nn.tanh(x)
         
         return control_output
 
 
 # =============================================================================
-# RECURRENT POLICY NETWORK (DiffPhysDrone-inspired)
+# 循环策略网络（受DiffPhysDrone启发）
 # =============================================================================
 
 class PolicyNetworkRNN(nn.Module):
     """
-    Recurrent policy network for temporal consistency.
+    用于时间一致性的循环策略网络。
     
-    Implements key insights from DiffPhysDrone's CRNN architecture:
-    - GRU for temporal memory and planning consistency
-    - Lightweight design for real-time deployment  
-    - Integrated action smoothing
+    实现DiffPhysDrone的CRNN架构的关键见解：
+    - 用于时间记忆和规划一致性的GRU
+    - 用于实时部署的轻量级设计
+    - 集成动作平滑
     """
     
     params: PolicyParams
     output_dim: int = 3
     
     def setup(self):
-        # Feature extraction layers using list comprehension (Flax compatible)
+        # 使用列表推导式的特征提取层（兼容Flax）
         self.feature_layers = [
             MLPBlock(features=features, activation=self.params.activation)
-            for features in self.params.hidden_dims[:-1]  # All but last
+            for features in self.params.hidden_dims[:-1]  # 除最后一个外的所有
         ]
         
-        # No need to setup RNN layer, we'll use GRUCell directly in __call__
+        # 不需要设置RNN层，我们在__call__中直接使用GRUCell
         
-        # Output projection
+        # 输出投影
         final_hidden_dim = self.params.hidden_dims[-1] if self.params.hidden_dims else self.params.rnn_hidden_size
         self.output_projection = nn.Dense(final_hidden_dim)
         self.control_head = nn.Dense(self.output_dim)
         
-        # Action history integration for smoothness
+        # 动作历史集成以获得平滑性
         self.action_history_proj = nn.Dense(self.params.rnn_hidden_size // 4)
     
     def __call__(
@@ -191,49 +191,49 @@ class PolicyNetworkRNN(nn.Module):
         training: bool = False
     ) -> Tuple[chex.Array, chex.Array]:
         """
-        Forward pass through RNN policy.
+        通过RNN策略的前向传递。
         
-        Args:
-            observations: Input observations sequence
-            rnn_state: Previous RNN hidden state
-            action_history: Previous action history for smoothing
-            training: Training mode flag
+        参数：
+            observations: 输入观测序列
+            rnn_state: 上一个RNN隐藏状态
+            action_history: 用于平滑的先前动作历史
+            training: 训练模式标志
             
-        Returns:
+        返回：
             (control_commands, new_rnn_state)
         """
         batch_size = observations.shape[0]
         
-        # Feature extraction
+        # 特征提取
         x = observations
         for layer in self.feature_layers:
             x = layer(x, training=training)
         
-        # Process action history for smoothness (DiffPhysDrone insight)
+        # 处理动作历史以获得平滑性（DiffPhysDrone见解）
         if action_history is not None:
             action_features = self.action_history_proj(
                 action_history.reshape(batch_size, -1)
             )
-            # Combine with current features
+            # 与当前特征组合
             x = jnp.concatenate([x, action_features], axis=-1)
         
-        # RNN processing - scan over time dimension
+        # RNN处理 - 在时间维度上扫描
         rnn_cell = nn.GRUCell(features=self.params.rnn_hidden_size)
         new_rnn_state, rnn_output = rnn_cell(rnn_state, x)
         
-        # Output projection
+        # 输出投影
         x = self.output_projection(rnn_output)
         x = nn.relu(x)
         
-        # Control head with bounded output
+        # 带有界输出的控制头
         control_output = self.control_head(x)
-        control_output = nn.tanh(control_output)  # Bound to [-1, 1]
+        control_output = nn.tanh(control_output)  # 绑定到[-1, 1]
         
         return control_output, new_rnn_state
 
 
 # =============================================================================
-# POLICY FACTORY AND UTILITIES
+# 策略工厂和实用程序
 # =============================================================================
 
 def create_policy_network(
@@ -242,22 +242,22 @@ def create_policy_network(
     output_dim: int = 3
 ) -> nn.Module:
     """
-    Factory function to create policy networks.
+    创建策略网络的工厂函数。
     
-    Args:
-        params: Policy parameters
-        network_type: Type of network ("mlp" or "rnn")  
-        output_dim: Output dimension
+    参数：
+        params: 策略参数
+        network_type: 网络类型（"mlp" 或 "rnn"）
+        output_dim: 输出维度
         
-    Returns:
-        Policy network instance
+    返回：
+        策略网络实例
     """
     if network_type == "mlp":
         return PolicyNetworkMLP(params=params, output_dim=output_dim)
     elif network_type == "rnn":
         return PolicyNetworkRNN(params=params, output_dim=output_dim)
     else:
-        raise ValueError(f"Unknown network type: {network_type}")
+        raise ValueError(f"未知的网络类型: {network_type}")
 
 
 def init_policy_state(
@@ -265,9 +265,9 @@ def init_policy_state(
     rng_key: chex.PRNGKey,
     batch_size: int = 1
 ) -> PolicyState:
-    """Initialize policy state."""
+    """初始化策略状态。"""
     rnn_state = jnp.zeros((batch_size, policy_params.rnn_hidden_size))
-    action_history = jnp.zeros((batch_size, 3, 3))  # Last 3 actions
+    action_history = jnp.zeros((batch_size, 3, 3))  # 最后3个动作
     
     return PolicyState(
         rnn_state=rnn_state,
@@ -282,30 +282,30 @@ def apply_control_constraints(
     previous_action: Optional[chex.Array] = None
 ) -> chex.Array:
     """
-    Apply control constraints and smoothing.
+    应用控制约束和平滑。
     
-    Implements control processing from DiffPhysDrone:
-    - Thrust magnitude constraints
-    - Temporal smoothing for stability
+    实现来自DiffPhysDrone的控制处理：
+    - 推力幅度约束
+    - 用于稳定性的时间平滑
     """
-    # Scale to actual thrust range
+    # 缩放到实际推力范围
     control_output = raw_control * params.max_thrust
     
-    # Apply exponential smoothing if previous action available
+    # 如果有可用的上一个动作，应用指数平滑
     if previous_action is not None:
         control_output = (
             params.thrust_smoothing * previous_action + 
             (1.0 - params.thrust_smoothing) * control_output
         )
     
-    # Enforce hard constraints
+    # 强制硬约束
     control_output = jnp.clip(control_output, -params.max_thrust, params.max_thrust)
     
     return control_output
 
 
 # =============================================================================
-# POLICY EVALUATION AND UTILITIES
+# 策略评估和实用程序
 # =============================================================================
 
 @jax.jit
@@ -315,7 +315,7 @@ def evaluate_policy_mlp(
     observations: chex.Array,
     training: bool = False
 ) -> chex.Array:
-    """JIT-compiled policy evaluation for MLP."""
+    """MLP的JIT编译策略评估。"""
     return policy.apply(params, observations, training=training)
 
 
@@ -328,7 +328,7 @@ def evaluate_policy_rnn(
     action_history: Optional[chex.Array] = None,
     training: bool = False
 ) -> Tuple[chex.Array, chex.Array]:
-    """JIT-compiled policy evaluation for RNN."""
+    """RNN的JIT编译策略评估。"""
     return policy.apply(
         params, observations, rnn_state, action_history, training=training
     )
@@ -341,31 +341,31 @@ def compute_policy_loss_components(
     params: PolicyParams
 ) -> Tuple[chex.Array, dict]:
     """
-    Compute policy loss components following DiffPhysDrone methodology.
+    遵循DiffPhysDrone方法计算策略损失组件。
     
-    Args:
-        predicted_actions: Network output actions
-        target_actions: Target actions (from QP solver)
-        action_history: Previous actions for smoothness
-        params: Policy parameters
+    参数：
+        predicted_actions: 网络输出动作
+        target_actions: 目标动作（来自QP求解器）
+        action_history: 用于平滑性的先前动作
+        params: 策略参数
         
-    Returns:
+    返回：
         (total_loss, loss_dict)
     """
-    # Action tracking loss (primary objective)
+    # 动作跟踪损失（主要目标）
     action_loss = jnp.mean((predicted_actions - target_actions) ** 2)
     
-    # Action magnitude penalty (energy efficiency)
+    # 动作幅度惩罚（能量效率）
     magnitude_loss = jnp.mean(jnp.sum(predicted_actions ** 2, axis=-1))
     
-    # Smoothness penalty (based on action derivatives)
-    if action_history.shape[-2] > 1:  # Need at least 2 history steps
+    # 平滑性惩罚（基于动作导数）
+    if action_history.shape[-2] > 1:  # 至少需要2个历史步骤
         action_derivatives = jnp.diff(action_history, axis=-2)
         smoothness_loss = jnp.mean(jnp.sum(action_derivatives ** 2, axis=-1))
     else:
         smoothness_loss = 0.0
     
-    # Combine losses
+    # 组合损失
     total_loss = (
         action_loss + 
         params.action_penalty_coef * magnitude_loss +
@@ -383,62 +383,62 @@ def compute_policy_loss_components(
 
 
 # =============================================================================
-# TESTING AND VALIDATION
+# 测试和验证
 # =============================================================================
 
 def validate_policy_implementation():
-    """Validate policy network implementation."""
-    print("🧪 Validating Policy Network Implementation...")
+    """验证策略网络实现。"""
+    print("🧪 验证策略网络实现...")
     
-    # Create test parameters
+    # 创建测试参数
     params = PolicyParams(
         hidden_dims=(128, 64),
         rnn_hidden_size=128,
         use_rnn=True
     )
     
-    # Test MLP policy
+    # 测试MLP策略
     mlp_policy = create_policy_network(params, "mlp")
     
-    # Initialize parameters
+    # 初始化参数
     key = random.PRNGKey(42)
-    dummy_obs = jnp.ones((4, 10))  # Batch of 4, obs dim 10
+    dummy_obs = jnp.ones((4, 10))  # 批量4，观测维度10
     
     mlp_params = mlp_policy.init(key, dummy_obs)
     mlp_output = mlp_policy.apply(mlp_params, dummy_obs)
     
-    print(f"✅ MLP Policy: input {dummy_obs.shape} -> output {mlp_output.shape}")
-    assert mlp_output.shape == (4, 3), f"Expected (4, 3), got {mlp_output.shape}"
+    print(f"✅ MLP策略: 输入 {dummy_obs.shape} -> 输出 {mlp_output.shape}")
+    assert mlp_output.shape == (4, 3), f"期望(4, 3)，得到{mlp_output.shape}"
     
-    # Test RNN policy  
+    # 测试RNN策略
     rnn_policy = create_policy_network(params, "rnn")
     rnn_state = jnp.zeros((4, params.rnn_hidden_size))
     
     rnn_params = rnn_policy.init(key, dummy_obs, rnn_state)
     rnn_output, new_rnn_state = rnn_policy.apply(rnn_params, dummy_obs, rnn_state)
     
-    print(f"✅ RNN Policy: input {dummy_obs.shape} -> output {rnn_output.shape}")
-    assert rnn_output.shape == (4, 3), f"Expected (4, 3), got {rnn_output.shape}"
-    assert new_rnn_state.shape == rnn_state.shape, "RNN state shape mismatch"
+    print(f"✅ RNN策略: 输入 {dummy_obs.shape} -> 输出 {rnn_output.shape}")
+    assert rnn_output.shape == (4, 3), f"期望(4, 3)，得到{rnn_output.shape}"
+    assert new_rnn_state.shape == rnn_state.shape, "RNN状态形状不匹配"
     
-    # Test JIT compilation
+    # 测试JIT编译
     jit_mlp = jax.jit(mlp_policy.apply)
     jit_output = jit_mlp(mlp_params, dummy_obs)
     
-    print(f"✅ JIT Compilation: MLP policy compiles successfully")
-    assert jnp.allclose(mlp_output, jit_output), "JIT output mismatch"
+    print(f"✅ JIT编译: MLP策略编译成功")
+    assert jnp.allclose(mlp_output, jit_output), "JIT输出不匹配"
     
-    # Test control constraints
+    # 测试控制约束
     raw_control = jnp.array([[0.8, -0.6, 1.2], [-0.5, 0.9, -0.3]])
     prev_action = jnp.array([[0.1, -0.1, 0.2], [-0.2, 0.3, -0.1]])
     
     constrained_control = apply_control_constraints(raw_control, params, prev_action)
-    print(f"✅ Control Constraints: Applied successfully")
+    print(f"✅ 控制约束: 应用成功")
     
-    # Verify bounds
-    assert jnp.all(jnp.abs(constrained_control) <= params.max_thrust), "Control bounds violated"
+    # 验证边界
+    assert jnp.all(jnp.abs(constrained_control) <= params.max_thrust), "控制边界被违反"
     
-    print("🎉 Policy Network Validation: ALL TESTS PASSED!")
+    print("🎉 策略网络验证: 所有测试通过!")
 
 
 if __name__ == "__main__":
