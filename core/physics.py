@@ -645,7 +645,7 @@ def validate_physics_state(state: DroneState) -> bool:
         return False
     if not jnp.all(jnp.isfinite(state.velocity)):
         return False
-    if not jnp.all(jnp.isfinite(state.thrust_history)):
+    if not jnp.all(jnp.isfinite(state.thrust_current)):
         return False
         
     # 检查合理的物理边界（为新约束更新）
