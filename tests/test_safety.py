@@ -1,15 +1,15 @@
 """
-Unit tests for safety module (Stage 3 validation)
+安全模块的单元测试（第三阶段验证）
 
-This test suite validates:
-1. QP construction and solving using qpax
-2. Three-layer safety fallback mechanism
-3. Differentiability of safety filter
-4. JIT compilation compatibility
-5. Integration with CBF constraints
+此测试套件验证：
+1. 使用qpax的QP构建和求解
+2. 三层安全回退机制
+3. 安全过滤器的可微分性
+4. JIT编译兼容性
+5. 与CBF约束的集成
 
-Test focuses on verifying the replacement of GCBF+ cvxpylayers
-with qpax for JAX-native differentiable QP solving.
+测试重点验证用qpax替换GCBF+ cvxpylayers，
+实现JAX原生的可微分QP求解。
 """
 
 import sys
@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import pytest
 from jax import random, grad, jit, vmap
 
-# Import modules under test
+# 导入被测试的模块
 from core.safety import (
     SafetyConfig, SafetyLayer, QSolutionInfo,
     differentiable_safety_filter,
@@ -34,10 +34,10 @@ from core.perception import DroneState
 
 
 class TestQPConstruction:
-    """Test QP matrix construction and solving"""
+    """测试QP矩阵构建和求解"""
     
     def setup_method(self):
-        """Setup test fixtures"""
+        """设置测试夹具"""
         self.config = SafetyConfig(
             max_thrust=0.8,
             cbf_alpha=1.0,

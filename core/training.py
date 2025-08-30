@@ -63,34 +63,34 @@ class LossConfig:
 
 
 class LossMetrics(NamedTuple):
-    """Comprehensive loss metrics for monitoring training"""
-    # Total loss components
+    """用于监控训练的全面损失指标"""
+    # 总损失组件
     total_loss: chex.Array
     efficiency_loss: chex.Array
     safety_loss: chex.Array
     control_loss: chex.Array
     
-    # GCBF+ specific losses
+    # GCBF+ 特定损失
     cbf_violation: chex.Array
     cbf_derivative: chex.Array
     cbf_boundary: chex.Array
     
-    # DiffPhysDrone specific losses  
+    # DiffPhysDrone 特定损失  
     velocity_tracking: chex.Array
     collision_penalty: chex.Array
     control_smoothness: chex.Array
     control_jerk: chex.Array
     
-    # Efficiency metrics
+    # 效率指标
     goal_distance: chex.Array
     time_penalty: chex.Array
     
-    # Safety metrics
+    # 安全指标
     safety_violations: chex.Array
     emergency_activations: chex.Array
     qp_success_rate: chex.Array
     
-    # Training dynamics
+    # 训练动态
     gradient_norm: chex.Array
     temporal_decay_factor: chex.Array
 
@@ -100,7 +100,7 @@ class LossMetrics(NamedTuple):
 # =============================================================================
 
 class AdvancedTrainingFramework:
-    """Advanced training framework with multi-objective optimization and curriculum learning"""
+    """具有多目标优化和课程学习的高级训练框架"""
     
     def __init__(self, loss_config: LossConfig, use_curriculum: bool = True):
         self.loss_config = loss_config
@@ -121,82 +121,82 @@ class AdvancedTrainingFramework:
         training_step: int = 0
     ) -> Tuple[chex.Array, LossMetrics, dict]:
         """
-        Compute comprehensive loss with curriculum learning adaptation
+        计算带课程学习适应的综合损失
         
-        Three-stage curriculum:
-        Stage 0: Focus on basic control and goal reaching (relaxed safety)
-        Stage 1: Introduce safety constraints gradually
-        Stage 2: Full safety enforcement with efficiency optimization
+        三阶段课程：
+        阶段0：专注于基本控制和目标到达（安全约束放松）
+        阶段1：逐步引入安全约束
+        阶段2：完整安全约束和效率优化
         """
-        # Determine current curriculum stage
+        # 确定当前课程阶段
         current_stage = self._get_current_curriculum_stage(training_step)
         
-        # Adapt loss weights based on curriculum stage
+        # 根据课程阶段调整损失权重
         adapted_config = self._adapt_loss_config(current_stage)
         
-        # Compute base loss with adapted configuration
+        # 使用调整后的配置计算基础损失
         total_loss, metrics = compute_comprehensive_loss(
             scan_outputs, target_positions, target_velocities,
             adapted_config, physics_params
         )
         
-        # Add curriculum-specific components
+        # 添加课程特定组件
         curriculum_info = {
             'current_stage': current_stage,
             'stage_progress': self._get_stage_progress(training_step, current_stage),
             'adapted_weights': self._get_weight_summary(adapted_config)
         }
         
-        # Update training history
+        # 更新训练历史
         self._update_training_history(total_loss, metrics)
         
-        # Check for stage advancement
+        # 检查阶段进展
         stage_advanced = self._check_stage_advancement(metrics, current_stage)
         if stage_advanced:
-            print(f"🎓 Curriculum advanced from stage {current_stage} to {current_stage + 1}")
+            print(f"🎓 课程从阶段 {current_stage} 进展到 {current_stage + 1}")
             self.training_stage = current_stage + 1
             curriculum_info['stage_advanced'] = True
         
         return total_loss, metrics, curriculum_info
     
     def _get_current_curriculum_stage(self, training_step: int) -> int:
-        """Determine current curriculum stage"""
+        """确定当前课程阶段"""
         if not self.use_curriculum:
-            return 2  # Full training
+            return 2  # 完整训练
         
-        # Override automatic progression if manually set
+        # 如果手动设置则覆盖自动进展
         if hasattr(self, 'manual_stage_override'):
             return self.manual_stage_override
         
-        # Automatic progression based on training steps
-        stage_duration = 3000  # Steps per automatic stage
+        # 基于训练步数的自动进展
+        stage_duration = 3000  # 每个自动阶段的步数
         automatic_stage = min(2, training_step // stage_duration)
         
-        # Use the higher of manual and automatic stage
+        # 使用手动和自动阶段的较高值
         return max(self.training_stage, automatic_stage)
     
     def _adapt_loss_config(self, stage: int) -> LossConfig:
-        """Adapt loss configuration based on curriculum stage"""
+        """根据课程阶段调整损失配置"""
         base_config = self.loss_config
         
-        if stage == 0:  # Basic control stage
+        if stage == 0:  # 基本控制阶段
             return LossConfig(
-                cbf_violation_coef=base_config.cbf_violation_coef * 0.2,  # Very relaxed
+                cbf_violation_coef=base_config.cbf_violation_coef * 0.2,  # 非常放松
                 cbf_derivative_coef=base_config.cbf_derivative_coef * 0.1,
                 cbf_boundary_coef=base_config.cbf_boundary_coef * 0.1,
-                velocity_tracking_coef=base_config.velocity_tracking_coef * 1.5,  # Focus on control
+                velocity_tracking_coef=base_config.velocity_tracking_coef * 1.5,  # 专注于控制
                 collision_avoidance_coef=base_config.collision_avoidance_coef * 0.3,
-                control_smoothness_coef=base_config.control_smoothness_coef * 2.0,  # Encourage smooth control
-                goal_reaching_coef=base_config.goal_reaching_coef * 2.0,  # Focus on reaching goals
+                control_smoothness_coef=base_config.control_smoothness_coef * 2.0,  # 鼓励平滑控制
+                goal_reaching_coef=base_config.goal_reaching_coef * 2.0,  # 专注于到达目标
                 safety_layer_coef=base_config.safety_layer_coef * 0.1,
                 emergency_coef=base_config.emergency_coef * 0.5,
                 temporal_decay_alpha=base_config.temporal_decay_alpha,
                 spatial_decay_enable=base_config.spatial_decay_enable,
                 spatial_decay_range=base_config.spatial_decay_range
             )
-        elif stage == 1:  # Safety-aware stage
+        elif stage == 1:  # 安全感知阶段
             return LossConfig(
-                cbf_violation_coef=base_config.cbf_violation_coef * 0.7,  # Moderate safety
+                cbf_violation_coef=base_config.cbf_violation_coef * 0.7,  # 适度安全
                 cbf_derivative_coef=base_config.cbf_derivative_coef * 0.6,
                 cbf_boundary_coef=base_config.cbf_boundary_coef * 0.6,
                 velocity_tracking_coef=base_config.velocity_tracking_coef * 1.2,
@@ -209,18 +209,18 @@ class AdvancedTrainingFramework:
                 spatial_decay_enable=base_config.spatial_decay_enable,
                 spatial_decay_range=base_config.spatial_decay_range
             )
-        else:  # Full training stage
+        else:  # 完整训练阶段
             return base_config
     
     def _get_stage_progress(self, training_step: int, current_stage: int) -> float:
-        """Get progress within current curriculum stage"""
+        """获取当前课程阶段内的进度"""
         stage_duration = 3000
         stage_start = current_stage * stage_duration
         progress = min(1.0, (training_step - stage_start) / stage_duration)
         return progress
     
     def _get_weight_summary(self, config: LossConfig) -> dict:
-        """Get summary of current loss weights"""
+        """获取当前损失权重摘要"""
         return {
             'safety_weight': config.cbf_violation_coef,
             'efficiency_weight': config.goal_reaching_coef,
@@ -228,37 +228,37 @@ class AdvancedTrainingFramework:
         }
     
     def _update_training_history(self, total_loss: chex.Array, metrics: LossMetrics):
-        """Update training history for curriculum decisions"""
+        """更新训练历史以便课程决策"""
         self.loss_history['total'].append(float(total_loss))
         self.loss_history['safety'].append(float(metrics.safety_loss))
         self.loss_history['efficiency'].append(float(metrics.efficiency_loss))
         
-        # Keep history manageable
+        # 保持历史记录可管理
         max_history = 1000
         for key in self.loss_history:
             if len(self.loss_history[key]) > max_history:
                 self.loss_history[key] = self.loss_history[key][-max_history//2:]
     
     def _check_stage_advancement(self, metrics: LossMetrics, current_stage: int) -> bool:
-        """Check if curriculum should advance to next stage"""
-        if current_stage >= 2:  # Already at final stage
+        """检查课程是否应该进入下一阶段"""
+        if current_stage >= 2:  # 已经在最终阶段
             return False
         
-        # Need sufficient training history
+        # 需要足够的训练历史
         if len(self.loss_history['total']) < 100:
             return False
         
-        # Compute recent performance metrics
+        # 计算最近的性能指标
         recent_window = 50
         recent_safety_violations = jnp.mean(jnp.array(self.loss_history['safety'][-recent_window:]))
         recent_efficiency = 1.0 / (1.0 + jnp.mean(jnp.array(self.loss_history['efficiency'][-recent_window:])))
         
-        # Check advancement criteria
-        if current_stage == 0:  # Stage 0 -> 1
+        # 检查进展标准
+        if current_stage == 0:  # 阶段 0 -> 1
             criteria = self.curriculum_thresholds['stage_1_to_2']
-            return (recent_efficiency >= criteria['min_efficiency'] * 0.8 and  # Relaxed for stage 1
+            return (recent_efficiency >= criteria['min_efficiency'] * 0.8 and  # 为阶段1放松
                    recent_safety_violations <= criteria['max_safety_violations'] * 2.0)
-        elif current_stage == 1:  # Stage 1 -> 2
+        elif current_stage == 1:  # 阶段 1 -> 2
             criteria = self.curriculum_thresholds['stage_2_to_3']
             return (recent_efficiency >= criteria['min_efficiency'] and
                    recent_safety_violations <= criteria['max_safety_violations'])
@@ -266,7 +266,7 @@ class AdvancedTrainingFramework:
         return False
 
 class MultiObjectiveOptimizer:
-    """Multi-objective optimizer using gradient balancing techniques"""
+    """使用梯度平衡技术的多目标优化器"""
     
     def __init__(self, balance_method: str = 'adaptive_weights'):
         self.balance_method = balance_method
@@ -281,7 +281,7 @@ class MultiObjectiveOptimizer:
         control_loss: chex.Array,
         training_step: int = 0
     ) -> Tuple[chex.Array, dict]:
-        """Compute balanced multi-objective loss"""
+        """计算平衡的多目标损失"""
         
         if self.balance_method == 'adaptive_weights':
             return self._adaptive_weight_balancing(safety_loss, efficiency_loss, control_loss)
@@ -290,7 +290,7 @@ class MultiObjectiveOptimizer:
         elif self.balance_method == 'pareto_efficient':
             return self._pareto_efficient_balancing(safety_loss, efficiency_loss, control_loss)
         else:
-            # Simple weighted sum
+            # 简单加权求和
             weights = self.current_weights
             total_loss = (weights['safety'] * safety_loss + 
                          weights['efficiency'] * efficiency_loss + 

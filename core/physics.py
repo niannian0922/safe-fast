@@ -1,9 +1,9 @@
 """
 基于JAX的可微分物理引擎，用于安全敏捷飞行。
 
-本模块实现核心可微分物理仿真，结合以下研究的见解：
-1. GCBF+ (MIT-REALM): 基于图的安全机制和多智能体协调
-2. DiffPhysDrone (SJTU): 具有时间梯度衰减的可微分物理学
+本模块实现核心可微分物理仿真，结合以下研究：
+1. GCBF+ : 基于图的安全机制和多智能体协调
+2. DiffPhysDrone : 具有时间梯度衰减的可微分物理学
 
 关键DiffPhysDrone集成：
 - 时间梯度衰减机制（g_decay函数）
@@ -12,10 +12,10 @@
 - 数值稳定性增强
 
 物理引擎设计特点：
-- 纯函数式（无副作用）
+- 纯函数式
 - 可JIT编译的JAX代码
 - 端到端可微分
-- 兼容BPTT（时间反向传播）
+- 兼容BPTT-时间反向传播
 - 支持时间梯度衰减以提高训练稳定性
 """
 
@@ -39,7 +39,7 @@ class DroneState:
     从原始复杂结构简化，专注于基本动力学。
     
     关键设计原则：
-    1. 点质量动力学（无方向复杂性）
+    1. 点质量动力学
     2. 兼容GCBF+图构建
     3. 支持DiffPhysDrone时间梯度衰减
     4. JAX原生纯函数设计
@@ -197,11 +197,10 @@ def create_spatial_temporal_decay_schedule(
     max_distance: float = 2.0
 ) -> float:
     """
-    高级：空间-时间梯度衰减适应
     
     根据与障碍物的距离适应梯度衰减：
-    - 靠近障碍物：更少衰减（为安全提供更强的梯度）
-    - 远离障碍物：更多衰减（专注于效率）
+    - 靠近障碍物：更少衰减
+    - 远离障碍物：更多衰减
     
     这是超越原始DiffPhysDrone论文的创新。
     """
@@ -263,10 +262,10 @@ def dynamics_step(
     # 这实现了原论文中的控制延迟和平滑
     
     # 输入饱和（标准化命令应在[-1, 1]范围内）
-    saturated_input = jnp.tanh(control_input)  # Smooth saturation
+    saturated_input = jnp.tanh(control_input)  #tanh 是一个是完全可微且平滑的双曲正切函数，它能将任意输入的数值都“压”到 [-1, 1] 的范围内。
     
     # 指数移动平均(EMA)推力平滑
-    # 公式： thrust_new = lambda * thrust_cmd + (1 - lambda) * thrust_prev
+    # 公式： thrust_new = lambda * thrust_cmd + (1 - lambda) * thrust_prev 根据平滑因子 lambda 和时间步长 dt 计算出“历史权重”。这个值介于0和1之间。
     smoothing_factor = jnp.exp(-params.exponential_smoothing_lambda * dt)
     smoothed_thrust = (
         (1.0 - smoothing_factor) * saturated_input + 
@@ -286,13 +285,13 @@ def dynamics_step(
     thrust_force = actual_thrust * params.max_thrust_force
     
     # 阻力（线性 + 二次）
-    vel_norm = jnp.linalg.norm(vel)
-    vel_unit = vel / jnp.maximum(vel_norm, params.epsilon)
+    vel_norm = jnp.linalg.norm(vel) # 计算当前速度向量 vel 的大小也就是速率
+    vel_unit = vel / jnp.maximum(vel_norm, params.epsilon)#计算速度的单位向量。jnp.maximum 防止除以零的数值,如果速度为零，则分母是一个极小值 epsilon。
     
     # 线性阻力
-    drag_linear = -params.drag_coefficient_linear * vel
+    drag_linear = -params.drag_coefficient_linear * vel #计算线性阻力。它与速度向量 vel 成正比，方向相反
     
-    # 二次阻力（速度平方）
+    # 二次阻力
     drag_quadratic = -params.drag_coefficient_quadratic * vel_norm * vel_unit
     
     total_drag = drag_linear + drag_quadratic
@@ -300,7 +299,7 @@ def dynamics_step(
     # 重力
     gravity_force = params.mass * params.gravity_vector
     
-    # === 物理积分（DiffPhysDrone风格） ===
+   
     # 总外力
     total_force = thrust_force + total_drag + gravity_force
     
@@ -314,7 +313,7 @@ def dynamics_step(
     
     # === 物理约束 ===
     # 平滑速度限制（可微分）
-    vel_magnitude = jnp.linalg.norm(new_vel)
+    vel_magnitude = jnp.linalg.norm(new_vel) #计算新速度的大小。
     vel_scale = jnp.minimum(1.0, params.velocity_limit / jnp.maximum(vel_magnitude, params.epsilon))
     new_vel = new_vel * vel_scale
     

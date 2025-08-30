@@ -1,21 +1,21 @@
 """
-STAGE 4: Complete Safe Agile Flight System - Main Training Script
+第四阶段：完整安全敏捷飞行系统 - 主训练脚本
 
-This is the culmination of our multi-stage development combining:
-1. GCBF+ (MIT-REALM): Neural Graph Control Barrier Functions for safety
-2. DiffPhysDrone (SJTU): Differentiable physics for end-to-end learning  
-3. JAX-native implementation for maximum performance
+这是我们多阶段开发的成果，结合了：
+1. GCBF+ (MIT-REALM): 用于安全保障的神经图控制屏障函数
+2. DiffPhysDrone (SJTU): 用于端到端学习的可微分物理学  
+3. JAX原生实现以获得最大性能
 
-STAGE 4 OBJECTIVES:
-- Complete end-to-end system integration
-- Full BPTT training loop with jax.lax.scan
-- Multi-objective loss function optimization
-- Validation of complete gradient flow through all components
+第四阶段目标：
+- 完整端到端系统集成
+- 使用jax.lax.scan的完整BPTT训练循环
+- 多目标损失函数优化
+- 验证通过所有组件的完整梯度流
 
-The system architecture:
-Input -> GNN Perception -> Policy Network -> Safety Layer -> Physics Engine -> Loss
-   ^                                                                            |
-   |_________________________ BPTT Gradient Flow __________________________|
+系统架构：
+输入 -> GNN感知 -> 策略网络 -> 安全层 -> 物理引擎 -> 损失
+   ^                                                        |
+   |_________________________ BPTT梯度流 __________________|
 """
 
 import jax
@@ -31,11 +31,11 @@ import chex
 from dataclasses import dataclass
 import pickle
 
-# Configure JAX for optimal performance
+# 配置JAX以获得最佳性能
 jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_compilation_cache_dir", ".jax_cache")
 
-# Auto-detect best available platform
+# 自动检测最佳可用平台
 try:
     devices = jax.devices()
     print(f"🚀 Available JAX devices: {devices}")
@@ -46,11 +46,11 @@ try:
 except Exception as e:
     print(f"JAX device detection: {e}")
 
-# Add project root to path  
+# 将项目根目录添加到路径  
 project_root = Path(__file__).parent
 sys.path.append(str(project_root))
 
-# Import all system components
+# 导入所有系统组件
 from configs.default_config import get_config, get_minimal_config
 from utils.memory_optimization import (
     get_memory_safe_config, validate_memory_config, 
@@ -73,7 +73,7 @@ from core.perception import (
     pointcloud_to_graph, DroneState as PerceptionDroneState, GraphConfig,
     AdvancedPerceptionModule, AdvancedCBFNet, test_advanced_perception_module
 )
-# Import enhanced policy
+# 导入增强策略
 from core.enhanced_policy import (
     EnhancedPolicyMLP, EnhancedPolicyConfig, create_enhanced_policy_network,
     initialize_enhanced_policy, ActionHistoryBuffer
@@ -87,14 +87,14 @@ from core.loop import (
     ScanCarry, ScanOutput, create_scan_function,
     run_complete_trajectory_scan
 )
-# Import performance tuning
+# 导入性能调优
 from core.performance_tuning import (
     PerformanceTuningConfig, get_optimized_training_config,
     LearningRateScheduler, AdaptiveLossWeightBalancer,
     CurriculumLearningManager, PerformanceMonitor,
     create_optimized_optimizer
 )
-# Import training components
+# 导入训练组件
 from core.training import (
     LossConfig, LossMetrics, compute_comprehensive_loss,
     training_step, create_default_loss_config, create_optimizer,
@@ -103,12 +103,12 @@ from core.training import (
 
 
 # =============================================================================
-# SYSTEM CONFIGURATION AND STATE MANAGEMENT
+# 系统配置和状态管理
 # =============================================================================
 
 @dataclass
 class TrainingState:
-    """Enhanced training state for checkpointing and resumption with comprehensive tracking"""
+    """用于检查点和恢复的增强训练状态，支持全面跟踪"""
     step: int
     epoch: int
     params: Dict
@@ -119,19 +119,19 @@ class TrainingState:
     best_metrics: Dict
     config: Dict
     
-    # Enhanced tracking
+    # 增强跟踪
     total_training_time: float = 0.0
     last_checkpoint_time: float = 0.0
     consecutive_no_improvement: int = 0
     learning_rate_schedule: Optional[Dict] = None
     curriculum_stage: int = 0
     
-    # Performance tracking
+    # 性能跟踪
     gradient_norms_history: list = None
     memory_usage_history: list = None
     batch_success_rates: list = None
     
-    # Resume capability
+    # 恢复能力
     random_state: Optional[Dict] = None
     last_validation_step: int = 0
     
@@ -147,8 +147,8 @@ class TrainingState:
 
 
 class SystemComponents(NamedTuple):
-    """All system components bundled together with advanced features"""
-    # Core components
+    """所有系统组件与高级功能的打包"""
+    # 核心组件
     gnn_perception: PerceptionModule
     policy_network: EnhancedPolicyMLP
     safety_layer: SafetyLayer
@@ -157,13 +157,13 @@ class SystemComponents(NamedTuple):
     physics_params: PhysicsParams
     action_history_buffer: ActionHistoryBuffer
     
-    # Performance tuning components
+    # 性能调优组件
     performance_config: PerformanceTuningConfig
     loss_weight_balancer: AdaptiveLossWeightBalancer
     curriculum_manager: CurriculumLearningManager
     performance_monitor: PerformanceMonitor
     
-    # Advanced components
+    # 高级组件
     advanced_perception: AdvancedPerceptionModule
     advanced_safety: AdvancedSafetyLayer
     hybrid_safety: HybridSafetyLayer
@@ -173,18 +173,18 @@ class SystemComponents(NamedTuple):
 
 
 def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.OptState]:
-    """Initialize all system components including advanced features"""
+    """初始化所有系统组件，包括高级功能"""
     print("🔧 Initializing Complete Safe Agile Flight System with Advanced Features...")
     
-    # Create physics parameters from config
+    # 从配置创建物理参数
     physics_params = PhysicsParams(
         dt=config.physics.dt,
         mass=config.physics.drone.mass,
-        thrust_to_weight=config.physics.drone.thrust_to_weight_ratio,  # Fixed parameter name
+        thrust_to_weight=config.physics.drone.thrust_to_weight_ratio,  # 固定参数名
         drag_coefficient=config.physics.drone.drag_coefficient
     )
     
-    # Initialize perception modules
+    # 初始化感知模块
     key = random.PRNGKey(config.training.seed)
     gnn_key, policy_key, safety_key, advanced_key = random.split(key, 4)
     
@@ -376,36 +376,36 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
     return components, all_params, optimizer_state
 
 # =============================================================================
-# DATA GENERATION AND BATCH MANAGEMENT
+# 数据生成和批处理管理
 # =============================================================================
 
 def generate_training_scenario(config, key: chex.PRNGKey) -> Dict:
-    """Generate a single training scenario"""
+    """生成单个训练场景"""
     key1, key2, key3 = random.split(key, 3)
     
-    # Random initial position and target
+    # 随机初始位置和目标
     initial_position = random.uniform(key1, (3,), minval=-2.0, maxval=2.0)
-    initial_position = initial_position.at[2].set(jnp.abs(initial_position[2]) + 1.0)  # Keep above ground
+    initial_position = initial_position.at[2].set(jnp.abs(initial_position[2]) + 1.0)  # 保持在地面以上
     
     target_position = random.uniform(key2, (3,), minval=-3.0, maxval=3.0)
     target_position = target_position.at[2].set(jnp.abs(target_position[2]) + 1.5)
     
-    # Generate fixed-size obstacle point cloud to enable stacking
-    max_obstacles = 100  # Fixed size for all scenarios
+    # 生成固定大小的障碍物点云以启用堆叠
+    max_obstacles = 100  # 所有场景的固定大小
     n_obstacles = random.randint(key3, (), 20, max_obstacles + 1)  
     
-    # Create full-size array and populate first n_obstacles entries
+    # 创建全尺寸数组并填充前n_obstacles个条目
     obstacle_positions = jnp.zeros((max_obstacles, 3))
     actual_obstacles = random.normal(key3, (n_obstacles, 3)) * 3.0
     obstacle_positions = obstacle_positions.at[:n_obstacles].set(actual_obstacles)
     
-    # Create initial drone state
+    # 创建初始无人机状态
     initial_state = create_initial_drone_state(
         position=initial_position,
         velocity=jnp.zeros(3)
     )
     
-    # Compute target velocities (simple proportional controller toward goal)
+    # 计算目标速度（朝向目标的简单比例控制器）
     sequence_length = config.training.sequence_length
     target_velocities = jnp.tile(
         (target_position - initial_position) / sequence_length * 0.5,
@@ -423,17 +423,17 @@ def generate_training_scenario(config, key: chex.PRNGKey) -> Dict:
 
 
 def generate_training_batch(config, key: chex.PRNGKey, batch_size: int) -> Dict:
-    """Generate a complete training batch using PyTree-compatible batching"""
+    """使用PyTree兼容的批处理生成完整的训练批次"""
     keys = random.split(key, batch_size)
     scenarios = [generate_training_scenario(config, k) for k in keys]
     
-    # Extract initial states (DroneState objects) for proper batching
+    # 提取初始状态（DroneState对象）以进行正确的批处理
     initial_states = [s['initial_state'] for s in scenarios]
     
-    # Use PyTree batching for DroneState objects
+    # 为DroneState对象使用PyTree批处理
     batched_initial_states = batch_drone_states(initial_states)
     
-    # Stack regular arrays normally
+    # 正常堆叠常规数组
     batch = {
         'initial_states': batched_initial_states,  # Now properly batched DroneState
         'target_positions': jnp.stack([s['target_position'] for s in scenarios]),

@@ -2,8 +2,8 @@
 安全敏捷飞行系统的策略网络。
 
 本模块实现神经网络策略，结合以下研究的见解：
-1. GCBF+ (MIT-REALM): 使用图神经网络的分布式安全控制
-2. DiffPhysDrone (SJTU): 端到端基于视觉的飞行控制
+1. GCBF+ : 使用图神经网络的分布式安全控制
+2. DiffPhysDrone : 端到端基于视觉的飞行控制
 
 策略架构支持单智能体和多智能体场景，
 具有用于时间一致性和安全意识的循环记忆。
@@ -150,7 +150,7 @@ class PolicyNetworkMLP(nn.Module):
 
 
 # =============================================================================
-# 循环策略网络（受DiffPhysDrone启发）
+# 循环策略网络（受DiffPhysDrone启发）卷积+循环混合架构
 # =============================================================================
 
 class PolicyNetworkRNN(nn.Module):
@@ -204,7 +204,7 @@ class PolicyNetworkRNN(nn.Module):
         """
         batch_size = observations.shape[0]
         
-        # 特征提取
+        # 特征提取:进行初步的特征提取。这一步将原始的、可能维度很高的观测数据，转换成了更抽象、信息密度更高的特征向量 x
         x = observations
         for layer in self.feature_layers:
             x = layer(x, training=training)
@@ -218,15 +218,15 @@ class PolicyNetworkRNN(nn.Module):
             x = jnp.concatenate([x, action_features], axis=-1)
         
         # RNN处理 - 在时间维度上扫描
-        rnn_cell = nn.GRUCell(features=self.params.rnn_hidden_size)
-        new_rnn_state, rnn_output = rnn_cell(rnn_state, x)
-        
+        rnn_cell = nn.GRUCell(features=self.params.rnn_hidden_size)#实例化一个 GRU（门控循环单元）。GRU 是一种比基础 RNN 更先进的循环单元，它内部有“更新门”和“重置门”，能够更有效地学习长期依赖关系，并缓解梯度消失问题。
+        new_rnn_state, rnn_output = rnn_cell(rnn_state, x)#GRU 单元内部进行复杂的门控计算，融合新旧信息。
+        #是 GRU 对当前情况的一个高度浓缩的总结，但它还不是最终的控制指令
         # 输出投影
         x = self.output_projection(rnn_output)
         x = nn.relu(x)
         
         # 带有界输出的控制头
-        control_output = self.control_head(x)
+        control_output = self.control_head(x)#代码将它通过另外两层 MLP ,将其“解码”成一个 3 维的推力向量 control_output。
         control_output = nn.tanh(control_output)  # 绑定到[-1, 1]
         
         return control_output, new_rnn_state
@@ -353,14 +353,17 @@ def compute_policy_loss_components(
         (total_loss, loss_dict)
     """
     # 动作跟踪损失（主要目标）
-    action_loss = jnp.mean((predicted_actions - target_actions) ** 2)
+    action_loss = jnp.mean((predicted_actions - target_actions) ** 2)#jnp.mean 计算了所有这些平方误差的平均值。这就是标准的均方误差 (Mean Squared Error, MSE)，是回归任务中最常用的损失函数。
     
     # 动作幅度惩罚（能量效率）
     magnitude_loss = jnp.mean(jnp.sum(predicted_actions ** 2, axis=-1))
+    #将推力向量 [tx, ty, tz] 的每个分量平方，得到 [tx^2, ty^2, tz^2]。
+    #jnp.sum(..., axis=-1)：沿着最后一个维度（即 xyz 分量）求和，得到 tx^2 + ty^2 + tz^2。这正是向量模长（距离原点的距离）的平方。
+    #jnp.mean(...)：计算批处理中所有动作模长平方的平均值。
     
     # 平滑性惩罚（基于动作导数）
     if action_history.shape[-2] > 1:  # 至少需要2个历史步骤
-        action_derivatives = jnp.diff(action_history, axis=-2)
+        action_derivatives = jnp.diff(action_history, axis=-2)#jnp.diff 函数计算了一个数组中沿指定轴的 N 阶差分
         smoothness_loss = jnp.mean(jnp.sum(action_derivatives ** 2, axis=-1))
     else:
         smoothness_loss = 0.0

@@ -33,8 +33,8 @@ from .policy import (
 
 @struct.dataclass
 class ScanCarry:
-    """与main.py接口兼容的扫描携带状态 - 支持批处理"""
-    drone_state: Any  # DroneState或批处理DroneState（灵活）
+    """和main.py接口兼容的扫描携带状态，支持批处理"""
+    drone_state: Any  # DroneState或批处理DroneState（灵活设计）
     rnn_hidden_state: chex.Array  # [batch_size, hidden_dim]或单个[hidden_dim]
     step_count: chex.Array  # [batch_size]或单个标量
     cumulative_reward: chex.Array  # [batch_size]或单个标量
@@ -42,7 +42,7 @@ class ScanCarry:
 
 @struct.dataclass 
 class ScanOutput:
-    """与main.py接口兼容的扫描输出"""
+    """和main.py接口兼容的扫描输出"""
     # 基本轨迹数据
     positions: chex.Array  # [3] 位置
     velocities: chex.Array  # [3] 速度
@@ -51,65 +51,65 @@ class ScanOutput:
     step_loss: float  # Step loss
     safety_violation: float  # Safety violations
     
-    # Extended compatibility fields (will be added dynamically)
-    drone_states: Optional[chex.Array] = None  # Full state vector
-    cbf_values: Optional[chex.Array] = None  # CBF values
-    cbf_gradients: Optional[chex.Array] = None  # CBF gradients
-    safe_controls: Optional[chex.Array] = None  # Safe controls
-    obstacle_distances: Optional[chex.Array] = None  # Obstacle distances
-    trajectory_lengths: Optional[chex.Array] = None  # Trajectory lengths
+    # 扩展兼容性字段（动态添加）
+    drone_states: Optional[chex.Array] = None  # 完整状态向量
+    cbf_values: Optional[chex.Array] = None  # CBF值
+    cbf_gradients: Optional[chex.Array] = None  # CBF梯度
+    safe_controls: Optional[chex.Array] = None  # 安全控制
+    obstacle_distances: Optional[chex.Array] = None  # 障碍物距离
+    trajectory_lengths: Optional[chex.Array] = None  # 轨迹长度
 
 # =============================================================================
-# MAIN.PY COMPATIBILITY LAYER
+# MAIN.PY 兼容层
 # =============================================================================
 
 def create_complete_bptt_scan_function(
     cbf_net_params, policy_params, safety_config, physics_params
 ) -> Callable:
     """
-    Create complete BPTT scan function integrating all components
+    创建整合所有组件的完整BPTT扫描函数
     
-    This is the CORE function implementing the complete methodology:
-    Input -> GNN Perception -> Policy -> Safety Layer -> Physics -> BPTT
+    这是实现完整方法论的核心函数：
+    输入 -> GNN感知 -> 策略 -> 安全层 -> 物理 -> BPTT
     
-    Following the exact architecture described in your methodology.
+    严格遵循你方法论中描述的架构。
     """
     
-    @jax.checkpoint  # Apply gradient checkpointing as per your methodology
+    @jax.checkpoint  # 按照你的方法论应用梯度检查点
     def scan_function_body(carry: ScanCarry, external_input):
         """
-        Complete scan function implementing the full pipeline:
+        实现完整流水线的完整扫描函数：
         
-        1. GCBF+ GNN perception for CBF computation
-        2. Policy network for nominal control  
-        3. Safety layer with qpax QP solving
-        4. JAX-native physics simulation
-        5. DiffPhysDrone temporal gradient decay
+        1. GCBF+ GNN感知进行CBF计算
+        2. 策略网络进行名义控制  
+        3. 使用qpax QP求解的安全层
+        4. JAX原生物理仿真
+        5. DiffPhysDrone时间梯度衰减
         """
-        # Extract current state
+        # 提取当前状态
         drone_state = carry.drone_state
         rnn_hidden = carry.rnn_hidden_state
         step = carry.step_count
         
-        # === 1. PERCEPTION MODULE (GCBF+ GNN) ===
-        # Simulate point cloud for demonstration (in real use, this comes from sensors)
-        # For now, create synthetic obstacles around the drone
+        # === 1. 感知模块 (GCBF+ GNN) ===
+        # 模拟演示用的点云（实际使用中来自传感器）
+        # 暂时在无人机周围创建合成障碍物
         relative_positions = jnp.array([
             [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], 
             [0.0, -1.0, 0.0], [0.5, 0.5, 1.0], [-0.5, -0.5, -1.0]
-        ])  # (6, 3) synthetic obstacles
+        ])  # (6, 3) 合成障碍物
         
-        # Import perception functions locally to avoid circular imports
+        # 局部导入感知函数避免循环导入
         from .perception import pointcloud_to_graph, CBFNet, GraphConfig
         
         config = GraphConfig()
         graph, node_types = pointcloud_to_graph(drone_state, relative_positions, config)
         
-        # Compute CBF value and gradients using GNN
+        # 使用GNN计算CBF值和梯度
         cbf_net = CBFNet()
         cbf_value = cbf_net.apply(cbf_net_params, graph, n_type=1)
         
-        # Compute CBF gradients w.r.t. drone position
+        # 计算相对于无人机位置的CBF梯度
         def cbf_wrt_position(pos):
             modified_state = drone_state.replace(position=pos)
             graph_mod, _ = pointcloud_to_graph(modified_state, relative_positions, config)
@@ -117,49 +117,49 @@ def create_complete_bptt_scan_function(
         
         cbf_gradients = jax.grad(cbf_wrt_position)(drone_state.position)
         
-        # === 2. POLICY MODULE ===
-        # Create observation vector
+        # === 2. 策略模块 ===
+        # 创建观测向量
         observation = jnp.concatenate([
-            drone_state.position,     # Current position
-            drone_state.velocity,     # Current velocity  
-            external_input.get('target_velocity', jnp.zeros(3)),  # Target velocity
-            jnp.array([cbf_value])    # CBF value as additional input
+            drone_state.position,     # 当前位置
+            drone_state.velocity,     # 当前速度  
+            external_input.get('target_velocity', jnp.zeros(3)),  # 目标速度
+            jnp.array([cbf_value])    # CBF值作为额外输入
         ])
         
-        # Policy network forward pass (using RNN for temporal consistency)
+        # 策略网络前向传播（使用RNN保持时间一致性）
         from .policy import PolicyNetworkRNN, PolicyParams
         
-        # Create policy network with default parameters
+        # 使用默认参数创建策略网络
         policy_config = PolicyParams(
-            hidden_dims=(32, 32),  # Match test configuration
+            hidden_dims=(32, 32),  # 匹配测试配置
             use_rnn=True,
             rnn_hidden_size=16
         )
         policy_net = PolicyNetworkRNN(params=policy_config)
         u_nominal, new_rnn_hidden = policy_net.apply(
-            policy_params, observation[None, :], rnn_hidden  # Add batch dimension
+            policy_params, observation[None, :], rnn_hidden  # 增加批次维度
         )
         
-        # === 3. SAFETY LAYER (qpax QP) ===
+        # === 3. 安全层 (qpax QP) ===
         from .safety import SafetyLayer
         safety_layer = SafetyLayer(safety_config)
         u_safe, qp_info = safety_layer.safety_filter(
             u_nominal, cbf_value, cbf_gradients, drone_state
         )
         
-        # === 4. PHYSICS SIMULATION ===
+        # === 4. 物理仿真 ===
         from .physics import dynamics_step, apply_temporal_gradient_decay_to_state
         
-        # Apply control and get next state
+        # 应用控制并获取下一状态
         next_drone_state = dynamics_step(drone_state, u_safe, physics_params)
         
-        # === 5. DIFFPHYSDRONE TEMPORAL GRADIENT DECAY ===
+        # === 5. DIFFPHYSDRONE 时间梯度衰减 ===
         if physics_params.enable_gradient_decay:
             next_drone_state = apply_temporal_gradient_decay_to_state(
                 next_drone_state, physics_params.gradient_decay_alpha
             )
         
-        # === UPDATE CARRY STATE ===
+        # === 更新携带状态 ===
         new_carry = ScanCarry(
             drone_state=next_drone_state,
             rnn_hidden_state=new_rnn_hidden,
@@ -167,26 +167,26 @@ def create_complete_bptt_scan_function(
             cumulative_reward=carry.cumulative_reward
         )
         
-        # === CREATE OUTPUT RECORD ===
+        # === 创建输出记录 ===
         scan_output = ScanOutput(
-            # Basic trajectory data
+            # 基本轨迹数据
             positions=next_drone_state.position,
             velocities=next_drone_state.velocity, 
             control_commands=u_safe,
             nominal_commands=u_nominal,
-            step_loss=0.0,  # Will be computed in training.py
-            safety_violation=jnp.maximum(-cbf_value, 0.0),  # CBF violation
+            step_loss=0.0,  # 将在training.py中计算
+            safety_violation=jnp.maximum(-cbf_value, 0.0),  # CBF违反
             
-            # Extended data for loss computation
+            # 用于损失计算的扩展数据
             drone_states=jnp.concatenate([
                 next_drone_state.position,
                 next_drone_state.velocity,
-                jnp.zeros(6)  # Padding for 12-dim compatibility
+                jnp.zeros(6)  # 为12维兼容性填充
             ])[None, :],
             cbf_values=jnp.array([cbf_value])[None, :],
             cbf_gradients=cbf_gradients[None, :],
             safe_controls=u_safe[None, :],
-            obstacle_distances=jnp.array([1.0])[None, :],  # Minimum distance to obstacles
+            obstacle_distances=jnp.array([1.0])[None, :],  # 到障碍物的最小距离
             trajectory_lengths=jnp.array([jnp.linalg.norm(u_safe)])
         )
         
@@ -198,12 +198,12 @@ def create_complete_bptt_scan_function(
 def create_scan_function(
     gnn_perception, policy_network, safety_layer, physics_params
 ) -> Callable:
-    """Legacy compatibility wrapper for main.py"""
-    # Use default parameters for compatibility
+    """为main.py的传统兼容性包装器"""
+    # 为兼容性使用默认参数
     from .perception import CBFNet
     from .safety import SafetyConfig
     
-    # Create dummy parameters (in real usage, these come from training state)
+    # 创建虚拟参数（实际使用中这些来自训练状态）
     dummy_cbf_params = {}
     dummy_policy_params = {}
     safety_config = SafetyConfig()
@@ -221,17 +221,17 @@ def run_complete_trajectory_scan(
     physics_params,
     sequence_length
 ):
-    """Run complete trajectory scan compatible with main.py"""
-    # Convert to BPTTInputs format
+    """运行与main.py兼容的完整轨迹扫描"""
+    # 转换为BPTTInputs格式
     bptt_inputs = BPTTInputs(
         target_velocity=jnp.zeros(3),
         external_forces=jnp.zeros(3)
     )
     
-    # Create dummy inputs for each timestep
+    # 为每个时间步创建虚拟输入
     inputs_sequence = [bptt_inputs] * sequence_length
     
-    # Use scan to execute the sequence
+    # 使用scan执行序列
     final_carry, outputs = lax.scan(
         lambda carry, inp: scan_function(carry, inp, params, physics_params),
         initial_carry,
@@ -243,72 +243,72 @@ def run_complete_trajectory_scan(
 
 
 # =============================================================================
-# BPTT STATE REPRESENTATIONS
+# BPTT 状态表示
 # =============================================================================
 
 @struct.dataclass
 class BPTTCarry:
     """
-    Carry state for JAX lax.scan BPTT loop.
+    JAX lax.scan BPTT循环的携带状态。
     
-    Contains all state that needs to be passed between timesteps,
-    following JAX's functional programming requirements.
+    包含所有需要在时间步之间传递的状态，
+    遵微jax的函数式编程要求。
     """
-    # Physics state
-    drone_state: DroneState  # Current drone state
-    multi_agent_state: Optional[MultiAgentState]  # Multi-agent state if applicable
+    # 物理状态
+    drone_state: DroneState  # 当前无人机状态
+    multi_agent_state: Optional[MultiAgentState]  # 如果适用的多代理状态
     
-    # Policy state  
-    policy_state: PolicyState  # RNN hidden state and memory
+    # 策略状态  
+    policy_state: PolicyState  # RNN隐藏状态和内存
     
-    # Control state
-    last_control: chex.Array  # Previous control command
-    control_history: chex.Array  # Control command history for smoothness
+    # 控制状态
+    last_control: chex.Array  # 上一次控制命令
+    control_history: chex.Array  # 用于平滑性的控制命令历史
     
-    # Training state
-    step: int  # Current timestep
-    accumulated_loss: float  # Accumulated loss over sequence
+    # 训练状态
+    step: int  # 当前时间步
+    accumulated_loss: float  # 序列上的累积损失
 
 
 @struct.dataclass
 class BPTTInputs:
     """
-    Per-timestep inputs to the BPTT scan function.
+    BPTT扫描函数的每时间步输入。
     
-    This represents external inputs that vary per timestep.
+    这表示每个时间步变化的外部输入。
     """
-    target_velocity: chex.Array  # [3] target velocity for this timestep
-    external_forces: chex.Array  # [3] external disturbances (optional)
-    obstacle_info: Optional[chex.Array] = None  # Dynamic obstacle information
-    goal_position: Optional[chex.Array] = None  # Dynamic goal updates
+    target_velocity: chex.Array  # [3] 这个时间步的目标速度
+    external_forces: chex.Array  # [3] 外部干扰（可选）
+    obstacle_info: Optional[chex.Array] = None  # 动态障碍物信息
+    goal_position: Optional[chex.Array] = None  # 动态目标更新
 
 
 @struct.dataclass
 class BPTTOutputs:
     """
-    Outputs collected from each timestep of BPTT scan.
+    从BPTT扫描的每个时间步收集的输出。
     
-    These are stacked across the time dimension for loss computation.
+    这些在时间维度上堆叠用于损失计算。
     """
-    # State trajectories
-    positions: chex.Array  # [3] drone positions
-    velocities: chex.Array  # [3] drone velocities
+    # 状态轨迹
+    positions: chex.Array  # [3] 无人机位置
+    velocities: chex.Array  # [3] 无人机速度
     
-    # Control trajectories
-    control_commands: chex.Array  # [3] applied control commands
-    nominal_commands: chex.Array  # [3] nominal control before safety filter
+    # 控制轨迹
+    control_commands: chex.Array  # [3] 应用的控制命令
+    nominal_commands: chex.Array  # [3] 安全过滤器前的名义控制
     
-    # Loss components
-    step_loss: float  # Loss for this timestep
-    safety_violation: float  # Safety violation metric
+    # 损失组件
+    step_loss: float  # 这个时间步的损失
+    safety_violation: float  # 安全违反指标
     
-    # Debug information
-    cbf_value: Optional[float] = None  # CBF value if computed
-    constraint_active: Optional[bool] = None  # Whether safety constraints active
+    # 调试信息
+    cbf_value: Optional[float] = None  # 如果计算则为CBF值
+    constraint_active: Optional[bool] = None  # 安全约束是否激活
 
 
 # =============================================================================
-# CORE BPTT SCAN FUNCTION
+# 核心BPTT扫描函数
 # =============================================================================
 
 def create_bptt_scan_function(

@@ -1,18 +1,18 @@
 """
-JAX PyTree Batch Processing Utilities
+JAX PyTree批处理工具
 
-This module provides utilities to handle the fundamental "Array of Structs vs Struct of Arrays"
-problem in JAX. It enables seamless conversion between individual structured objects 
-(like DroneState) and batch-compatible JAX arrays.
+此模块提供工具来处理JAX中基本的"结构数组 vs 数组结构"
+问题。它实现了个别结构化对象（如DroneState）与批处理兼容的JAX数组
+之间的无缝转换。
 
-Key Functions:
-- batch_pytree_objects: Convert [struct1, struct2, ...] -> struct_of_arrays
-- unbatch_pytree_objects: Convert struct_of_arrays -> [struct1, struct2, ...]
-- stack_pytree_list: Safe stacking of PyTree objects
-- validate_batch_structure: Validate batch consistency
+关键函数：
+- batch_pytree_objects: 将 [struct1, struct2, ...] -> struct_of_arrays
+- unbatch_pytree_objects: 将 struct_of_arrays -> [struct1, struct2, ...]
+- stack_pytree_list: PyTree对象的安全堆叠
+- validate_batch_structure: 验证批处理一致性
 
-This solves the core issue where JAX operations like jnp.stack cannot handle
-Flax @struct.dataclass objects directly.
+这解决了JAX操作（如jnp.stack）无法直接处理
+Flax @struct.dataclass对象的核心问题。
 """
 
 import jax
@@ -26,32 +26,32 @@ T = TypeVar('T')
 
 def batch_pytree_objects(objects_list: List[T]) -> T:
     """
-    Convert a list of PyTree objects to a batched PyTree.
+    将PyTree对象列表转换为批处理PyTree。
     
-    Transforms [struct1, struct2, ...] -> struct_of_arrays
-    This is the core solution to JAX's "Array of Structs" limitation.
+    将 [struct1, struct2, ...] -> struct_of_arrays 转换
+    这是解决JAX"结构数组"限制的核心方案。
     
-    Args:
-        objects_list: List of PyTree objects (e.g., DroneState instances)
+    参数:
+        objects_list: PyTree对象列表（如DroneState实例）
         
-    Returns:
-        Batched PyTree where each leaf is stacked along batch dimension
+    返回值:
+        批处理PyTree，其中每个叶子沿批处理维度堆叠
         
-    Example:
+    示例:
         states = [DroneState(...), DroneState(...), DroneState(...)]
         batched_states = batch_pytree_objects(states)
-        # Result: DroneState with position.shape = [3, 3] instead of [3]
+        # 结果: DroneState with position.shape = [3, 3] instead of [3]
     """
     if not objects_list:
         raise ValueError("Cannot batch empty list")
         
-    # Validate all objects have the same structure
+    # 验证所有对象具有相同结构
     first_obj = objects_list[0]
     for i, obj in enumerate(objects_list[1:], 1):
         if not tree_util.tree_structure(obj) == tree_util.tree_structure(first_obj):
             raise ValueError(f"Object {i} has different structure than object 0")
     
-    # Use tree_map with stacking to create batch dimension
+    # 使用tree_map和堆叠来创建批处理维度
     return tree_util.tree_map(
         lambda *args: jnp.stack(args, axis=0), 
         *objects_list
@@ -59,29 +59,29 @@ def batch_pytree_objects(objects_list: List[T]) -> T:
 
 def unbatch_pytree_objects(batched_struct: T) -> List[T]:
     """
-    Convert a batched PyTree back to a list of individual PyTrees.
+    将批处理PyTree转换回个别PyTree的列表。
     
-    Transforms struct_of_arrays -> [struct1, struct2, ...]
+    将 struct_of_arrays -> [struct1, struct2, ...] 转换
     
-    Args:
-        batched_struct: PyTree with batched arrays as leaves
+    参数:
+        batched_struct: 以批处理数组作为叶子的PyTree
         
-    Returns:
-        List of individual PyTree objects
+    返回值:
+        个别PyTree对象的列表
         
-    Example:
+    示例:
         batched_states = DroneState(position=jnp.array([[1,2,3], [4,5,6]]), ...)
         states = unbatch_pytree_objects(batched_states)
-        # Result: [DroneState(position=[1,2,3]), DroneState(position=[4,5,6])]
+        # 结果: [DroneState(position=[1,2,3]), DroneState(position=[4,5,6])]
     """
-    # Get batch size from first leaf
+    # 从第一个叶子获取批处理大小
     first_leaf = tree_util.tree_leaves(batched_struct)[0]
     if first_leaf.ndim == 0:
         raise ValueError("Cannot unbatch scalar (0-dimensional) arrays")
         
     batch_size = first_leaf.shape[0]
     
-    # Extract each batch element
+    # 提取每个批处理元素
     individual_objects = []
     for i in range(batch_size):
         individual_obj = tree_util.tree_map(
@@ -94,14 +94,14 @@ def unbatch_pytree_objects(batched_struct: T) -> List[T]:
 
 def stack_pytree_list(objects_list: List[T], axis: int = 0) -> T:
     """
-    Safe stacking of PyTree objects with custom axis.
+    使用自定义轴的PyTree对象安全堆叠。
     
-    Args:
-        objects_list: List of PyTree objects to stack
-        axis: Axis along which to stack (default: 0 for batch dimension)
+    参数:
+        objects_list: 要堆叠的PyTree对象列表
+        axis: 堆叠的轴（默认值：0表示批处理维度）
         
-    Returns:
-        Stacked PyTree
+    返回值:
+        堆叠后的PyTree
     """
     if not objects_list:
         raise ValueError("Cannot stack empty list")
@@ -113,14 +113,14 @@ def stack_pytree_list(objects_list: List[T], axis: int = 0) -> T:
 
 def validate_batch_structure(batched_struct: Any, expected_batch_size: int) -> bool:
     """
-    Validate that a batched PyTree has consistent structure.
+    验证批处理PyTree具有一致的结构。
     
-    Args:
-        batched_struct: Batched PyTree to validate
-        expected_batch_size: Expected size of batch dimension
+    参数:
+        batched_struct: 要验证的批处理PyTree
+        expected_batch_size: 批处理维度的期望大小
         
-    Returns:
-        True if structure is valid, False otherwise
+    返回值:
+        如果结构有效则为True，否则为False
     """
     try:
         leaves = tree_util.tree_leaves(batched_struct)
@@ -128,7 +128,7 @@ def validate_batch_structure(batched_struct: Any, expected_batch_size: int) -> b
         if not leaves:
             return False
             
-        # Check all leaves have correct batch dimension
+        # 检查所有叶子具有正确的批处理维度
         for leaf in leaves:
             if not hasattr(leaf, 'shape'):
                 return False
@@ -175,31 +175,31 @@ def tree_batch_dimension_size(batched_struct: Any) -> int:
 
 def safe_pytree_stack(objects_list: List[T]) -> T:
     """
-    Ultra-safe PyTree stacking with comprehensive error handling.
+    具有全面错误处理的超安全PyTree堆叠。
     
-    This function provides the most robust way to convert individual 
-    structured objects to batch format for JAX operations.
+    此函数提供了将个别结构化对象转换为批处理格式
+    以供JAX操作的最稳健方式。
     
-    Args:
-        objects_list: List of PyTree objects
+    参数:
+        objects_list: PyTree对象列表
         
-    Returns:
-        Safely batched PyTree
+    返回值:
+        安全批处理的PyTree
         
-    Raises:
-        ValueError: With detailed error messages for debugging
+    异常:
+        ValueError: 带有详细错误信息用于调试
     """
     if not objects_list:
         raise ValueError("Cannot stack empty list of objects")
         
     if len(objects_list) == 1:
-        # Single object - add batch dimension
+        # 单个对象 - 添加批处理维度
         return tree_util.tree_map(
             lambda x: jnp.expand_dims(x, axis=0),
             objects_list[0]
         )
     
-    # Multiple objects - validate and stack
+    # 多个对象 - 验证并堆叠
     first_obj = objects_list[0]
     first_structure = tree_util.tree_structure(first_obj)
     
@@ -211,14 +211,14 @@ def safe_pytree_stack(objects_list: List[T]) -> T:
                 f"Expected: {first_structure}, Got: {obj_structure}"
             )
     
-    # Perform stacking with detailed error reporting
+    # 执行堆叠并提供详细的错误报告
     try:
         return tree_util.tree_map(
             lambda *args: jnp.stack(args, axis=0),
             *objects_list
         )
     except Exception as e:
-        # Provide detailed debugging information
+        # 提供详细的调试信息
         first_leaves = tree_util.tree_leaves(first_obj)
         error_info = []
         
@@ -230,17 +230,17 @@ def safe_pytree_stack(objects_list: List[T]) -> T:
             f"First object leaf info: {error_info}"
         )
 
-# Specialized functions for common use cases
+# 常用用例的专用函数
 
 def batch_drone_states(states: List['DroneState']) -> 'DroneState':
-    """Specialized function for batching DroneState objects."""
+    """用于批处理DroneState对象的专用函数。"""
     return batch_pytree_objects(states)
 
 def unbatch_drone_states(batched_states: 'DroneState') -> List['DroneState']:
-    """Specialized function for unbatching DroneState objects."""
+    """用于解批处理DroneState对象的专用函数。"""
     return unbatch_pytree_objects(batched_states)
 
-# Make all functions available for import
+# 使所有函数可供导入
 __all__ = [
     'batch_pytree_objects',
     'unbatch_pytree_objects', 

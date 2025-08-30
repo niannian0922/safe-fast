@@ -1,14 +1,14 @@
 """
-Memory optimization utilities for Safe Agile Flight system.
+安全敏捷飞行系统的内存优化工具。
 
-This module provides utilities to:
-1. Detect and manage memory usage during training
-2. Automatically adjust sequence lengths based on available memory
-3. Provide memory-safe configuration defaults
-4. Monitor memory usage during training
+此模块提供以下工具：
+1. 在训练过程中检测和管理内存使用
+2. 基于可用内存自动调整序列长度
+3. 提供内存安全的配置默认值
+4. 在训练过程中监控内存使用
 
-The goal is to prevent memory overflow during long sequence training
-while maintaining training effectiveness.
+目标是在长序列训练期间防止内存溢出，
+同时保持训练有效性。
 """
 
 import jax
@@ -20,12 +20,12 @@ import warnings
 
 
 def get_memory_info() -> Dict[str, float]:
-    """Get current memory usage information"""
+    """获取当前内存使用信息"""
     try:
-        # Get system memory info
+        # 获取系统内存信息
         memory = psutil.virtual_memory()
         
-        # Get JAX device memory info if available
+        # 获取JAX设备内存信息（如果可用）
         devices = jax.devices()
         device_memory = {}
         
@@ -34,11 +34,11 @@ def get_memory_info() -> Dict[str, float]:
                 if hasattr(device, 'memory_stats'):
                     stats = device.memory_stats()
                     device_memory[f'device_{i}'] = {
-                        'used': stats.get('bytes_in_use', 0) / 1e9,  # GB
-                        'total': stats.get('peak_bytes_in_use', 0) / 1e9  # GB
+                        'used': stats.get('bytes_in_use', 0) / 1e9,  # GB 已使用
+                        'total': stats.get('peak_bytes_in_use', 0) / 1e9  # GB 总计
                     }
             except:
-                pass  # Device doesn't support memory stats
+                pass  # 设备不支持内存统计
         
         return {
             'system_total_gb': memory.total / 1e9,
@@ -53,32 +53,32 @@ def get_memory_info() -> Dict[str, float]:
 
 def estimate_memory_usage(batch_size: int, sequence_length: int, model_size: str = "medium") -> float:
     """
-    Estimate memory usage for a given configuration
+    估计给定配置的内存使用量
     
-    Args:
-        batch_size: Training batch size
-        sequence_length: BPTT sequence length 
-        model_size: "small", "medium", or "large"
+    参数:
+        batch_size: 训练批处理大小
+        sequence_length: BPTT序列长度 
+        model_size: "small"、"medium"或"large"
         
-    Returns:
-        Estimated memory usage in GB
+    返回值:
+        估计的内存使用量（GB）
     """
     
-    # Base memory estimates (rough approximations)
+    # 基础内存估计（粗略近似）
     base_memory = {
         "small": 1.0,   # GB
         "medium": 2.5,  # GB  
         "large": 5.0    # GB
     }
     
-    # Memory scaling factors
-    batch_factor = batch_size / 16.0  # Reference batch size
-    sequence_factor = sequence_length / 20.0  # Reference sequence length
+    # 内存缩放因子
+    batch_factor = batch_size / 16.0  # 参考批处理大小
+    sequence_factor = sequence_length / 20.0  # 参考序列长度
     
-    # Estimate total memory
+    # 估计总内存
     estimated_memory = base_memory[model_size] * batch_factor * sequence_factor
     
-    # Add buffer for JAX compilation and intermediate values
+    # 为JAX编译和中间值添加缓冲区
     estimated_memory *= 1.5
     
     return estimated_memory
@@ -86,28 +86,28 @@ def estimate_memory_usage(batch_size: int, sequence_length: int, model_size: str
 
 def get_memory_safe_config(base_config, target_memory_gb: float = 4.0):
     """
-    Adjust configuration to be memory safe
+    调整配置以确保内存安全
     
-    Args:
-        base_config: Base configuration to adjust
-        target_memory_gb: Target maximum memory usage in GB
+    参数:
+        base_config: 要调整的基础配置
+        target_memory_gb: 目标最大内存使用量（GB）
         
-    Returns:
-        Memory-safe configuration
+    返回值:
+        内存安全的配置
     """
     config = base_config
     
-    # Get current memory info
+    # 获取当前内存信息
     memory_info = get_memory_info()
     available_memory = min(target_memory_gb, memory_info['system_available_gb'] * 0.8)
     
     print(f"🧠 Memory optimization target: {available_memory:.1f}GB")
     
-    # Start with current configuration
+    # 从当前配置开始
     current_batch_size = config.training.batch_size
     current_seq_length = config.training.sequence_length
     
-    # Estimate current memory usage
+    # 估计当前内存使用量
     current_memory = estimate_memory_usage(current_batch_size, current_seq_length, "medium")
     
     if current_memory <= available_memory:
@@ -117,10 +117,10 @@ def get_memory_safe_config(base_config, target_memory_gb: float = 4.0):
     print(f"⚠️ Current config may exceed memory: {current_memory:.1f}GB > {available_memory:.1f}GB")
     print("🔧 Adjusting configuration for memory safety...")
     
-    # Adjust parameters to fit memory
-    # Priority: reduce sequence length first, then batch size
+    # 调整参数以适应内存
+    # 优先级：首先减少序列长度，然后减少批处理大小
     
-    # Try reducing sequence length
+    # 尝试减少序列长度
     safe_seq_length = current_seq_length
     while safe_seq_length > 5:
         test_memory = estimate_memory_usage(current_batch_size, safe_seq_length, "medium")
@@ -128,7 +128,7 @@ def get_memory_safe_config(base_config, target_memory_gb: float = 4.0):
             break
         safe_seq_length = max(5, int(safe_seq_length * 0.8))
     
-    # If still too large, reduce batch size
+    # 如果仍然太大，减少批处理大小
     safe_batch_size = current_batch_size
     while safe_batch_size > 1:
         test_memory = estimate_memory_usage(safe_batch_size, safe_seq_length, "medium")
@@ -136,7 +136,7 @@ def get_memory_safe_config(base_config, target_memory_gb: float = 4.0):
             break
         safe_batch_size = max(1, int(safe_batch_size * 0.8))
     
-    # Update configuration
+    # 更新配置
     if safe_seq_length != current_seq_length:
         config.training.sequence_length = safe_seq_length
         print(f"   Reduced sequence length: {current_seq_length} → {safe_seq_length}")
@@ -145,9 +145,9 @@ def get_memory_safe_config(base_config, target_memory_gb: float = 4.0):
         config.training.batch_size = safe_batch_size
         print(f"   Reduced batch size: {current_batch_size} → {safe_batch_size}")
     
-    # Also adjust other memory-sensitive parameters
+    # 同时调整其他内存敏感参数
     if current_memory > available_memory * 1.5:
-        # Reduce model sizes for very constrained memory
+        # 为严重受限的内存减少模型大小
         config.policy.hidden_dims = [min(128, d) for d in config.policy.hidden_dims]
         config.gcbf.gnn.hidden_dims = [min(128, d) for d in config.gcbf.gnn.hidden_dims]
         print("   Reduced model sizes for memory constraints")
@@ -164,13 +164,13 @@ def get_memory_safe_config(base_config, target_memory_gb: float = 4.0):
 
 
 def clear_jax_cache():
-    """Clear JAX compilation cache and run garbage collection"""
+    """清除JAX编译缓存并运行垃圾回收"""
     try:
-        # Clear JAX cache if available
+        # 清除JAX缓存（如果可用）
         if hasattr(jax, 'clear_caches'):
             jax.clear_caches()
         
-        # Force garbage collection
+        # 强制垃圾回收
         gc.collect()
         
         print("🧹 Cleared JAX cache and ran garbage collection")
@@ -179,7 +179,7 @@ def clear_jax_cache():
 
 
 def monitor_training_memory(step: int, clear_every: int = 50):
-    """Monitor memory usage during training and clear cache if needed"""
+    """在训练过程中监控内存使用量，必要时清除缓存"""
     if step % clear_every == 0 and step > 0:
         memory_info = get_memory_info()
         
@@ -187,29 +187,29 @@ def monitor_training_memory(step: int, clear_every: int = 50):
             print(f"⚠️ High memory usage at step {step}: {memory_info['system_used_percent']:.1f}%")
             clear_jax_cache()
             
-            # Check again after cleanup
+            # 清理后再次检查
             new_memory_info = get_memory_info()
             print(f"   Memory after cleanup: {new_memory_info['system_used_percent']:.1f}%")
 
 
 def get_debug_config(base_config):
-    """Get a debug configuration with minimal memory usage"""
+    """获取具有最小内存使用量的调试配置"""
     config = base_config
     
-    # Minimal settings for debugging
+    # 调试的最小设置
     config.training.batch_size = 2
     config.training.sequence_length = 5
     config.training.num_epochs = 2
     config.training.batches_per_epoch = 3
     config.training.validation_batch_size = 2
     
-    # Reduce model complexity
+    # 降低模型复杂度
     config.policy.hidden_dims = [32, 32]
     config.gcbf.gnn.hidden_dims = [64, 64, 32]
     config.gcbf.k_neighbors = 3
     config.gcbf.max_neighbors = 4
     
-    # Disable expensive features
+    # 禁用昂贵的功能
     config.optimization.use_checkpoint = False
     config.optimization.nested_checkpoint = False
     config.logging.video_logging = False
@@ -220,7 +220,7 @@ def get_debug_config(base_config):
 
 
 def validate_memory_config(config) -> bool:
-    """Validate that the configuration is reasonable for available memory"""
+    """验证配置对于可用内存是合理的"""
     memory_info = get_memory_info()
     estimated_usage = estimate_memory_usage(
         config.training.batch_size,
@@ -243,13 +243,13 @@ def validate_memory_config(config) -> bool:
 
 
 if __name__ == "__main__":
-    # Test memory utilities
+    # 测试内存工具
     print("Testing memory optimization utilities...")
     
     memory_info = get_memory_info()
     print(f"System memory: {memory_info}")
     
-    # Test memory estimation
+    # 测试内存估计
     for batch_size in [2, 8, 16]:
         for seq_len in [5, 20, 50]:
             usage = estimate_memory_usage(batch_size, seq_len, "medium")

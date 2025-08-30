@@ -1,13 +1,13 @@
 """
-Stage 3 Integration Tests - Focused validation of core components
+第三阶段集成测试 - 核心组件的重点验证
 
-This simplified test suite validates the essential functionality for Stage 3:
-1. Basic perception module functionality
-2. Safety filter with qpax integration  
-3. End-to-end gradient flow
-4. Component integration readiness
+这个简化的测试套件验证第三阶段的基本功能：
+1. 基本感知模块功能
+2. 与qpax集成的安全过滤器  
+3. 端到端梯度流
+4. 组件集成准备就绪
 
-Focus on functional correctness rather than complex JIT compilation edge cases.
+专注于功能正确性而非复杂的JIT编译边缘情况。
 """
 
 import sys
@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import jraph
 from jax import random, grad
 
-# Import modules under test
+# 导入被测试的模块
 from core.perception import (
     DroneState, GraphConfig, 
     pointcloud_to_graph, 

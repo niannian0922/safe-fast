@@ -1,17 +1,17 @@
 """
-Comprehensive test suite for the differentiable physics engine.
+可微分物理引擎的综合测试套件。
 
-This module validates the correctness, differentiability, and numerical stability 
-of the core physics simulation combining GCBF+ and DiffPhysDrone methodologies.
+该模块验证结合GCBF+和DiffPhysDrone方法论的
+核心物理仿真的正确性、可微分性和数值稳定性。
 
-Tests cover:
-1. Basic dynamics correctness against analytical solutions
-2. Gradient flow verification through the physics engine  
-3. JIT compilation functionality
-4. Temporal gradient decay mechanism
-5. Multi-agent coordination and collision detection
-6. Conservation laws and energy balance
-7. Numerical stability under extreme conditions
+测试包括：
+1. 基本动力学相对于解析解的正确性
+2. 通过物理引擎的梯度流验证
+3. JIT编译功能性
+4. 时间梯度衰减机制
+5. 多代理协调和碰撞检测
+6. 守恒定律和能量平衡
+7. 极端条件下的数值稳定性
 """
 
 import pytest
@@ -21,7 +21,7 @@ import numpy as np
 from jax import random, grad, jit
 import chex
 
-# Import the physics engine components
+# 导入物理引擎组件
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -37,28 +37,28 @@ from core.physics import (
 
 
 # =============================================================================
-# TEST FIXTURES AND UTILITIES
+# 测试夹具和工具
 # =============================================================================
 
 @pytest.fixture
 def default_params():
-    """Standard physics parameters for testing."""
+    """用于测试的标准物理参数。"""
     return PhysicsParams()
 
 
 @pytest.fixture  
 def simple_drone_state():
-    """Basic drone state for testing."""
+    """用于测试的基本无人机状态。"""
     return create_initial_drone_state(
         position=jnp.array([0.0, 0.0, 1.0]),
         velocity=jnp.array([0.0, 0.0, 0.0]),
-        hover_initialization=True  # Use smart initialization for better hovering
+        hover_initialization=True  # 使用智能初始化以获得更好的悬停效果
     )
 
 
 @pytest.fixture
 def multi_agent_state():
-    """Multi-agent state with 4 drones."""
+    """包含4台无人机的多代理状态。"""
     positions = jnp.array([
         [0.0, 0.0, 1.0],
         [1.0, 0.0, 1.0], 
@@ -69,27 +69,27 @@ def multi_agent_state():
 
 
 class TestBasicPhysicsFunctionality:
-    """Test suite for basic physics engine functionality."""
+    """基本物理引擎功能性的测试套件。"""
     
     def test_drone_state_creation(self):
-        """Verify drone state initialization is correct."""
+        """验证无人机状态初始化是否正确。"""
         position = jnp.array([1.0, 2.0, 3.0])
         velocity = jnp.array([0.1, 0.2, 0.3])
         
-        # Test with zero initialization
+        # 使用零初始化进行测试
         state = create_initial_drone_state(position, velocity, hover_initialization=False)
         
-        # Verify position and velocity
+        # 验证位置和速度
         assert jnp.allclose(state.position, position)
         assert jnp.allclose(state.velocity, velocity)
         assert state.mass == 0.027
         assert state.time == 0.0
         
-        # Verify thrust history initialization (should be zeros when hover_initialization=False)
+        # 验证推力历史初始化（当hover_initialization=False时应为零）
         expected_thrust_history = jnp.zeros((3, 3))
         assert jnp.allclose(state.thrust_history, expected_thrust_history)
         
-        # Test with hover initialization
+        # 使用悬停初始化进行测试
         hover_state = create_initial_drone_state(position, velocity, hover_initialization=True)
         params = PhysicsParams()
         expected_hover_thrust = jnp.array([0.0, 0.0, 1.0 / params.thrust_to_weight])
@@ -97,7 +97,7 @@ class TestBasicPhysicsFunctionality:
         assert jnp.allclose(hover_state.thrust_history, expected_hover_history)
     
     def test_physics_params_defaults(self, default_params):
-        """Verify default physics parameters are reasonable."""
+        """验证默认物理参数是否合理。"""
         params = default_params
         
         assert params.dt > 0

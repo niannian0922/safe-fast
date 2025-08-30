@@ -1,15 +1,15 @@
 """
-Complete System Integration Tests - Stage 4
+完整系统集成测试 - 第四阶段
 
-This comprehensive test suite validates the entire Safe Agile Flight system:
-1. Full system initialization and component integration
-2. End-to-end BPTT training loop validation  
-3. Multi-objective loss function computation
-4. Gradient flow through all components (GNN -> Policy -> Safety -> Physics)
-5. Training stability and convergence validation
-6. Memory optimization and JIT compilation verification
+这个综合测试套件验证整个安全敏捷飞行系统：
+1. 完整系统初始化和组件集成
+2. 端到端BPTT训练循环验证  
+3. 多目标损失函数计算
+4. 通过所有组件的梯度流（GNN -> 策略 -> 安全 -> 物理）
+5. 训练稳定性和收敛性验证
+6. 内存优化和JIT编译验证
 
-Objective: Ensure the complete Stage 4 system is ready for production training.
+目标：确保完整的第四阶段系统准备好进行生产训练。
 """
 
 import sys
@@ -25,11 +25,11 @@ import pytest
 import warnings
 from typing import Dict, Tuple
 
-# Configure JAX for testing
+# 配置JAX用于测试
 jax.config.update("jax_enable_x64", True)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# Import all system components
+# 导入所有系统组件
 from configs.default_config import get_minimal_config, get_config
 from core.physics import (
     DroneState, PhysicsParams, dynamics_step, dynamics_step_jit,
@@ -55,16 +55,16 @@ from core.training import (
 
 
 def test_system_initialization():
-    """Test complete system component initialization"""
+    """测试完整系统组件初始化"""
     print("=' Testing System Initialization...")
     
     config = get_minimal_config()
     
-    # Test physics parameters creation
+    # 测试物理参数创建
     physics_params = PhysicsParams(
         dt=config.physics.dt,
         mass=config.physics.drone.mass,
-        thrust_to_weight=config.physics.drone.thrust_to_weight_ratio,  # Fixed parameter name
+        thrust_to_weight=config.physics.drone.thrust_to_weight_ratio,  # 固定参数名
         drag_coefficient=config.physics.drone.drag_coefficient
     )
     
@@ -72,15 +72,15 @@ def test_system_initialization():
     assert physics_params.mass > 0
     print(" Physics parameters initialized")
     
-    # Test perception module initialization
+    # 测试感知模块初始化
     gnn_perception = create_default_perception_module()
     assert gnn_perception is not None
     print(" Perception module initialized")
     
-    # Test policy network initialization
+    # 测试策略网络初始化
     policy_params = PolicyParams(
-        hidden_dims=(64, 64),  # Smaller for testing
-        use_rnn=False  # Disable RNN for simpler testing
+        hidden_dims=(64, 64),  # 测试用较小规模
+        use_rnn=False  # 为简化测试禁用RNN
     )
     
     policy_network = create_policy_network(
@@ -91,7 +91,7 @@ def test_system_initialization():
     assert policy_network is not None
     print(" Policy network initialized")
     
-    # Test safety layer initialization
+    # 测试安全层初始化
     safety_config = SafetyConfig(
         max_thrust=config.safety.max_thrust if hasattr(config.safety, 'max_thrust') else 0.8,
         max_torque=config.safety.max_torque if hasattr(config.safety, 'max_torque') else 0.5,
@@ -106,14 +106,14 @@ def test_system_initialization():
 
 
 def test_parameter_initialization():
-    """Test neural network parameter initialization"""
+    """测试神经网络参数初始化"""
     print(">� Testing Parameter Initialization...")
     
     config = get_minimal_config()
     key = random.PRNGKey(42)
     gnn_key, policy_key = random.split(key, 2)
     
-    # Initialize perception module parameters
+    # 初始化感知模块参数
     gnn_perception = create_default_perception_module()
     dummy_state = create_initial_drone_state(jnp.array([0.0, 0.0, 1.0]))
     dummy_pointcloud = random.normal(gnn_key, (10, 3)) * 2.0
@@ -135,7 +135,7 @@ def test_parameter_initialization():
     assert param_count > 0
     print(f" GNN parameters: {param_count} parameters")
     
-    # Initialize policy parameters
+    # 初始化策略参数
     policy_params = PolicyParams(
         hidden_dims=(64, 64),
         use_rnn=False
@@ -162,17 +162,17 @@ def test_parameter_initialization():
 
 
 def test_forward_pass_components():
-    """Test forward pass through individual components"""
+    """测试通过各个组件的前向传播"""
     print("� Testing Forward Pass Components...")
     
     config = get_minimal_config()
     key = random.PRNGKey(123)
     
-    # Setup test data
+    # 设置测试数据
     dummy_state = create_initial_drone_state(jnp.array([0.0, 0.0, 1.0]))
     dummy_pointcloud = random.normal(key, (15, 3)) * 2.0
     
-    # Test perception forward pass
+    # 测试感知前向传播
     gnn_perception = create_default_perception_module()
     gnn_key, policy_key, test_key = random.split(key, 3)
     
@@ -193,7 +193,7 @@ def test_forward_pass_components():
     assert jnp.isfinite(cbf_value)
     print(f" GNN forward pass: CBF = {cbf_value:.4f}")
     
-    # Test policy forward pass
+    # 测试策略前向传播
     policy_params = PolicyParams(
         hidden_dims=(64, 64),
         use_rnn=False
@@ -245,16 +245,16 @@ def test_forward_pass_components():
 
 
 def test_end_to_end_gradient_flow():
-    """Test end-to-end gradient computation through all components"""
+    """测试通过所有组件的端到端梯度计算"""
     print(">� Testing End-to-End Gradient Flow...")
     
     config = get_minimal_config()
     key = random.PRNGKey(456)
     
-    # Create simplified integrated system for gradient testing
+    # 为梯度测试创建简化的集成系统
     def simplified_system_loss(params_dict, initial_state, pointcloud, target_pos):
-        """Simplified system for gradient testing"""
-        # Perception: CBF from pointcloud
+        """用于梯度测试的简化系统"""
+        # 感知：从点云计算CBF
         perception_state = PerceptionDroneState(
             position=initial_state.position,
             velocity=initial_state.velocity,
@@ -265,7 +265,7 @@ def test_end_to_end_gradient_flow():
         graph = pointcloud_to_graph(perception_state, pointcloud, k_neighbors=3)
         cbf_value = params_dict['gnn_perception'].apply(params_dict['gnn_params'], graph)
         
-        # Policy: Generate nominal control
+        # 策略：生成名义控制
         policy_input = jnp.concatenate([
             initial_state.position, initial_state.velocity,
             initial_state.orientation.flatten(),
@@ -276,11 +276,11 @@ def test_end_to_end_gradient_flow():
             params_dict['policy_params'], policy_input, None
         )
         
-        # Safety: Filter control (simplified)
-        cbf_grad = jnp.array([1.0, 0.0, 0.0])  # Simplified gradient
-        u_safe = jnp.clip(u_nom, -0.5, 0.5)  # Simplified safety filter
+        # 安全：控制过滤（简化）
+        cbf_grad = jnp.array([1.0, 0.0, 0.0])  # 简化的梯度
+        u_safe = jnp.clip(u_nom, -0.5, 0.5)  # 简化的安全过滤器
         
-        # Physics: One step simulation
+        # 物理：单步仿真
         physics_params = PhysicsParams(
             dt=config.physics.dt,
             mass=config.physics.drone.mass,
@@ -290,7 +290,7 @@ def test_end_to_end_gradient_flow():
         
         next_state = dynamics_step(initial_state, u_safe, physics_params)
         
-        # Loss: Distance to target
+        # 损失：到目标的距离
         distance_loss = jnp.sum((next_state.position - target_pos) ** 2)
         return distance_loss
     
@@ -382,7 +382,7 @@ def test_end_to_end_gradient_flow():
 
 
 def test_training_step_functionality():
-    """Test training step with optimizer updates"""
+    """测试带有优化器更新的训练步骤"""
     print("<� Testing Training Step Functionality...")
     
     config = get_minimal_config()
@@ -511,21 +511,21 @@ def test_training_step_functionality():
 
 
 def test_memory_optimization():
-    """Test memory usage with different sequence lengths"""
+    """测试不同序列长度下的内存使用情况"""
     print("=� Testing Memory Optimization...")
     
     config = get_minimal_config()
     
-    # Test with different sequence lengths to check memory scaling
+    # 测试不同序列长度以检查内存扩展
     sequence_lengths = [5, 10, 20]  # Keep reasonable for testing
     
     for seq_len in sequence_lengths:
         print(f"  Testing sequence length: {seq_len}")
         
-        # Create small system for memory testing
+        # 创建用于内存测试的小型系统
         key = random.PRNGKey(seq_len)  # Use different key for each test
         
-        # Simple physics simulation for memory test
+        # 用于内存测试的简单物理仿真
         def memory_test_simulation(seq_length):
             physics_params = PhysicsParams(
                 dt=config.physics.dt,
@@ -541,7 +541,7 @@ def test_memory_optimization():
                 new_state = dynamics_step(carry_state, control_input, physics_params)
                 return new_state, new_state.position
             
-            # Use lax.scan for memory-efficient computation
+            # 使用lax.scan进行内存高效计算
             final_state, trajectory = jax.lax.scan(
                 step_fn, state, controls
             )
@@ -565,13 +565,13 @@ def test_memory_optimization():
 
 
 def test_jit_compilation():
-    """Test JIT compilation of system components"""
+    """测试系统组件的JIT编译"""
     print("� Testing JIT Compilation...")
     
     config = get_minimal_config()
     key = random.PRNGKey(999)
     
-    # Test physics JIT
+    # 测试物理JIT
     physics_params = PhysicsParams(
         dt=config.physics.dt,
         mass=config.physics.drone.mass,
@@ -582,7 +582,7 @@ def test_jit_compilation():
     state = create_initial_drone_state(jnp.array([0.0, 0.0, 1.0]))
     control = jnp.array([0.1, 0.0, 0.2])
     
-    # Test normal vs JIT physics
+    # 测试正常与JIT物理
     normal_result = dynamics_step(state, control, physics_params)
     jit_result = dynamics_step_jit(state, control, physics_params)
     
@@ -590,7 +590,7 @@ def test_jit_compilation():
     assert position_diff < 1e-10
     print(" Physics JIT compilation matches normal execution")
     
-    # Test JIT compilation of combined operations
+    # 测试组合操作的JIT编译
     @jit
     def jit_multi_step_physics(initial_state, controls):
         def step_fn(carry_state, control_input):
@@ -628,7 +628,7 @@ def test_jit_compilation():
 
 
 def run_complete_system_tests():
-    """Run comprehensive system integration tests"""
+    """运行全面的系统集成测试"""
     print("=� COMPLETE SYSTEM INTEGRATION TESTS - STAGE 4")
     print("=" * 80)
     print("Validating the complete Safe Agile Flight system combining:")

@@ -1,8 +1,13 @@
 """
-结合GCBF+和DiffPhysDrone方法的安全敏捷飞行系统的默认配置。
+默认配置文件 - 阶段1 MVP配置管理
+基于GCBF+和DiffPhysDrone的深度代码分析和最佳实践设计
 
-此配置文件定义了统一基于JAX框架的所有超参数、模型设置和环境参数，
-该框架实现了带有可微分物理仿真的神经图控制屏障函数。
+本配置系统基于对以下源码库的完整分析：
+1. GCBF+ (MIT): GNN架构、CBF-QP求解、多智能体安全控制
+2. DiffPhysDrone (上海交大): 可微分物理学、时间梯度衰减、BPTT训练循环
+
+使用ml_collections进行超参数管理，实现代码与实验配置的完全分离
+这是保持研究可复现性和可扩展性的关键架构决策
 """
 
 import ml_collections
@@ -47,113 +52,113 @@ def get_config():
     # 控制约束
     config.physics.control = ml_collections.ConfigDict()
     config.physics.control.max_thrust = 0.8  # 标准化最大推力
-    config.physics.control.min_thrust = 0.0  # Normalized minimum thrust
-    config.physics.control.thrust_delay = 1.0/15.0  # Control delay (tau parameter)
-    config.physics.control.smoothing_factor = 12.0  # Exponential smoothing (lambda parameter)
+    config.physics.control.min_thrust = 0.0  # 标准化最小推力
+    config.physics.control.thrust_delay = 1.0/15.0  # 控制延迟（tau参数）
+    config.physics.control.smoothing_factor = 12.0  # 指数平滑（lambda参数）
     
-    # Temporal gradient decay (Critical DiffPhysDrone innovation)
+    # 时间梯度衰减（DiffPhysDrone的关键创新）
     config.physics.gradient_decay = ml_collections.ConfigDict()
     config.physics.gradient_decay.alpha = 0.92  # 时间梯度衰减
-    config.physics.gradient_decay.enable = True  # Enable gradient decay mechanism
+    config.physics.gradient_decay.enable = True  # 启用梯度衰减机制
     
     # =============================================================================
-    # GCBF+ CONFIGURATION (Neural Graph Control Barrier Functions)
+    # GCBF+ 配置（神经图控制障碍函数）
     # =============================================================================
     config.gcbf = ml_collections.ConfigDict()
     
-    # Graph construction parameters
-    config.gcbf.sensing_radius = 0.5  # R parameter for neighbor detection
-    config.gcbf.max_neighbors = 16  # M parameter for fixed-size neighborhoods
+    # 图构建参数
+    config.gcbf.sensing_radius = 0.5  # 邻居检测的R参数
+    config.gcbf.max_neighbors = 16  # 固定大小邻域的M参数
     config.gcbf.k_neighbors = 8  # KNN图构建
-    config.gcbf.graph_construction_method = "knn"  # "knn" or "radius"
+    config.gcbf.graph_construction_method = "knn"  # "knn"或"radius"
     
-    # CBF parameters
+    # CBF参数
     config.gcbf.alpha = 1.0  # CBF类K函数参数
-    config.gcbf.gamma = 0.02  # Margin parameter for strict inequalities
-    config.gcbf.look_ahead_horizon = 32  # T parameter for control invariant set computation
+    config.gcbf.gamma = 0.02  # 严格不等式的边界参数
+    config.gcbf.look_ahead_horizon = 32  # 控制不变集计算的T参数
     
-    # GNN architecture (from GCBF+ paper)
+    # GNN架构（来自GCBF+论文）
     config.gcbf.gnn = ml_collections.ConfigDict()
     config.gcbf.gnn.hidden_dims = [256, 256, 128]  # GNN架构
-    config.gcbf.gnn.output_dim = 1  # CBF scalar output
-    config.gcbf.gnn.activation = "relu"  # Activation function
-    config.gcbf.gnn.use_attention = True  # Graph attention mechanism
-    config.gcbf.gnn.attention_heads = 4  # Number of attention heads
-    config.gcbf.gnn.dropout_rate = 0.1  # Dropout for regularization
+    config.gcbf.gnn.output_dim = 1  # CBF标量输出
+    config.gcbf.gnn.activation = "relu"  # 激活函数
+    config.gcbf.gnn.use_attention = True  # 图注意力机制
+    config.gcbf.gnn.attention_heads = 4  # 注意力头数量
+    config.gcbf.gnn.dropout_rate = 0.1  # 正则化的Dropout
     
     # =============================================================================
-    # POLICY NETWORK CONFIGURATION 
+    # 策略网络配置 
     # =============================================================================
     config.policy = ml_collections.ConfigDict()
     
-    # Input/Output dimensions
+    # 输入/输出维度
     config.policy.input_dim = 13  # 3(pos) + 3(vel) + 9(orientation) + 3(angular_vel) - 5 = 13
     config.policy.output_dim = 3  # 3D control input
     
-    # Architecture
+    # 架构
     config.policy.type = "mlp_rnn"  # "mlp", "rnn", "mlp_rnn"
-    config.policy.hidden_dims = [256, 256]  # Hidden layer dimensions
-    config.policy.rnn_hidden_size = 256  # RNN hidden state size
+    config.policy.hidden_dims = [256, 256]  # 隐藏层维度
+    config.policy.rnn_hidden_size = 256  # RNN隐藏状态大小
     config.policy.rnn_type = "gru"  # "gru", "lstm"
-    config.policy.activation = "relu"  # Activation function
-    config.policy.output_activation = "tanh"  # Output activation for control
-    config.policy.use_rnn = False  # Enable RNN for memory
+    config.policy.activation = "relu"  # 激活函数
+    config.policy.output_activation = "tanh"  # 控制输出激活函数
+    config.policy.use_rnn = False  # 启用RNN内存
     
     # =============================================================================
-    # SAFETY LAYER CONFIGURATION (QP-based Safety Filter)
+    # 安全层配置（基于QP的安全过滤器）
     # =============================================================================
     config.safety = ml_collections.ConfigDict()
     
-    # Control limits
-    config.safety.max_thrust = 0.8  # Maximum thrust magnitude
-    config.safety.max_torque = 0.5  # Maximum torque magnitude
+    # 控制限制
+    config.safety.max_thrust = 0.8  # 最大推力大小
+    config.safety.max_torque = 0.5  # 最大力矩大小
     
-    # CBF parameters
-    config.safety.cbf_alpha = 1.0  # CBF alpha parameter
+    # CBF参数
+    config.safety.cbf_alpha = 1.0  # CBF alpha参数
     
-    #安全层配置 (qpax集成)
-    config.safety.solver = "qpax"  # Differentiable QP solver
-    config.safety.max_iterations = 100  # Maximum QP iterations
+    # 安全层配置 (qpax集成)
+    config.safety.solver = "qpax"  # 可微分QP求解器
+    config.safety.max_iterations = 100  # 最大QP迭代次数
     config.safety.tolerance = 1e-6  # 松弛变量惩罚
-    config.safety.regularization = 1e-8  # Regularization parameter
+    config.safety.regularization = 1e-8  # 正则化参数
     
-    # Three-layer safety mechanism parameters
-    config.safety.relaxation_penalty = 1e6  # Beta parameter for slack variables
-    config.safety.failsafe_mode = "emergency_brake"  # Failsafe strategy
-    config.safety.enable_backoff = True  # Enable automatic backoff mechanism
+    # 三层安全机制参数
+    config.safety.relaxation_penalty = 1e6  # 松弛变量的Beta参数
+    config.safety.failsafe_mode = "emergency_brake"  # 故障安全策略
+    config.safety.enable_backoff = True  # 启用自动退出机制
     
-    # Training configuration with performance optimization
+    # 带性能优化的训练配置
     config.training = ml_collections.ConfigDict()
     
-    # Optimized learning rates (from performance tuning research)
+    # 优化的学习率（来自性能调优研究）
     config.training.optimizer = "adam"
-    config.training.learning_rate = 1e-4  # Base learning rate (optimized)
+    config.training.learning_rate = 1e-4  # 基础学习率（已优化）
     config.training.learning_rate_gcbf = 5e-5  # GNN稳定性
     config.training.learning_rate_policy = 2e-4  # 策略收敛
-    config.training.batch_size = 32  # Optimized batch size for memory/performance
+    config.training.batch_size = 32  # 优化的批次大小（内存/性能平衡）
     config.training.sequence_length = 25  # BPTT效率平衡
-    config.training.num_epochs = 100  # Extended for better convergence
-    config.training.batches_per_epoch = 20  # More iterations per epoch
+    config.training.num_epochs = 100  # 为更好收敛而扩展
+    config.training.batches_per_epoch = 20  # 每个训练轮次更多迭代
     config.training.validation_frequency = 5
     config.training.validation_batch_size = 16
     config.training.checkpoint_frequency = 10
     config.training.max_steps = 2000
     config.training.seed = 42
     
-    # Optimized loss function coefficients (empirically tuned)
-    config.training.loss_cbf_coef = 2.0  # Increased for safety emphasis
-    config.training.loss_velocity_coef = 1.0  # Balanced velocity tracking
-    config.training.loss_goal_coef = 3.0  # Strong goal-directed behavior  
-    config.training.loss_control_coef = 0.05  # Reduced control penalty
-    config.training.loss_collision_coef = 5.0  # High collision avoidance
-    config.training.loss_safety_coef = 2.5  # Enhanced safety importance
+    # 优化的损失函数系数（经验调优）
+    config.training.loss_cbf_coef = 2.0  # 提高安全重要性
+    config.training.loss_velocity_coef = 1.0  # 平衡的速度追踪
+    config.training.loss_goal_coef = 3.0  # 强目标导向行为  
+    config.training.loss_control_coef = 0.05  # 减少控制惩罚
+    config.training.loss_collision_coef = 5.0  # 高碑撞规避
+    config.training.loss_safety_coef = 2.5  # 增强安全重要性
     
-    # Advanced gradient handling
+    # 高级梯度处理
     config.training.gradient_clip_norm = 1.0
-    config.training.grad_decay_eta = 0.1  # Reduced for stability
-    config.training.use_gradient_checkpointing = True  # Memory optimization
+    config.training.grad_decay_eta = 0.1  # 为稳定性降低
+    config.training.use_gradient_checkpointing = True  # 内存优化
     
-    # Performance optimization features
+    # 性能优化功能
     config.training.performance_tuning = ml_collections.ConfigDict()
     config.training.performance_tuning.enable = True
     config.training.performance_tuning.adaptive_lr_schedule = "warmup_cosine"
@@ -162,67 +167,67 @@ def get_config():
     config.training.performance_tuning.decay_steps = 1500
     config.training.performance_tuning.weight_update_frequency = 50
     
-    # Curriculum learning (Three-stage approach)
+    # 课程学习（三阶段方法）
     config.training.curriculum = ml_collections.ConfigDict()
     config.training.curriculum.enable = True
-    config.training.curriculum.stage1_steps = 300  # Efficiency-first stage
-    config.training.curriculum.stage2_steps = 400  # Safety-aware stage  
-    config.training.curriculum.stage3_steps = 300  # Joint optimization
-    config.training.curriculum.annealing_start = 1e-6  # Initial relaxation penalty
-    config.training.curriculum.annealing_end = 1e6    # Final relaxation penalty
+    config.training.curriculum.stage1_steps = 300  # 效率优先阶段
+    config.training.curriculum.stage2_steps = 400  # 安全感知阶段  
+    config.training.curriculum.stage3_steps = 300  # 联合优化
+    config.training.curriculum.annealing_start = 1e-6  # 初始松弛惩罚
+    config.training.curriculum.annealing_end = 1e6    # 最终松弛惩罚
     
     # =============================================================================
-    # ENVIRONMENT CONFIGURATION
+    # 环境配置
     # =============================================================================
     config.env = ml_collections.ConfigDict()
     
-    # Multi-agent settings
-    config.env.num_agents = 8  # Number of agents (consistent with GCBF+ paper)
-    config.env.area_size = 4.0  # Environment side length
-    config.env.num_obstacles = 8  # Number of static obstacles
-    config.env.obstacle_types = ["sphere", "box", "cylinder"]  # Obstacle primitives
+    # 多代理设置
+    config.env.num_agents = 8  # 代理数量（与GCBF+论文一致）
+    config.env.area_size = 4.0  # 环境边长
+    config.env.num_obstacles = 8  # 静态障碍物数量
+    config.env.obstacle_types = ["sphere", "box", "cylinder"]  # 障碍物基元
     
-    # LiDAR configuration (for real-world deployment)
+    # LiDAR配置（用于现实世界部署）
     config.env.lidar = ml_collections.ConfigDict()
-    config.env.lidar.num_rays = 32  # Number of LiDAR rays
-    config.env.lidar.max_range = 2.0  # Maximum sensing range
-    config.env.lidar.angular_resolution = 360.0 / 32  # Angular resolution in degrees
+    config.env.lidar.num_rays = 32  # LiDAR光线数量
+    config.env.lidar.max_range = 2.0  # 最大传感距离
+    config.env.lidar.angular_resolution = 360.0 / 32  # 角度分辨率（度）
     
-    # Goal configuration
-    config.env.goal_tolerance = 0.1  # Goal reaching tolerance
-    config.env.max_episode_length = 150  # Maximum episode length
+    # 目标配置
+    config.env.goal_tolerance = 0.1  # 目标到达容差
+    config.env.max_episode_length = 150  # 最大幕集长度
     
     # =============================================================================
-    # EVALUATION AND LOGGING
+    # 评估和日志
     # =============================================================================
     config.evaluation = ml_collections.ConfigDict()
-    config.evaluation.eval_frequency = 100  # Evaluation frequency (training steps)
-    config.evaluation.num_eval_episodes = 5  # Episodes per evaluation
-    config.evaluation.success_threshold = 0.95  # Success rate threshold
-    config.evaluation.safety_threshold = 1.0   # Required safety rate
+    config.evaluation.eval_frequency = 100  # 评估频率（训练步数）
+    config.evaluation.num_eval_episodes = 5  # 每次评估的幕集数
+    config.evaluation.success_threshold = 0.95  # 成功率阈值
+    config.evaluation.safety_threshold = 1.0   # 要求的安全率
     
     config.logging = ml_collections.ConfigDict()
-    config.logging.wandb_project = "safe_agile_flight"  # Weights & Biases project
-    config.logging.log_frequency = 10  # Logging frequency
-    config.logging.save_frequency = 100  # Model checkpoint frequency
-    config.logging.video_logging = True  # Enable trajectory video logging
+    config.logging.wandb_project = "safe_agile_flight"  # Weights & Biases项目
+    config.logging.log_frequency = 10  # 日志频率
+    config.logging.save_frequency = 100  # 模型检查点频率
+    config.logging.video_logging = True  # 启用轨迹视频日志
     
     # =============================================================================
-    # COMPUTATIONAL OPTIMIZATION
+    # 计算优化
     # =============================================================================
     config.optimization = ml_collections.ConfigDict()
     
-    # JAX-specific optimizations
-    config.optimization.use_scan = True  # Use jax.lax.scan for BPTT
-    config.optimization.use_checkpoint = True  # Enable gradient checkpointing
+    # JAX特定优化
+    config.optimization.use_scan = True  # 为BPTT使用jax.lax.scan
+    config.optimization.use_checkpoint = True  # 启用梯度检查点
     config.optimization.checkpoint_strategy = "selective"  # "none", "all", "selective"
-    config.optimization.nested_checkpoint = False  # Enable nested checkpointing
+    config.optimization.nested_checkpoint = False  # 启用嵌套检查点
     
-    # Memory management
-    config.optimization.max_memory_usage = 0.8  # Maximum GPU memory fraction
-    config.optimization.clear_cache_frequency = 50  # JAX cache clearing frequency
+    # 内存管理
+    config.optimization.max_memory_usage = 0.8  # 最大GPU内存占用比
+    config.optimization.clear_cache_frequency = 50  # JAX缓存清理频率
     
-    # Experiment configuration
+    # 实验配置
     config.experiment_name = "safe_agile_flight_stage4"
     config.experiment_description = "Complete system integration with GCBF+ and DiffPhysDrone"
     
@@ -230,19 +235,19 @@ def get_config():
 
 
 def get_minimal_config():
-    """Returns a minimal configuration for testing and development."""
+    """返回用于测试和开发的最小配置。"""
     config = get_config()
     
-    # Reduce computational requirements for testing
+    # 降低测试的计算需求
     config.physics.max_steps = 50
     config.training.max_steps = 100
     config.training.batch_size = 8
-    config.training.sequence_length = 10  # Much shorter for testing memory
+    config.training.sequence_length = 10  # 测试内存的较短序列
     config.env.num_agents = 2
     config.gcbf.max_neighbors = 4
-    config.gcbf.k_neighbors = 3  # Smaller for testing
+    config.gcbf.k_neighbors = 3  # 测试用的较小值
     
-    # Disable expensive features for testing
+    # 禁用测试中的昂贵功能
     config.optimization.use_checkpoint = False
     config.logging.video_logging = False
     config.training.curriculum.enable = False
@@ -251,37 +256,37 @@ def get_minimal_config():
 
 
 def get_single_agent_config():
-    """Returns configuration for single-agent scenarios."""
+    """返回单代理场景的配置。"""
     config = get_config()
     
-    # Single agent modifications
+    # 单代理修改
     config.env.num_agents = 1
-    config.gcbf.max_neighbors = 8  # Only obstacles as neighbors
-    config.gcbf.k_neighbors = 6  # Reasonable for single agent
-    config.env.num_obstacles = 16  # Increase obstacle density
+    config.gcbf.max_neighbors = 8  # 仅障碍物作为邻居
+    config.gcbf.k_neighbors = 6  # 对单代理合理
+    config.env.num_obstacles = 16  # 增加障碍物密度
     
-    # Adjust training for single-agent case
-    config.training.loss_cbf_coef = 0.5  # Reduced CBF importance
+    # 调整单代理情况的训练
+    config.training.loss_cbf_coef = 0.5  # 降低CBF重要性
     config.training.batch_size = 32
     
     return config
 
 
 def get_hardware_config():
-    """Returns configuration optimized for hardware deployment."""
+    """返回为硬件部署优化的配置。"""
     config = get_config()
     
-    # Hardware-specific optimizations
-    config.system.precision = "float16"  # Reduce memory usage
-    config.optimization.use_checkpoint = True  # Memory efficiency
-    config.gcbf.gnn.hidden_dims = [128, 128, 64]  # Smaller network
-    config.policy.hidden_dims = [128, 128]  # Smaller policy network
+    # 硬件特定优化
+    config.system.precision = "float16"  # 减少内存使用
+    config.optimization.use_checkpoint = True  # 内存效率
+    config.gcbf.gnn.hidden_dims = [128, 128, 64]  # 较小网络
+    config.policy.hidden_dims = [128, 128]  # 较小策略网络
     
-    # Real-time constraints
-    config.physics.dt = 1.0/30.0  # Higher frequency for hardware
-    config.physics.max_steps = 100  # Shorter horizons
+    # 实时约束
+    config.physics.dt = 1.0/30.0  # 硬件的更高频率
+    config.physics.max_steps = 100  # 更短的时间范围
     
-    # Disable expensive logging for hardware
+    # 禁用硬件的昂贵日志
     config.logging.video_logging = False
     config.evaluation.num_eval_episodes = 1
     

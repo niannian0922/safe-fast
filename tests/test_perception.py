@@ -1,15 +1,15 @@
 """
-Unit tests for perception module (Stage 3 validation)
+感知模块的单元测试（第三阶段验证）
 
-This test suite validates:
-1. Point cloud to graph conversion functionality
-2. JIT compilation compatibility
-3. GNN-based CBF computation
-4. Gradient computation correctness
-5. Integration with JAX transformations
+此测试套件验证：
+1. 点云到图的转换功能
+2. JIT编译兼容性
+3. 基于GNN的CBF计算
+4. 梯度计算正确性
+5. 与JAX变换的集成
 
-Test focuses on verifying the core adaptation from GCBF+'s multi-agent
-neighbor discovery to single-agent LiDAR processing.
+测试重点验证从GCBF+的多智能体邻居发现
+到单智能体LiDAR处理的核心适配。
 """
 
 import sys
@@ -22,7 +22,7 @@ import jraph
 import pytest
 from jax import random, grad, jit
 
-# Import modules under test
+# 导入被测试的模块
 from core.perception import (
     DroneState, GraphConfig, 
     pointcloud_to_graph, 

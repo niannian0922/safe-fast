@@ -14,9 +14,6 @@
 - 来自gcbfplus/utils/graph.py的图构建
 - 来自gcbfplus/algo/module/cbf.py的CBF网络
 
-适配内容：
-- 多智能体邻居发现 -> 单智能体LiDAR处理
-- cvxpylayers -> qpax（在safety.py中处理）
 """
 
 import jax
@@ -161,8 +158,12 @@ def pointcloud_to_graph(drone_state: DroneState, point_cloud: jnp.ndarray, confi
         - Nodes 1~N: Obstacle nodes (LiDAR points) with position features
         - Edges: Spatial connectivity based on KNN
     """
-    # 1. Transform points to world frame
-    # point_cloud is in body frame, transform to world frame
+    # 世界坐标
+    # point_cloud是一个 (N, 3) 的矩阵，代表了 N 个在机体坐标系下的点
+    #drone_state.orientation.T: 这是旋转矩阵 R 的转置
+    #point_cloud.T: 为了利用矩阵乘法一次性高效地处理所有 N 个点，代码将 (N, 3) 的点云矩阵转置为 (3, N)
+    #(drone_state.orientation.T @ point_cloud.T)
+    #.T: 将旋转后的结果转置回 (N, 3) 的标准形状
     world_points = (drone_state.orientation.T @ point_cloud.T).T + drone_state.position
     
     # 2. Filter points by range (simplified approach)
@@ -317,28 +318,28 @@ class GNNLayer(nn.Module):
     def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
         def message(edge_feats, sender_feats, receiver_feats):
             """Message function - exact GCBF+ implementation"""
-            feats = jnp.concatenate([edge_feats, sender_feats, receiver_feats], axis=-1)
-            feats = self.msg_net_cls()(feats)
+            feats = jnp.concatenate([edge_feats, sender_feats, receiver_feats], axis=-1) #发送者节点的特征,接收者节点的特征,这条边本身的特征拼接在一起
+            feats = self.msg_net_cls()(feats)## 通过一个MLP处理
             feats = nn.Dense(self.msg_dim, kernel_init=default_nn_init())(feats)
             return feats
         
         def update(node_feats, msgs):
             """Node update function - exact GCBF+ implementation"""
-            feats = jnp.concatenate([node_feats, msgs], axis=-1)
-            feats = self.update_net_cls()(feats)
+            feats = jnp.concatenate([node_feats, msgs], axis=-1)#将节点自身的旧特征 node_feats 和聚合后的消息 msgs 拼接起来
+            feats = self.update_net_cls()(feats)#将这个组合向量送入 update_net_cls (另一个 MLP) 中
             feats = nn.Dense(self.out_dim, kernel_init=default_nn_init())(feats)
             return feats
             
         def aggregate(msgs, recv_idx, num_segments):
             """Attention-based aggregation - exact GCBF+ implementation"""
-            gate_feats = self.aggr_net_cls()(msgs)
-            gate_feats = nn.Dense(1, kernel_init=default_nn_init())(gate_feats).squeeze(-1)
+            gate_feats = self.aggr_net_cls()(msgs)#将每条消息传入一个“门控”网络 
+            gate_feats = nn.Dense(1, kernel_init=default_nn_init())(gate_feats).squeeze(-1)#计算出注意力分数
             
             # Segment softmax for attention weights
-            attn = jraph.segment_softmax(gate_feats, segment_ids=recv_idx, num_segments=num_segments)
+            attn = jraph.segment_softmax(gate_feats, segment_ids=recv_idx, num_segments=num_segments)#使用 jraph.segment_softmax 函数，将同一个接收者的所有消息的注意力分数进行 Softmax 归一化，得到最终的注意力权重 attn
             assert attn.shape[0] == msgs.shape[0]
             
-            # Weighted sum aggregation
+            # 使用 jraph.segment_sum 对 attn[:, None] * msgs加权后的消息进行求和，完成聚合。
             aggr_msg = jraph.segment_sum(
                 attn[:, None] * msgs, segment_ids=recv_idx, num_segments=num_segments
             )
@@ -397,10 +398,13 @@ class GNN(nn.Module):
         else:
             # For ego drone (node_type=0), return first node
             if node_type == 0 and n_type is not None:
-                return current_graph.nodes[:n_type]
+                # Ensure n_type is a concrete integer for slicing
+                n_type_concrete = int(n_type) if hasattr(n_type, '__len__') == False else 1
+                return current_graph.nodes[:n_type_concrete]
             # For obstacles (node_type=1), return remaining nodes  
             elif node_type == 1 and n_type is not None:
-                return current_graph.nodes[1:1+n_type] if current_graph.nodes.shape[0] > 1 else jnp.zeros((n_type, current_graph.nodes.shape[1]))
+                n_type_concrete = int(n_type) if hasattr(n_type, '__len__') == False else 1
+                return current_graph.nodes[1:1+n_type_concrete] if current_graph.nodes.shape[0] > 1 else jnp.zeros((n_type_concrete, current_graph.nodes.shape[1]))
             else:
                 return current_graph.nodes
 

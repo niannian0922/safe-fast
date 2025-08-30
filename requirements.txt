@@ -1,133 +1,133 @@
 # =============================================================================
-# CORE JAX DEPENDENCIES
+# JAX 核心依赖
 # =============================================================================
-# JAX ecosystem with version constraints for stability
+# JAX 生态系统，带版本约束确保稳定性
 jax>=0.4.20,<0.5.0
 jaxlib>=0.4.20,<0.5.0
 
-# JAX-MD for optional advanced graph operations (if needed later)
-# Note: Only install if planning to use advanced molecular dynamics features
+# JAX-MD 用于可选的高级图操作（如果后续需要的话）
+# 注意：仅在计划使用高级分子动力学功能时安装
 # jax-md>=0.2.7
 
 # =============================================================================
-# NEURAL NETWORK FRAMEWORKS
+# 神经网络框架
 # =============================================================================
-# Flax for neural networks with JAX (compatible with JAX 0.4.x)
+# Flax 用于 JAX 神经网络（兼容 JAX 0.4.x）
 flax>=0.7.4,<0.8.0
 
-# Optax for JAX-compatible optimizers  
+# Optax 提供 JAX 兼容的优化器  
 optax>=0.1.7,<0.2.0
 
-# Jraph for Graph Neural Networks
+# Jraph 用于图神经网络
 jraph>=0.0.6.dev0
 
 # =============================================================================
-# DIFFERENTIABLE QP SOLVER
+# 可微分二次规划求解器
 # =============================================================================
-# QPax for differentiable QP solving (core requirement)
+# QPax 用于可微分二次规划求解（核心需求）
 qpax>=0.0.3
 
 # =============================================================================
-# CONFIGURATION MANAGEMENT
+# 配置管理
 # =============================================================================
-# ML Collections for structured configs
+# ML Collections 用于结构化配置
 ml_collections>=0.1.1
 
-# OmegaConf as alternative/supplement to ml_collections
+# OmegaConf 作为 ml_collections 的替代/补充
 omegaconf>=2.3.0
 
 # =============================================================================
-# SCIENTIFIC COMPUTING CORE
+# 科学计算核心
 # =============================================================================
-# NumPy - stick to stable versions that work with JAX
+# NumPy - 坚持使用与 JAX 兼容的稳定版本
 numpy>=1.24.0,<1.27.0
 
-# SciPy for scientific computing
+# SciPy 用于科学计算
 scipy>=1.10.0,<1.12.0
 
 # =============================================================================
-# DATA HANDLING AND VISUALIZATION
+# 数据处理和可视化
 # =============================================================================
-# Matplotlib for plotting and visualization
+# Matplotlib 用于绘图和可视化
 matplotlib>=3.6.0
 
-# Seaborn for statistical visualization
+# Seaborn 用于统计可视化
 seaborn>=0.12.0
 
-# Pandas for data manipulation
+# Pandas 用于数据处理
 pandas>=1.5.0
 
-# TQDM for progress bars
+# TQDM 用于进度条显示
 tqdm>=4.64.0
 
 # =============================================================================
-# TESTING AND DEVELOPMENT TOOLS
+# 测试和开发工具
 # =============================================================================
-# Pytest for testing framework
+# Pytest 测试框架
 pytest>=7.0.0
 pytest-cov>=4.0.0
 
-# Code formatting and linting
+# 代码格式化和检查
 black>=22.0.0
 isort>=5.10.0
 
 # =============================================================================
-# LOGGING AND EXPERIMENT TRACKING
+# 日志记录和实验追踪
 # =============================================================================
-# TensorBoard for logging
+# TensorBoard 用于日志记录
 tensorboard>=2.10.0
 
-# Weights & Biases for experiment tracking  
+# Weights & Biases 用于实验追踪  
 wandb>=0.13.0
 
 # =============================================================================
-# FILE I/O AND SERIALIZATION
+# 文件输入输出和序列化
 # =============================================================================
-# HDF5 support
+# HDF5 支持
 h5py>=3.7.0
 
-# NOTE: pickle5 removed - Python 3.8+ includes pickle protocol 5 natively
-# The pickle5 package is only needed for Python < 3.8
-# Since we're using modern Python, native pickle module is sufficient
+# 注意：已移除 pickle5 - Python 3.8+ 原生包含 pickle protocol 5
+# pickle5 包仅在 Python < 3.8 时需要
+# 由于我们使用现代 Python，原生 pickle 模块就足够了
 
 # =============================================================================
-# UTILITIES
+# 实用工具
 # =============================================================================
-# Click for CLI interfaces
+# Click 用于命令行界面
 click>=8.1.0
 
-# Rich for beautiful terminal output
+# Rich 用于美化终端输出
 rich>=12.0.0
 
-# Chex for JAX testing utilities
+# Chex 用于 JAX 测试工具
 chex>=0.1.7
 
-# PSUtil for system memory monitoring
+# PSUtil 用于系统内存监控
 psutil>=5.9.0
 
 # =============================================================================
-# OPTIONAL DEPENDENCIES FOR ENHANCED FEATURES
+# 增强功能的可选依赖
 # =============================================================================
-# Uncomment these if you plan to use advanced features:
+# 如果计划使用高级功能，请取消这些注释：
 
-# For advanced 3D rendering (if needed for complex visualization)
+# 用于高级3D渲染（如果需要复杂可视化）
 # trimesh>=3.21.0
 # pyrender>=0.1.45
 
-# For additional math utilities
+# 用于额外的数学工具
 # jaxopt>=0.6.0
 
-# For advanced optimization algorithms
-# optuna>=3.0.0  # For hyperparameter optimization
+# 用于高级优化算法
+# optuna>=3.0.0  # 超参数优化
 
 # =============================================================================
-# PLATFORM-SPECIFIC NOTES
+# 平台相关说明
 # =============================================================================
-# Windows users: Ensure Visual Studio Build Tools are installed
-# macOS users: Ensure Xcode command line tools are installed  
-# Linux users: Ensure build-essential is installed
+# Windows 用户：确保安装了 Visual Studio Build Tools
+# macOS 用户：确保安装了 Xcode command line tools  
+# Linux 用户：确保安装了 build-essential
 
-# If you encounter CUDA issues with jaxlib:
+# 如果遇到 jaxlib 的 CUDA 问题：
 # pip install "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-# or for CUDA 12:
+# 或者对于 CUDA 12：
 # pip install "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html

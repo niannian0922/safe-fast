@@ -91,7 +91,7 @@ class SafetyLayer:
         关键见解是CBF约束只关心位置演化。
         """
         # 成本函数：最小化||u - u_nom||^2带数值稳定性
-        Q = 2.0 * jnp.eye(3) + self.config.regularization * jnp.eye(3)
+        Q = 2.0 * jnp.eye(3) + self.config.regularization * jnp.eye(3)#2I（一个对角线为2的3x3矩阵）
         q = -2.0 * u_nom
         
         # 对于仅位置CBF，我们只需要位置动力学：
@@ -197,28 +197,26 @@ class SafetyLayer:
                 target_kappa=1e-3     # Gradient smoothing for differentiability
             )
             
-            # For feasibility checking, we can use a simple constraint satisfaction check
-            # Check if Gx <= h is satisfied (with small tolerance for numerical errors)
+    
             constraint_violations = G @ solution - h_constraint
             max_violation = jnp.max(constraint_violations)
             is_feasible = max_violation <= self.config.tolerance * 10  # Allow some numerical tolerance
             
             # Use jnp.where for differentiable fallback
-            u_safe = jnp.where(is_feasible, solution, u_nom)
+            u_safe = jnp.where(is_feasible, solution, u_nom)#无论 is_feasible 是 True 还是 False，梯度都可以同时沿着计算 solution 和 u_nom 的路径回传。JAX 会处理好如何根据条件来正确地组合梯度。这避免了 if 语句带来的梯度中断问题。
             
             return QSolutionInfo(
                 u_safe=u_safe,
                 is_feasible=is_feasible,
                 solver_status=0 if is_feasible else 1,
                 slack_violation=jnp.maximum(max_violation, 0.0),
-                num_iterations=-1  # qpax.solve_qp_primal doesn't return iteration count
+                num_iterations=-1  
             )
             
         except Exception as e:
-            # Solver failed - return nominal control with penalty signal
-            # Use a small perturbation to maintain gradient flow instead of direct assignment
-            u_safe = u_nom + 1e-8 * jnp.ones_like(u_nom)  # Small perturbation for gradient flow
             
+            u_safe = u_nom + 1e-8 * jnp.ones_like(u_nom)  # 通过返回 u_nom 加上一个极小的扰动，我们确保了 u_safe 在计算上仍然直接依赖于 u_nom。这样，即使求解器失败，损失函数关于 u_safe 的梯度，仍然能够通过这条微弱的连接，回传到 u_nom，进而更新策略网络。这是一个保证端到端训练鲁棒性的关键技巧。
+            #保持梯度流。
             return QSolutionInfo(
                 u_safe=u_safe,
                 is_feasible=False,
@@ -287,30 +285,28 @@ class SafetyLayer:
 
     def _emergency_brake(self, drone_state: DroneState) -> chex.Array:
         """Emergency braking control (Layer 3)"""
-        velocity_magnitude = jnp.linalg.norm(drone_state.velocity)
+        velocity_magnitude = jnp.linalg.norm(drone_state.velocity) #计算当前速度的大小。
         
-        # Fixed braking logic: apply force OPPOSITE to velocity direction
-        # brake_direction should be -velocity/|velocity| (pointing opposite to motion)
-        # emergency_brake_force should be POSITIVE (magnitude of braking force)
         brake_direction = jnp.where(
-            velocity_magnitude > 1e-6,
-            -drone_state.velocity / (velocity_magnitude + 1e-8),  # Opposite to velocity
-            jnp.array([0.0, 0.0, -1.0])  # Default downward direction when stationary
+            velocity_magnitude > 1e-6,#条件判断，检查无人机是否在运动
+            -drone_state.velocity / (velocity_magnitude + 1e-8),  # 如果在运动，就计算速度的反向单位向量。+ 1e-8 是为了防止除以零的数值稳定技巧。
+            jnp.array([0.0, 0.0, -1.0])  # 如果无人机已经静止，那么“反向刹车”没有意义。此时，代码选择施加一个向下的力，让它稳定地停留在原地或缓慢下降。
         )
         
-        # Apply positive braking force in the brake direction (opposite to velocity)
-        brake_magnitude = jnp.abs(self.config.emergency_brake_force)  # Ensure positive
+     
+        brake_magnitude = jnp.abs(self.config.emergency_brake_force)  # 确保配置中的制动力大小是一个正值
         
+        #根据无人机是否在运动，选择最终的控制指令。
         emergency_control = jnp.where(
             velocity_magnitude > 1e-6,
-            brake_magnitude * brake_direction,  # Positive force * opposite direction = braking
-            jnp.array([0.0, 0.0, -0.1])  # Gentle downward for hovering
+            brake_magnitude * brake_direction,  # 如果在运动，就将制动力大小 brake_magnitude 乘以制动方向 brake_direction
+            jnp.array([0.0, 0.0, -0.1])  # 静止，就施加一个微小的向下推力
         )
         
         emergency_control = jnp.clip(
             emergency_control, -self.config.max_thrust, self.config.max_thrust
         )
-        
+        #最后一步，确保这个计算出的紧急指令本身不会超过电机的物理极限
         return emergency_control
 
     def safety_filter(
@@ -379,17 +375,20 @@ def compute_safety_loss(
         loss_dict: 单个损失组件
     """
     # 松弛惩罚（鼓励可行解）
-    relaxation_loss = config.relaxation_penalty * jnp.maximum(0.0, solution_info.slack_violation)
+    relaxation_loss = config.relaxation_penalty * jnp.maximum(0.0, solution_info.slack_violation) # solution_info.slack_violation就是从第二层松弛 QP 解出的 δ 值
+    #jnp.maximum(0.0, ...) 确保了损失值是非负的（虽然 δ 本身已经被约束为非负，但这是一种安全的编程习惯）。然后将其乘以巨大的惩罚权重 config.relaxation_penalty (即 β)。
     
     # 失败惩罚（强烈阻止求解器失败）
     failure_penalty = jnp.where(
         solution_info.solver_status >= 2,
-        config.failure_penalty,
-        0.0
+        config.failure_penalty,#如果条件为真，损失值就是这个巨大的惩罚 P_fail
+        0.0#如果条件为假即 QP 正常求解，这部分损失就为零。
     )
     
+    #status=0 代表成功，status=1 代表不可行（但已由松弛QP处理），status=2 代表求解器失败，status=3 代表触发紧急制动。所以 >= 2 囊括了所有灾难性的失败情况。
+
     # 控制助力正则化
-    control_magnitude_loss = 0.01 * jnp.sum(solution_info.u_safe ** 2)
+    control_magnitude_loss = 0.01 * jnp.sum(solution_info.u_safe ** 2) #0.01 是硬编码的权重
     
     total_loss = relaxation_loss + failure_penalty + control_magnitude_loss
     
@@ -946,29 +945,28 @@ def projected_gradient_qp_solve(
         
         return x_clipped
     
-    # Initial point
+
     x = project_onto_feasible_set(x_init)
     
-    # Simplified projected gradient descent (fewer steps for training efficiency)
+    # 这是迭代循环
     for i in range(num_steps):
-        # Gradient of quadratic objective
+        # 计算二次目标函数在当前点 x 处的梯度
         grad = Q @ x + q
         
-        # Adaptive step size
         current_step_size = step_size / (1.0 + 0.1 * i)
         
-        # Gradient step
+        # 执行标准的梯度下降步
         x_new = x - current_step_size * grad
         
-        # Project back to feasible set
+        # 执行投影步，将走出边界的点拉回来
         x_new = project_onto_feasible_set(x_new)
         
-        x = x_new
+        x = x_new#在迭代指定步数后，返回最终的点作为 QP 问题的近似解
     
-    # Final projection
+    # 这是实现投影操作的函数。是一个简化的近似投影，它主要处理最重要的控制边界约束（通过 jnp.clip），并对其他约束的违反进行简单的缩放修复。一个精确的投影本身可能就是一个复杂的优化问题，这里的简化是为了保证计算速度。
     x = project_onto_feasible_set(x)
     
-    # Check feasibility (simple check)
+    
     final_violations = G @ x - h
     max_final_violation = jnp.max(final_violations)
     is_feasible = max_final_violation <= 1e-2  # More lenient for training
