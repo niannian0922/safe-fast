@@ -220,9 +220,8 @@ def create_spatial_temporal_decay_schedule(
     return adaptive_alpha
 
 
-# =============================================================================
 # 核心物理函数
-# =============================================================================
+
 
 def dynamics_step(
     state: DroneState, 
@@ -257,9 +256,7 @@ def dynamics_step(
     acc = state.acceleration
     thrust_prev = state.thrust_previous
     
-    # === DIFFPHYSDRONE控制平滑 ===
-    # 指数移动平均推力平滑（关键创新）
-    # 这实现了原论文中的控制延迟和平滑
+    # === DIFFPHYSDRONE控制平滑 指数移动平均推力平滑-这实现了原论文中的控制延迟和平滑
     
     # 输入饱和（标准化命令应在[-1, 1]范围内）
     saturated_input = jnp.tanh(control_input)  #tanh 是一个是完全可微且平滑的双曲正切函数，它能将任意输入的数值都“压”到 [-1, 1] 的范围内。
@@ -280,7 +277,7 @@ def dynamics_step(
         delay_factor * state.thrust_current
     )
     
-    # === 力计算 ===
+    # 力的计算
     # 将标准化推力转换为物理力
     thrust_force = actual_thrust * params.max_thrust_force
     
@@ -306,12 +303,12 @@ def dynamics_step(
     # 计算加速度
     new_acceleration = total_force / params.mass
     
-    # 半隐式欧拉积分（对刘性系统稳定）
+    # 半隐式欧拉积
     # 这遵循DiffPhysDrone的积分方案
     new_vel = vel + 0.5 * (acc + new_acceleration) * dt  # 梯形速度
     new_pos = pos + vel * dt + 0.5 * new_acceleration * dt**2  # 带加速度的位置
     
-    # === 物理约束 ===
+    # 物理约束
     # 平滑速度限制（可微分）
     vel_magnitude = jnp.linalg.norm(new_vel) #计算新速度的大小。
     vel_scale = jnp.minimum(1.0, params.velocity_limit / jnp.maximum(vel_magnitude, params.epsilon))
@@ -551,7 +548,10 @@ def create_initial_drone_state(
     if hover_initialization:
         # 计算悬停推力（平衡重力）
         params = PhysicsParams()
-        hover_thrust_magnitude = params.gravity_magnitude / params.thrust_to_weight_ratio
+        # 悬停时需要的推力：mass * gravity 
+        # 标准化为：(mass * gravity) / max_thrust_force = (mass * gravity) / (mass * thrust_to_weight_ratio * gravity)
+        # 简化为：1 / thrust_to_weight_ratio
+        hover_thrust_magnitude = 1.0 / params.thrust_to_weight_ratio
         hover_thrust = jnp.array([0.0, 0.0, hover_thrust_magnitude])
     else:
         hover_thrust = jnp.zeros(3)

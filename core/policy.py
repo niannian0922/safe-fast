@@ -149,9 +149,7 @@ class PolicyNetworkMLP(nn.Module):
         return control_output
 
 
-# =============================================================================
 # 循环策略网络（受DiffPhysDrone启发）卷积+循环混合架构
-# =============================================================================
 
 class PolicyNetworkRNN(nn.Module):
     """

@@ -1,18 +1,18 @@
 """
 安全敏捷飞行系统的感知模块
 
-本模块将GCBF+ GNN架构与LiDAR点云处理相集成，
-用于单智能体基于CBF的安全控制。
+这个模块的核心任务是把GCBF+的GNN架构和激光雷达（LiDAR）的点云处理流程结合起来，
+最终实现单个智能体基于控制屏障函数（CBF）的安全控制。
 
-关键组件：
-1. 点云到图的转换（pointcloud_to_graph）
-2. 基于GNN的CBF值和梯度计算
-3. 支持JIT编译的JAX原生实现
+主要干几件事：
+1. 点云到图的转换（pointcloud_to_graph函数）
+2. 用GNN来算出CBF的值和它的梯度
+3. 整个实现都是JAX原生的，天生就支持即时编译（JIT）
 
-来自GCBF+代码库的集成：
-- 来自gcbfplus/nn/gnn.py的GNN架构
-- 来自gcbfplus/utils/graph.py的图构建
-- 来自gcbfplus/algo/module/cbf.py的CBF网络
+我是怎么把GCBF+代码库里的东西整合进来的：
+- GNN的整体架构，是从gcbfplus/nn/gnn.py里借鉴的
+- 图的构建逻辑，参考了gcbfplus/utils/graph.py
+- CBF网络的具体实现，学习了gcbfplus/algo/module/cbf.py
 
 """
 
@@ -25,112 +25,112 @@ import functools as ft
 from typing import Tuple, Callable, Optional, NamedTuple
 from dataclasses import dataclass
 
-# JAX实用程序
+# 导入一些JAX的实用工具
 from jax import vmap, jit
 from jax.lax import top_k
 
 # =============================================================================
-# 数据结构
+# 定义一些数据结构
 # =============================================================================
 
-# 从physics模块导入DroneState以保持一致性
-from core.physics import DroneState
+# 为了保持队形一致，我们从physics模块里导入无人机的状态定义
+from core.physics import DroneState, create_initial_drone_state
 
 @dataclass(frozen=True)
 class GraphConfig:
-    """图构建参数"""
-    k_neighbors: int = 8  # KNN邻居数量
-    max_range: float = 5.0  # 最大传感范围
-    min_points: int = 10  # 最小点云大小
-    max_points: int = 1000  # 最大点云大小（用于内存控制）
-    ego_node_features: int = 10  # 自身节点特征维度
-    obstacle_node_features: int = 3  # 障碍物节点特征维度
-    edge_features: int = 4  # 边特征维度
+    """这个数据类用来存放构建图的时候要用到的所有参数。"""
+    k_neighbors: int = 8  # 用KNN算法时，找最近的8个邻居
+    max_range: float = 5.0  # 感知范围，只处理5米内的障碍物点
+    min_points: int = 10  # 点云太稀疏了也不行，至少得有10个点
+    max_points: int = 1000  # 点云太多了费内存，最多处理1000个点
+    ego_node_features: int = 10  # 代表无人机自己的那个节点的特征维度
+    obstacle_node_features: int = 3  # 代表障碍物点的节点的特征维度
+    edge_features: int = 4  # 连接节点之间的边的特征维度
 
 # =============================================================================
-# 点云到图的转换
+# 点云到图的转换逻辑
 # =============================================================================
 
 def compute_pairwise_distances(points1: jnp.ndarray, points2: jnp.ndarray) -> jnp.ndarray:
     """
-    计算两个点集之间的成对距离
-    支持vmap的JAX原生实现
+    这个函数用来算两堆点云里，每两个点之间的距离。
+    实现方式是纯JAX原生的，可以很方便地用vmap进行批处理。
     
-    参数：
-        points1: (N, 3) - 第一个点集
-        points2: (M, 3) - 第二个点集
+    传进来的参数：
+        points1: (N, 3) - 第一堆点
+        points2: (M, 3) - 第二堆点
     返回：
-        distances: (N, M) - 成对距离矩阵
+        distances: (N, M) - 一个距离矩阵
     """
-    # 向量化距离计算： ||p1 - p2||_2
-    diff = points1[:, None, :] - points2[None, :, :]  # (N, M, 3)
-    distances = jnp.linalg.norm(diff, axis=2)  # (N, M)
+    # 巧妙地利用广播机制来计算所有点对的差值向量：||p1 - p2||_2
+    diff = points1[:, None, :] - points2[None, :, :]  # 形状会变成 (N, M, 3)
+    distances = jnp.linalg.norm(diff, axis=2)  # 沿着最后一个维度求范数，得到距离矩阵 (N, M)
     return distances
 
 def filter_points_by_range(points: jnp.ndarray, drone_pos: jnp.ndarray, max_range: float) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    按与无人机的距离范围过滤点云
+    根据点云和无人机的距离，把太远的点给过滤掉。
     """
     distances = jnp.linalg.norm(points - drone_pos, axis=1)
     mask = distances <= max_range
-    # 使用jnp.where避免布尔索引问题
+    # 这里用jnp.where而不是直接用布尔索引，是为了JIT兼容性
     valid_indices = jnp.where(mask, size=points.shape[0], fill_value=0)[0]
     valid_points = points[valid_indices]
     return valid_points, mask
 
 def find_knn_edges(drone_pos: jnp.ndarray, obstacle_points: jnp.ndarray, k: int) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    为以自我为中心的图构建建立KNN边
-    具有固定大小输出的JAX/JIT兼容版本
+    为我们的“以自我为中心”的图找到K近邻的边。
+    这个版本是专门为JAX/JIT设计的，输出的数组大小是固定的。
     
-    参数：
-        drone_pos: (3,) - 无人机位置
-        obstacle_points: (N, 3) - 障碍物点云
-        k: KNN邻居数量（对于JIT编译必须是静态的）
+    传进来的参数：
+        drone_pos: (3,) - 无人机自己的位置
+        obstacle_points: (N, 3) - 周围障碍物的点云
+        k: KNN算法里的K，邻居数量（这个K必须是静态的，才能做JIT编译）
         
     返回：
-        senders: (fixed_size,) - 发送者节点索引（无效的用-1填充）
-        receivers: (fixed_size,) - 接收者节点索引（无效的用-1填充）
-        edge_features: (fixed_size, 4) - 边特征（无效的用零填充）
+        senders: (固定大小,) - 发出边的节点索引（无效边用-1填充）
+        receivers: (固定大小,) - 接收边的节点索引（无效边用-1填充）
+        edge_features: (固定大小, 4) - 边的特征（无效边用0填充）
     """
     n_obstacles = obstacle_points.shape[0]
-    n_total = n_obstacles + 1  # +1 for ego drone node
+    n_total = n_obstacles + 1  # 加上无人机自己这个节点
     
-    # 组合位置数组： [无人机, 障碍物1, 障碍物2, ...]
+    # 把无人机和障碍物的位置拼在一起，方便处理：[无人机, 障碍物1, 障碍物2, ...]
     all_positions = jnp.concatenate([drone_pos[None, :], obstacle_points], axis=0)
     
-    # 计算所有成对距离
+    # 计算所有节点之间的距离矩阵
     distances = compute_pairwise_distances(all_positions, all_positions)
     
-    # 遮罩对角线以排除自连接
+    # 把对角线（自己到自己）的距离设为无穷大，这样就不会跟自己连边了
     distances_masked = jnp.where(jnp.eye(n_total), jnp.inf, distances)
     
-    # 使用静态k值
-    k_use = min(k, n_total - 1)  # 静态计算
+    # K值需要是静态的
+    k_use = min(k, n_total - 1)
     
-    # 获取每个节点的k个最近邻居
+    # 对每个节点，找到离它最近的k_use个邻居
     _, top_k_indices = jax.vmap(lambda row: jax.lax.top_k(-row, k_use))(distances_masked)
     
-    # 创建固定大小的边数组
+    # 预先分配固定大小的数组来存储边
     max_edges = n_total * k_use
     
-    # 创建所有潜在的边（密集格式）
+    # 密集地创建出所有可能的边
     all_senders = jnp.repeat(jnp.arange(n_total), k_use)
     all_receivers = top_k_indices.flatten()
     
-    # 计算所有边特征
+    # 计算所有这些边的特征
     sender_positions = all_positions[all_senders]
     receiver_positions = all_positions[all_receivers]
     rel_positions = receiver_positions - sender_positions
     edge_distances = jnp.linalg.norm(rel_positions, axis=1, keepdims=True)
     all_edge_features = jnp.concatenate([edge_distances, rel_positions], axis=1)
     
-    # 创建有效性遮罩（但不用于索引）
-    # 如果发送者 != 接收者，则边有效
+    # 创建一个掩码来标记哪些边是有效的
+    # 只要发送方和接收方不是同一个节点，并且接收方索引有效，这条边就是有效的
     validity_mask = (all_senders != all_receivers) & (all_receivers < n_total)
     
-    # 不使用动态过滤，使用固定大小的数组并标记无效边
-    # 无效边将有发送者/接收者 = -1和零特征
+    # 我们不用动态大小的数组，而是用固定大小的数组，然后用特殊值来标记无效边
+    # 无效边的发送方/接收方索引是-1，特征是0
     final_senders = jnp.where(validity_mask, all_senders, -1)
     final_receivers = jnp.where(validity_mask, all_receivers, -1)
     final_features = jnp.where(validity_mask[:, None], all_edge_features, 0.0)
@@ -139,124 +139,123 @@ def find_knn_edges(drone_pos: jnp.ndarray, obstacle_points: jnp.ndarray, k: int)
 
 def pointcloud_to_graph(drone_state: DroneState, point_cloud: jnp.ndarray, config: GraphConfig) -> Tuple[jraph.GraphsTuple, jnp.ndarray]:
     """
-    将LiDAR点云转换为jraph.GraphsTuple以进行GNN处理
+    把LiDAR点云数据转换成jraph库能处理的图结构（GraphsTuple）。
     
-    这是从“GCBF+的多智能体邻居发现”到“单智能体LiDAR处理”的核心适配
-    （替换多智能体环境）。
+    这是我们项目的一个核心适配工作，把GCBF+里处理多个智能体的逻辑，
+    改造成了现在处理单个智能体和LiDAR点云的逻辑。
     
-    参数：
-        drone_state: 当前无人机状态
-        point_cloud: (N, 3) 无人机机体坐标系中的LiDAR点云
-        config: 图构建配置
+    传进来的参数：
+        drone_state: 无人机当前的状态
+        point_cloud: (N, 3) 的LiDAR点云，这些点是在无人机机体坐标系下的
+        config: 图构建的配置参数
     
     返回：
-        graph: jraph.GraphsTuple - GNN的图结构
-        node_types: 用于处理的节点类型数组
+        graph: 一个jraph.GraphsTuple对象，可以直接喂给GNN
+        node_types: 一个数组，用来区分哪个节点是无人机，哪些是障碍物
         
-    图结构：
-        - Node 0: Ego drone node with state features
-        - Nodes 1~N: Obstacle nodes (LiDAR points) with position features
-        - Edges: Spatial connectivity based on KNN
+    图的结构设计是这样的：
+        - 节点0: 代表无人机自己的节点，特征是无人机的状态信息
+        - 节点1到N: 代表障碍物的节点（就是LiDAR上的点），特征是它们的相对位置
+        - 边: 基于KNN算法，连接空间上相邻的节点
     """
-    # 世界坐标
-    # point_cloud是一个 (N, 3) 的矩阵，代表了 N 个在机体坐标系下的点
-    #drone_state.orientation.T: 这是旋转矩阵 R 的转置
-    #point_cloud.T: 为了利用矩阵乘法一次性高效地处理所有 N 个点，代码将 (N, 3) 的点云矩阵转置为 (3, N)
-    #(drone_state.orientation.T @ point_cloud.T)
-    #.T: 将旋转后的结果转置回 (N, 3) 的标准形状
+    # 首先，把机体坐标系下的点云转换到世界坐标系下
+    # point_cloud (N, 3) 是机体坐标系下的点
+    # drone_state.orientation.T 是旋转矩阵的转置
+    # point_cloud.T 是为了方便做矩阵乘法，把 (N, 3) 转置成 (3, N)
+    # (drone_state.orientation.T @ point_cloud.T).T 把旋转后的结果再转置回 (N, 3)
     world_points = (drone_state.orientation.T @ point_cloud.T).T + drone_state.position
     
-    # 2. Filter points by range (simplified approach)
+    # 2. 按距离过滤点云（这里用的是简化方法）
     distances = jnp.linalg.norm(world_points - drone_state.position, axis=1)
     valid_mask = distances <= config.max_range
     
-    # Use padding approach instead of filtering to avoid dynamic shapes
+    # 为了避免动态形状导致JIT编译失败，我们采用填充（padding）的策略
     n_total_points = world_points.shape[0]
-    valid_points = world_points  # Keep all points for now
+    valid_points = world_points  # 暂时保留所有点
     n_valid = n_total_points
     if n_valid < config.min_points:
-        # Pad with dummy points if too few
+        # 如果点太少，就用假的点（全零）来填充
         dummy_points = jnp.zeros((config.min_points, 3))
         valid_points = dummy_points
         n_valid = config.min_points
     elif n_valid > config.max_points:
-        # Subsample if too many points
-        key = jax.random.PRNGKey(0)  # Use proper JAX random API
+        # 如果点太多，就随机抽样一部分
+        key = jax.random.PRNGKey(0)  # 这里最好用一个动态的key
         indices = jax.random.choice(
             key, n_valid, (config.max_points,), replace=False
         )
         valid_points = valid_points[indices]
         n_valid = config.max_points
     
-    # 3. Construct node features
-    # Ego node features: [position(3), velocity(3), acceleration(3), forward_direction(1)]
-    # Simplified for point-mass model (no angular_velocity)
+    # 3. 构建节点的特征
+    # 无人机节点的特征: [位置(3), 速度(3), 加速度(3), 朝向(1)]
+    # 因为我们用的是点质量模型，所以角速度之类的就简化了
     ego_features = jnp.concatenate([
         drone_state.position,
         drone_state.velocity, 
         drone_state.acceleration,
-        jnp.array([0.0])  # Dummy forward direction for point mass
-    ])  # (10,) -> truncate to ego_node_features dimension
+        jnp.array([0.0])  # 点质量模型没有明确的朝向，用个假数据占位
+    ])  # 这是一个10维的特征向量，后面会根据配置截取
     ego_features = ego_features[:config.ego_node_features]
     
-    # Obstacle node features: relative position in drone body frame
+    # 障碍物节点的特征: 在无人机机体坐标系下的相对位置
     obstacle_features = (drone_state.orientation @ (valid_points - drone_state.position).T).T
-    obstacle_features = obstacle_features[:, :config.obstacle_node_features]  # Keep only x,y,z
+    obstacle_features = obstacle_features[:, :config.obstacle_node_features]  # 只保留x,y,z
     
-    # Combine all node features (pad ego features to match obstacle feature dimension)
+    # 把所有节点的特征拼在一起（需要先把无人机节点的特征填充到和障碍物节点一样的维度）
     ego_features_padded = jnp.pad(ego_features, (0, max(0, config.obstacle_node_features - len(ego_features))))[:config.obstacle_node_features]
     all_node_features = jnp.concatenate([
         ego_features_padded[None, :],  # (1, obstacle_node_features)
         obstacle_features  # (n_valid, obstacle_node_features)
     ], axis=0)
     
-    # 5. Build edges with fixed-size arrays
+    # 5. 用固定大小的数组来构建边
     senders, receivers, edge_features = find_knn_edges(
         drone_state.position, valid_points, config.k_neighbors
     )
     
-    # Filter out invalid edges (marked with -1) without dynamic slicing
+    # 过滤掉那些无效的边（就是被标记为-1的那些）
     valid_edge_mask = (senders >= 0) & (receivers >= 0)
     
-    # Count valid edges
+    # 统计一下有多少条有效的边
     n_valid_edges = jnp.sum(valid_edge_mask.astype(jnp.int32))
     
-    # For GraphsTuple, we'll use the full arrays but jraph can handle -1 indices
-    # The GNN will ignore edges with negative indices
+    # 在创建GraphsTuple的时候，我们还是用完整的数组，jraph库能很优雅地处理那些-1的索引
+    # GNN在计算时会自动忽略那些索引是负数的边
     
-    # 6. Node type classification
-    # 0 = ego drone, 1 = obstacle
+    # 6. 给节点分类
+    # 0 代表无人机自己, 1 代表障碍物
     node_types = jnp.concatenate([
-        jnp.array([0]),  # ego node
-        jnp.ones(n_valid)  # obstacle nodes
+        jnp.array([0]),  # 无人机节点
+        jnp.ones(n_valid)  # 障碍物节点
     ]).astype(jnp.int32)
     
-    # 7. Create GraphsTuple - use full arrays, jraph handles invalid edges gracefully
+    # 7. 创建GraphsTuple对象 - 注意我们用的是包含无效边的完整数组
     n_nodes = n_valid + 1
-    n_total_edges = len(senders)  # Include both valid and invalid edges
+    n_total_edges = len(senders)
     
     graph = jraph.GraphsTuple(
-        n_node=jnp.array([n_nodes]),  # Single graph
-        n_edge=jnp.array([n_total_edges]),  # Total edges (including invalid)
+        n_node=jnp.array([n_nodes]),  # 我们这里只处理一张图
+        n_edge=jnp.array([n_total_edges]),  # 总边数（包括无效的）
         nodes=all_node_features,  # (n_nodes, node_features)
         edges=edge_features,  # (n_total_edges, edge_features) 
-        globals=None,
-        senders=senders,  # (n_total_edges,) - includes -1 for invalid
-        receivers=receivers,  # (n_total_edges,) - includes -1 for invalid
+        globals=None, # 我们没有全局特征
+        senders=senders,  # (n_total_edges,) - 里面可能包含-1
+        receivers=receivers,  # (n_total_edges,) - 里面可能包含-1
     )
     
     return graph, node_types
 
 # =============================================================================  
-# GNN ARCHITECTURE (Based on GCBF+)
+# GNN 架构 (基本照搬GCBF+)
 # =============================================================================
 
 def default_nn_init():
-    """Default network initialization following GCBF+ convention"""
+    """这是GCBF+里默认的网络权重初始化方法，我们也跟着用。"""
     return nn.initializers.xavier_uniform()
 
 class MLP(nn.Module):
-    """Multi-layer perceptron from GCBF+ codebase"""
+    """这个是GCBF+代码库里的标准多层感知机（MLP）实现。"""
     hid_sizes: Tuple[int, ...]
     act: Callable = nn.relu
     act_final: bool = False
@@ -270,43 +269,43 @@ class MLP(nn.Module):
         return x
 
 class GNNUpdate(NamedTuple):
-    """Graph update functions following GCBF+ exact implementation pattern"""
+    """这个具名元组把GNN一次更新所需的三个核心函数打包在一起，完全遵循GCBF+的模式。"""
     message: Callable
     aggregate: Callable  
     update: Callable
     
     def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
-        """Apply GNN update step with safe indexing"""
-        # Allow both single graph (scalar n_node) and batched single graph ((1,) n_node)
-        assert graph.n_node.shape == tuple() or graph.n_node.shape == (1,), f"Expected single graph, got shape {graph.n_node.shape}"
+        """应用GNN的单步更新，同时做了安全的索引处理。"""
+        # 我们只处理单张图，所以做个断言检查一下
+        assert graph.n_node.shape == tuple() or graph.n_node.shape == (1,), f"期望单张图, 但输入的图n_node形状是 {graph.n_node.shape}"
         
-        # Safe indexing that handles -1 indices (invalid edges)
+        # 安全的索引函数，可以处理-1这样的无效索引
         def safe_get(array, indices):
             valid_mask = indices >= 0
-            safe_indices = jnp.where(valid_mask, indices, 0)  # Replace -1 with 0
+            safe_indices = jnp.where(valid_mask, indices, 0)  # 把-1换成0
             result = array[safe_indices]
-            # Zero out invalid entries
+            # 把无效位置的结果清零
             return jnp.where(valid_mask[:, None], result, 0.0)
         
-        # Extract node features for senders and receivers
+        # 提取发送方和接收方节点的特征
         node_feats_send = safe_get(graph.nodes, graph.senders)
         node_feats_recv = safe_get(graph.nodes, graph.receivers)
         
-        # Message passing
+        # 消息传递：计算每条边的消息
         edges = self.message(graph.edges, node_feats_send, node_feats_recv)
         
-        # Aggregate messages
+        # 消息聚合：把发往同一个节点的消息聚合起来
         aggr_msg = self.aggregate(edges, graph.receivers, graph.nodes.shape[0])
         
-        # Update nodes
+        # 节点更新：用聚合后的消息来更新节点自身的特征
         new_node_feats = self.update(graph.nodes, aggr_msg)
         
         return graph._replace(nodes=new_node_feats)
 
 class GNNLayer(nn.Module):
     """
-    Single GNN layer - EXACT replication of GCBF+ GNNLayer 
-    From gcbfplus/nn/gnn.py with JAX-native implementation
+    单个GNN层 - 这是对GCBF+里GNNLayer的精准复现。
+    代码逻辑源自 gcbfplus/nn/gnn.py，用JAX原生方式实现。
     """
     msg_net_cls: Callable
     aggr_net_cls: Callable
@@ -317,42 +316,47 @@ class GNNLayer(nn.Module):
     @nn.compact
     def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
         def message(edge_feats, sender_feats, receiver_feats):
-            """Message function - exact GCBF+ implementation"""
-            feats = jnp.concatenate([edge_feats, sender_feats, receiver_feats], axis=-1) #发送者节点的特征,接收者节点的特征,这条边本身的特征拼接在一起
-            feats = self.msg_net_cls()(feats)## 通过一个MLP处理
+            """消息函数 - 完全复刻GCBF+的实现。"""
+            # 把发送者节点、接收者节点和边本身的特征拼在一起
+            feats = jnp.concatenate([edge_feats, sender_feats, receiver_feats], axis=-1)
+            # 喂给一个MLP处理
+            feats = self.msg_net_cls()(feats)
             feats = nn.Dense(self.msg_dim, kernel_init=default_nn_init())(feats)
             return feats
         
         def update(node_feats, msgs):
-            """Node update function - exact GCBF+ implementation"""
-            feats = jnp.concatenate([node_feats, msgs], axis=-1)#将节点自身的旧特征 node_feats 和聚合后的消息 msgs 拼接起来
-            feats = self.update_net_cls()(feats)#将这个组合向量送入 update_net_cls (另一个 MLP) 中
+            """节点更新函数 - 完全复刻GCBF+的实现。"""
+            # 把节点自己旧的特征和聚合来的新消息拼在一起
+            feats = jnp.concatenate([node_feats, msgs], axis=-1)
+            # 喂给另一个MLP处理
+            feats = self.update_net_cls()(feats)
             feats = nn.Dense(self.out_dim, kernel_init=default_nn_init())(feats)
             return feats
             
         def aggregate(msgs, recv_idx, num_segments):
-            """Attention-based aggregation - exact GCBF+ implementation"""
-            gate_feats = self.aggr_net_cls()(msgs)#将每条消息传入一个“门控”网络 
-            gate_feats = nn.Dense(1, kernel_init=default_nn_init())(gate_feats).squeeze(-1)#计算出注意力分数
+            """基于注意力机制的聚合函数 - 完全复刻GCBF+的实现。"""
+            # 每条消息先进一个“门控”网络，算出注意力分数
+            gate_feats = self.aggr_net_cls()(msgs)
+            gate_feats = nn.Dense(1, kernel_init=default_nn_init())(gate_feats).squeeze(-1)
             
-            # Segment softmax for attention weights
-            attn = jraph.segment_softmax(gate_feats, segment_ids=recv_idx, num_segments=num_segments)#使用 jraph.segment_softmax 函数，将同一个接收者的所有消息的注意力分数进行 Softmax 归一化，得到最终的注意力权重 attn
+            # 对发往同一个节点的所有消息的注意力分数做Softmax归一化，得到权重
+            attn = jraph.segment_softmax(gate_feats, segment_ids=recv_idx, num_segments=num_segments)
             assert attn.shape[0] == msgs.shape[0]
             
-            # 使用 jraph.segment_sum 对 attn[:, None] * msgs加权后的消息进行求和，完成聚合。
+            # 用注意力权重对消息进行加权求和，完成聚合
             aggr_msg = jraph.segment_sum(
                 attn[:, None] * msgs, segment_ids=recv_idx, num_segments=num_segments
             )
             return aggr_msg
         
-        # Create update function and apply
+        # 把这三个函数打包成一个更新函数，然后应用到图上
         update_fn = GNNUpdate(message, aggregate, update)
         return update_fn(graph)
 
 class GNN(nn.Module):
     """
-    Multi-layer GNN - EXACT replication of GCBF+ GNN architecture
-    From gcbfplus/nn/gnn.py with support for single-agent adaptation
+    多层GNN - 完全复刻GCBF+的GNN架构。
+    代码逻辑源自 gcbfplus/nn/gnn.py，并做了适配以支持单智能体场景。
     """
     msg_dim: int = 128
     hid_size_msg: Tuple[int, ...] = (64, 64)
@@ -364,25 +368,25 @@ class GNN(nn.Module):
     @nn.compact  
     def __call__(self, graph: jraph.GraphsTuple, node_type: Optional[int] = None, n_type: Optional[int] = None) -> jnp.ndarray:
         """
-        Forward pass following GCBF+ exact implementation
+        前向传播过程，完全遵循GCBF+的实现。
         
-        Args:
-            graph: Input graph structure
-            node_type: Filter specific node type (0=ego, 1=obstacle)  
-            n_type: Number of nodes of specified type
+        参数:
+            graph: 输入的图结构
+            node_type: 可以用来筛选特定类型的节点 (0=无人机, 1=障碍物)  
+            n_type: 指定类型的节点有多少个
         """
         current_graph = graph
         
-        # Multi-layer GNN processing
+        # 堆叠多层GNN进行处理
         for i in range(self.n_layers):
             out_dim = self.out_dim if i == self.n_layers - 1 else self.msg_dim
             
-            # Create network classes using partial application (GCBF+ pattern)
+            # 用偏函数的方式来创建MLP网络，这是GCBF+里常用的模式
             msg_net = ft.partial(MLP, hid_sizes=self.hid_size_msg, act=nn.relu, act_final=False)
             attn_net = ft.partial(MLP, hid_sizes=self.hid_size_aggr, act=nn.relu, act_final=False)  
             update_net = ft.partial(MLP, hid_sizes=self.hid_size_update, act=nn.relu, act_final=False)
             
-            # Create and apply GNN layer
+            # 创建并应用一个GNN层
             gnn_layer = GNNLayer(
                 msg_net_cls=msg_net,
                 aggr_net_cls=attn_net,
@@ -392,16 +396,15 @@ class GNN(nn.Module):
             )
             current_graph = gnn_layer(current_graph)
             
-        # Return results based on node type filtering (GCBF+ compatibility)
+        # 根据节点类型来决定返回什么结果（为了和GCBF+兼容）
         if node_type is None:
             return current_graph.nodes
         else:
-            # For ego drone (node_type=0), return first node
+            # 如果要的是无人机节点 (node_type=0)，就返回第一个节点
             if node_type == 0 and n_type is not None:
-                # Ensure n_type is a concrete integer for slicing
                 n_type_concrete = int(n_type) if hasattr(n_type, '__len__') == False else 1
                 return current_graph.nodes[:n_type_concrete]
-            # For obstacles (node_type=1), return remaining nodes  
+            # 如果要的是障碍物节点 (node_type=1)，就返回剩下的节点  
             elif node_type == 1 and n_type is not None:
                 n_type_concrete = int(n_type) if hasattr(n_type, '__len__') == False else 1
                 return current_graph.nodes[1:1+n_type_concrete] if current_graph.nodes.shape[0] > 1 else jnp.zeros((n_type_concrete, current_graph.nodes.shape[1]))
@@ -410,16 +413,16 @@ class GNN(nn.Module):
 
 class CBFNet(nn.Module):
     """
-    CBF network - EXACT replication of GCBF+ CBF module
-    From gcbfplus/algo/module/cbf.py adapted for single-agent scenarios
+    CBF网络 - 完全复刻GCBF+的CBF模块。
+    代码逻辑源自 gcbfplus/algo/module/cbf.py，并为单智能体场景做了适配。
     """
-    # Graph neural network parameters (matching GCBF+ CBF defaults)
-    node_dim: int = 3  # Node feature dimension
-    edge_dim: int = 4  # Edge feature dimension  
-    n_agents: int = 1  # Single agent (ego drone)
+    # GNN的参数 (和GCBF+的CBF网络默认值保持一致)
+    node_dim: int = 3
+    edge_dim: int = 4  
+    n_agents: int = 1  # 我们是单智能体
     gnn_layers: int = 3
     
-    # GNN architecture parameters (GCBF+ defaults)
+    # GNN的架构参数 (GCBF+的默认值)
     msg_dim: int = 64
     hid_size_msg: Tuple[int, ...] = (64, 64)
     hid_size_aggr: Tuple[int, ...] = (64,)
@@ -428,46 +431,50 @@ class CBFNet(nn.Module):
     @nn.compact
     def __call__(self, graph: jraph.GraphsTuple, n_type: Optional[int] = None) -> jnp.ndarray:
         """
-        CBF computation following GCBF+ exact implementation
+        计算CBF值的过程，完全遵循GCBF+的实现。
         
-        Args:
-            graph: Input graph with drone and obstacle nodes
-            n_type: Number of agent nodes (should be 1 for single drone)
+        参数:
+            graph: 包含了无人机和障碍物节点的图
+            n_type: 智能体节点的数量 (对我们来说就是1)
         
-        Returns:
-            CBF value(s) for agent node(s)
+        返回:
+            智能体节点的CBF值
         """
-        # Create GNN following GCBF+ CBF parameters
+        # 创建一个和GCBF+里一样的GNN
         gnn = GNN(
             msg_dim=self.msg_dim,
             hid_size_msg=self.hid_size_msg,
             hid_size_aggr=self.hid_size_aggr, 
             hid_size_update=self.hid_size_update,
-            out_dim=self.msg_dim,  # Output same as message dimension
+            out_dim=self.msg_dim,
             n_layers=self.gnn_layers
         )
         
-        # Process graph and extract agent node features  
-        # node_type=0 means agent nodes (ego drone)
-        n_agents_actual = n_type if n_type is not None else self.n_agents
+        # 用GNN处理图，然后只提取出代表无人机的那个节点的特征
+        # node_type=0 代表的就是智能体节点
+        if n_type is not None:
+            if hasattr(n_type, 'shape') and n_type.shape:
+                n_agents_actual = jnp.sum(n_type == 0)
+            else:
+                n_agents_actual = n_type
+        else:
+            n_agents_actual = self.n_agents
+            
         agent_embeddings = gnn(graph, node_type=0, n_type=n_agents_actual)
         
-        # Final CBF head - single Dense layer (GCBF+ pattern)
+        # 最后接一个全连接层作为“CBF头”，输出最终的CBF值
         cbf_values = nn.Dense(1, kernel_init=default_nn_init())(agent_embeddings)
         
-        # For single agent, return scalar; for multi-agent, return vector
-        if n_agents_actual == 1:
-            return cbf_values.squeeze()  # Scalar output
-        else:
-            return cbf_values.squeeze(-1)  # Remove last dimension but keep batch
+        # 因为我们只有一个智能体，所以把维度压缩一下，直接返回一个标量
+        return cbf_values.squeeze()
 
 # =============================================================================
-# PERCEPTION MODULE
+# 感知模块的整体封装
 # =============================================================================
 
 class PerceptionModule:
     """
-    Complete perception pipeline for CBF computation
+    一个完整的感知流水线，用于计算CBF。
     """
     
     def __init__(self, config: GraphConfig):
@@ -476,96 +483,99 @@ class PerceptionModule:
         
     def get_cbf_and_gradients(self, params, drone_state: DroneState, point_cloud: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
-        Compute CBF value and gradients from point cloud input
+        从点云输入，计算出CBF值和它的梯度。
         
-        Args:
-            params: Network parameters
-            drone_state: Current drone state
-            point_cloud: LiDAR point cloud (N, 3)
+        参数:
+            params: 网络的权重
+            drone_state: 无人机当前的状态
+            point_cloud: LiDAR点云 (N, 3)
             
-        Returns:
-            cbf_value: CBF value (scalar)
-            cbf_gradients: CBF gradients w.r.t. drone position
+        返回:
+            cbf_value: CBF的值 (一个标量)
+            cbf_gradients: CBF关于无人机位置的梯度
         """
         def cbf_fn(state):
             graph, node_types = pointcloud_to_graph(state, point_cloud, self.config)
             return self.cbf_net.apply(params, graph, node_types)
         
-        # Compute CBF value
+        # 计算CBF的值
         cbf_value = cbf_fn(drone_state)
         
-        # Compute gradients w.r.t. drone position
-        grad_fn = jax.grad(lambda state: cbf_fn(state).sum())  # sum() for scalar output
+        # 计算关于无人机位置的梯度
+        grad_fn = jax.grad(lambda state: cbf_fn(state).sum())  # .sum()是为了确保输出是标量
         cbf_gradients = grad_fn(drone_state)
         
         return cbf_value, cbf_gradients
 
 # =============================================================================
-# JIT-COMPATIBLE WRAPPER FUNCTIONS
+# JIT兼容的函数封装
 # =============================================================================
 
-@ft.partial(jit, static_argnums=(2,))  # config is static
+@ft.partial(jit, static_argnums=(2,))  # config是静态参数
 def pointcloud_to_graph_jit(drone_state: DroneState, point_cloud: jnp.ndarray, config: GraphConfig) -> Tuple[jraph.GraphsTuple, jnp.ndarray]:
-    """JIT-compatible version of pointcloud_to_graph with static config"""
+    """JIT编译版本的pointcloud_to_graph函数，config必须是静态的。"""
     return pointcloud_to_graph(drone_state, point_cloud, config)
 
-@ft.partial(jit, static_argnums=(2,))  # k is static  
+@ft.partial(jit, static_argnums=(2,))  # k是静态参数
 def find_knn_edges_jit(drone_pos: jnp.ndarray, obstacle_points: jnp.ndarray, k: int) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """JIT-compatible version of find_knn_edges with static k"""
+    """JIT编译版本的find_knn_edges函数，k必须是静态的。"""
     return find_knn_edges(drone_pos, obstacle_points, k)
 
 # =============================================================================
-# FACTORY FUNCTIONS AND UTILITIES
+# 工厂函数和一些实用工具
 # =============================================================================
 
 def create_default_perception_module():
-    """Create perception module with default parameters"""
+    """用默认参数创建一个感知模块。"""
     config = GraphConfig()
     return PerceptionModule(config)
 
 def init_cbf_network(rng_key, input_graph: jraph.GraphsTuple, node_types: jnp.ndarray):
-    """Initialize CBF network parameters"""
+    """初始化CBF网络的参数。"""
     cbf_net = CBFNet()
-    return cbf_net.init(rng_key, input_graph, node_types)
+    # 从node_types数组里数一下有多少个智能体节点（类型为0的）
+    n_agents = int(jnp.sum(node_types == 0))
+    return cbf_net.init(rng_key, input_graph, n_agents)
 
-# Core function for integration with loop.py scan_function
+# 这个是给loop.py里的scan_function调用的核心函数
 @jit
 def get_cbf_from_pointcloud(params, drone_state: DroneState, point_cloud: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    Optimized function for CBF computation in training loop
-    Used by loop.py scan_function
-    JIT-compiled for performance
+    一个在训练循环中计算CBF的优化函数。
+    被loop.py里的scan_function调用，并且为了性能做了JIT编译。
     """
     config = GraphConfig()
     graph, node_types = pointcloud_to_graph(drone_state, point_cloud, config)
     
     cbf_net = CBFNet()
-    cbf_value = cbf_net.apply(params, graph, node_types)
+    # 统计智能体节点数量
+    n_agents = jnp.sum(node_types == 0)
+    cbf_value = cbf_net.apply(params, graph, n_agents)
     
-    # Compute gradients w.r.t. drone position (needed for QP constraints)
+    # 计算关于无人机位置的梯度（QP约束里要用）
     def cbf_wrt_position(pos):
-        # Add numerical stability checks
-        pos_clipped = jnp.clip(pos, -10.0, 10.0)  # Prevent extreme positions
+        # 加点数值稳定性检查
+        pos_clipped = jnp.clip(pos, -10.0, 10.0)  # 防止位置跑得太离谱
         
-        modified_state = DroneState(
+        modified_state = create_initial_drone_state(
             position=pos_clipped,
             velocity=drone_state.velocity,
-            orientation=drone_state.orientation,
-            angular_velocity=drone_state.angular_velocity
+            hover_initialization=False
         )
         graph_mod, node_types_mod = pointcloud_to_graph(modified_state, point_cloud, config)
-        cbf_raw = cbf_net.apply(params, graph_mod, node_types_mod)
+        n_agents_mod = jnp.sum(node_types_mod == 0)
+        cbf_raw = cbf_net.apply(params, graph_mod, n_agents_mod)
         
-        # Apply numerical stability: prevent extreme CBF values
+        # 再加点数值稳定性：把CBF的值也限制在一定范围内
         cbf_stable = jnp.clip(cbf_raw, -5.0, 5.0)
         return cbf_stable
     
-    # Compute gradients with clipping
+    # 计算梯度
     cbf_grad_raw = jax.grad(lambda pos: cbf_wrt_position(pos).sum())(drone_state.position)
     
-    # Apply gradient clipping for numerical stability
+    # 对梯度也做个裁剪，防止梯度爆炸
     grad_norm = jnp.linalg.norm(cbf_grad_raw)
-    max_grad_norm = 10.0  # Maximum allowed gradient norm
+    max_grad_norm = 10.0  # 梯度范数最大不允许超过10.0
     
     cbf_grad = jnp.where(
         grad_norm > max_grad_norm,
@@ -576,11 +586,11 @@ def get_cbf_from_pointcloud(params, drone_state: DroneState, point_cloud: jnp.nd
     return cbf_value, cbf_grad
 
 # =============================================================================
-# ADVANCED PERCEPTION MODULE WITH TEMPORAL CONSISTENCY
+# (高级功能) 带时序一致性的感知模块
 # =============================================================================
 
 class AdvancedPerceptionModule(PerceptionModule):
-    """Advanced perception module with temporal consistency and memory"""
+    """一个更高级的感知模块，考虑了时序上的连续性和记忆。"""
     
     def __init__(self, config: GraphConfig, use_temporal_smoothing: bool = True):
         super().__init__(config)
@@ -588,14 +598,14 @@ class AdvancedPerceptionModule(PerceptionModule):
         self.cbf_history = []
         self.max_history = 5
         
-        # Advanced CBF network with better architecture
+        # 用一个更强大的CBF网络架构
         self.cbf_net = AdvancedCBFNet(
-            gnn_msg_dim=256,  # Larger message dimension
+            gnn_msg_dim=256,         # 更大的消息维度
             gnn_out_dim=256,
-            gnn_layers=4,     # More layers for better representation
-            head_sizes=(512, 256, 128),  # Deeper MLP head
-            use_residual=True,
-            use_attention=True
+            gnn_layers=4,            # 更多的GNN层
+            head_sizes=(512, 256, 128), # 更深的MLP头
+            use_residual=True,       # 使用残差连接
+            use_attention=True       # 使用注意力机制
         )
     
     def get_cbf_and_gradients_with_history(
@@ -606,49 +616,49 @@ class AdvancedPerceptionModule(PerceptionModule):
         temporal_weight: float = 0.1
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
-        Compute CBF with temporal smoothing for stability
+        计算CBF，并用历史信息做平滑，让结果更稳定。
         
-        Args:
-            params: Network parameters
-            drone_state: Current drone state
-            point_cloud: LiDAR point cloud
-            temporal_weight: Weight for temporal smoothing
+        参数:
+            params: 网络权重
+            drone_state: 无人机状态
+            point_cloud: LiDAR点云
+            temporal_weight: 时间平滑的权重
             
-        Returns:
-            cbf_value: Temporally smoothed CBF value
-            cbf_gradients: CBF gradients w.r.t. drone position
+        返回:
+            cbf_value: 经过时间平滑的CBF值
+            cbf_gradients: 对应的梯度
         """
-        # Get current CBF value
+        # 先计算当前时刻的CBF值和梯度
         current_cbf, current_grad = self.get_cbf_and_gradients(
             params, drone_state, point_cloud
         )
         
         if not self.use_temporal_smoothing or len(self.cbf_history) == 0:
-            # No temporal smoothing or first computation
+            # 如果不启用时间平滑，或者这是第一次计算，就直接用当前值
             smoothed_cbf = current_cbf
             smoothed_grad = current_grad
         else:
-            # Apply exponential moving average for temporal consistency
+            # 用指数移动平均（EMA）来做平滑
             prev_cbf = self.cbf_history[-1]['cbf_value']
             prev_grad = self.cbf_history[-1]['cbf_grad']
             
             smoothed_cbf = (1 - temporal_weight) * prev_cbf + temporal_weight * current_cbf
             smoothed_grad = (1 - temporal_weight) * prev_grad + temporal_weight * current_grad
         
-        # Update history
+        # 把当前结果存入历史记录
         self.cbf_history.append({
             'cbf_value': current_cbf,
             'cbf_grad': current_grad
         })
         
-        # Limit history size
+        # 保持历史记录的长度
         if len(self.cbf_history) > self.max_history:
             self.cbf_history.pop(0)
         
         return smoothed_cbf, smoothed_grad
 
 class AdvancedCBFNet(nn.Module):
-    """Advanced CBF network with enhanced architecture from GCBF+ analysis"""
+    """一个更强大的CBF网络，架构上做了很多优化。"""
     
     gnn_msg_dim: int = 256
     gnn_out_dim: int = 256
@@ -660,7 +670,7 @@ class AdvancedCBFNet(nn.Module):
     
     @nn.compact
     def __call__(self, graph: jraph.GraphsTuple, node_types: jnp.ndarray, training: bool = False) -> jnp.ndarray:
-        # Enhanced GNN with residual connections
+        # 带残差连接的增强版GNN
         gnn = EnhancedGNN(
             msg_dim=self.gnn_msg_dim,
             out_dim=self.gnn_out_dim,
@@ -670,45 +680,45 @@ class AdvancedCBFNet(nn.Module):
             dropout_rate=self.dropout_rate if training else 0.0
         )
         
-        node_embeddings = gnn(graph, training=training)  # (n_nodes, gnn_out_dim)
+        node_embeddings = gnn(graph, training=training)
         
-        # Extract ego drone embedding (always at index 0)
+        # 提取出无人机自己的节点特征（总是在索引0的位置）
         ego_embedding = node_embeddings[0:1, :]
         
-        # Enhanced MLP head with residual connections and batch normalization
+        # 一个带残差连接和批标准化的增强版MLP头
         x = ego_embedding
         
         for i, features in enumerate(self.head_sizes):
             residual = x
             
-            # Dense layer
+            # 全连接层
             x = nn.Dense(features, kernel_init=nn.initializers.xavier_uniform())(x)
             
-            # Batch normalization for better training stability (only when training)
+            # 批标准化，让训练更稳定（只在训练时用）
             if training:
                 x = nn.BatchNorm(use_running_average=False)(x)
             
-            # Activation
-            x = nn.swish(x)  # Swish activation for better gradient flow
+            # Swish激活函数，据说梯度流更好
+            x = nn.swish(x)
             
-            # Dropout for regularization (only when training and rate > 0)
+            # Dropout正则化（也只在训练时用）
             if self.dropout_rate > 0 and training:
                 x = nn.Dropout(self.dropout_rate, deterministic=not training)(x)
             
-            # Residual connection if dimensions match
+            # 如果维度匹配，就加上残差连接
             if self.use_residual and residual.shape[-1] == features:
-                x = x + residual * 0.5  # Scaled residual connection
+                x = x + residual * 0.5
         
-        # Final CBF prediction layer
+        # 最终输出CBF值的预测层
         cbf_raw = nn.Dense(1, kernel_init=nn.initializers.xavier_uniform())(x)
         
-        # Use tanh activation to ensure bounded CBF values [-1, 1]
+        # 用tanh激活函数把CBF的值限制在[-1, 1]之间
         cbf_value = nn.tanh(cbf_raw)
         
-        return cbf_value.squeeze()  # Return scalar
+        return cbf_value.squeeze()
 
 class EnhancedGNN(nn.Module):
-    """Enhanced GNN with advanced features from GCBF+ architecture"""
+    """一个从架构上做了优化的GNN。"""
     
     msg_dim: int = 256
     out_dim: int = 256
@@ -722,13 +732,12 @@ class EnhancedGNN(nn.Module):
         current_graph = graph
         
         for i in range(self.n_layers):
-            # Progressive dimension scaling
             if i == self.n_layers - 1:
                 layer_out_dim = self.out_dim
             else:
                 layer_out_dim = self.msg_dim
             
-            # Enhanced GNN layer with attention and residual connections
+            # 创建一个增强版的GNN层
             layer = EnhancedGNNLayer(
                 msg_dim=self.msg_dim,
                 out_dim=layer_out_dim,
@@ -736,10 +745,10 @@ class EnhancedGNN(nn.Module):
                 dropout_rate=self.dropout_rate if training else 0.0
             )
             
-            # Apply layer
+            # 应用这一层
             new_graph = layer(current_graph, training=training)
             
-            # Residual connection for node features
+            # 加上节点的残差连接
             if (self.use_residual and 
                 current_graph.nodes.shape[-1] == new_graph.nodes.shape[-1]):
                 new_graph = new_graph._replace(
@@ -751,7 +760,7 @@ class EnhancedGNN(nn.Module):
         return current_graph.nodes
 
 class EnhancedGNNLayer(nn.Module):
-    """Enhanced GNN layer with attention mechanism from GCBF+ analysis"""
+    """一个带注意力机制的增强版GNN层。"""
     
     msg_dim: int
     out_dim: int
@@ -764,53 +773,44 @@ class EnhancedGNNLayer(nn.Module):
     @nn.compact
     def __call__(self, graph: jraph.GraphsTuple, training: bool = False) -> jraph.GraphsTuple:
         def enhanced_message_fn(edge_feats, sender_feats, receiver_feats):
-            """Enhanced message function with better feature processing"""
-            # Concatenate all features
+            """增强版的消息函数。"""
             feats = jnp.concatenate([edge_feats, sender_feats, receiver_feats], axis=-1)
             
-            # Multi-layer message processing
             x = feats
             for i, size in enumerate(self.hid_size_msg):
                 x = nn.Dense(size, kernel_init=nn.initializers.xavier_uniform())(x)
-                x = nn.swish(x)  # Better activation function
+                x = nn.swish(x)
                 
                 if self.dropout_rate > 0 and training:
                     x = nn.Dropout(self.dropout_rate, deterministic=not training)(x)
             
-            # Final message dimension
             messages = nn.Dense(self.msg_dim, kernel_init=nn.initializers.xavier_uniform())(x)
             return messages
         
         def enhanced_aggregate_fn(msgs, segment_ids, num_segments):
-            """Enhanced aggregation with learned attention weights"""
+            """带注意力机制的增强版聚合函数。"""
             if self.use_attention:
-                # Attention-based aggregation (from GCBF+ implementation)
                 gate_feats = MLP(self.hid_size_aggr, act=nn.swish)(msgs)
                 attention_scores = nn.Dense(1, kernel_init=nn.initializers.xavier_uniform())(gate_feats).squeeze(-1)
                 
-                # Apply softmax attention
                 attn_weights = jraph.segment_softmax(
                     attention_scores, segment_ids=segment_ids, num_segments=num_segments
                 )
                 
-                # Weighted aggregation
                 aggr_msg = jraph.segment_sum(
                     attn_weights[:, None] * msgs, 
                     segment_ids=segment_ids, 
                     num_segments=num_segments
                 )
             else:
-                # Simple mean aggregation
                 aggr_msg = jraph.segment_mean(msgs, segment_ids, num_segments)
             
             return aggr_msg
         
         def enhanced_update_fn(node_feats, aggr_msgs):
-            """Enhanced node update function"""
-            # Combine node features with aggregated messages
+            """增强版的节点更新函数。"""
             feats = jnp.concatenate([node_feats, aggr_msgs], axis=-1)
             
-            # Multi-layer update processing
             x = feats
             for i, size in enumerate(self.hid_size_update):
                 x = nn.Dense(size, kernel_init=nn.initializers.xavier_uniform())(x)
@@ -819,15 +819,14 @@ class EnhancedGNNLayer(nn.Module):
                 if self.dropout_rate > 0 and training:
                     x = nn.Dropout(self.dropout_rate, deterministic=not training)(x)
             
-            # Final output dimension
             updated_features = nn.Dense(self.out_dim, kernel_init=nn.initializers.xavier_uniform())(x)
             return updated_features
         
-        # Apply enhanced message passing
+        # 应用增强版的消息传递流程
         updated_nodes = jraph.GraphNetwork(
             update_node_fn=lambda nodes, sent_msgs, received_msgs, globals_: enhanced_update_fn(nodes, received_msgs),
-            update_edge_fn=None,  # Keep edges unchanged
-            update_global_fn=None,  # No global features
+            update_edge_fn=None,
+            update_global_fn=None,
             aggregate_edges_for_nodes_fn=enhanced_aggregate_fn,
             aggregate_nodes_for_globals_fn=None,
             aggregate_edges_for_globals_fn=None,
@@ -842,12 +841,12 @@ class EnhancedGNNLayer(nn.Module):
         return graph._replace(nodes=updated_nodes)
 
 # =============================================================================
-# TESTING AND VALIDATION
+# 测试和验证代码
 # =============================================================================
 
 def test_pointcloud_to_graph():
-    """Test point cloud to graph conversion"""
-    # Create test data
+    """测试一下点云到图的转换功能。"""
+    # 创建一些测试数据
     drone_state = DroneState(
         position=jnp.array([0.0, 0.0, 1.0]),
         velocity=jnp.array([1.0, 0.0, 0.0]),
@@ -855,35 +854,35 @@ def test_pointcloud_to_graph():
         angular_velocity=jnp.zeros(3)
     )
     
-    # Simple obstacle point cloud
+    # 一个简单的障碍物点云
     point_cloud = jnp.array([
-        [1.0, 0.0, 0.0],  # Front obstacle
-        [0.0, 1.0, 0.0],  # Right obstacle  
-        [-1.0, 0.0, 0.0], # Rear obstacle
-        [0.0, -1.0, 0.0], # Left obstacle
-        [0.0, 0.0, 1.0],  # Top obstacle
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
     ])
     
     config = GraphConfig()
     graph, node_types = pointcloud_to_graph(drone_state, point_cloud, config)
     
-    print(f"Number of nodes: {graph.n_node}")
-    print(f"Number of edges: {graph.n_edge}")
-    print(f"Node features shape: {graph.nodes.shape}")
-    print(f"Edge features shape: {graph.edges.shape}")
-    print(f"Node types: {node_types}")
+    print(f"图里有多少节点: {graph.n_node}")
+    print(f"图里有多少条边: {graph.n_edge}")
+    print(f"节点特征的形状: {graph.nodes.shape}")
+    print(f"边特征的形状: {graph.edges.shape}")
+    print(f"节点的类型: {node_types}")
     
     return graph, node_types
 
 def test_advanced_perception_module():
-    """Test advanced perception module with temporal consistency"""
-    print("Testing Advanced Perception Module...")
+    """测试一下我们那个更高级的感知模块。"""
+    print("开始测试高级感知模块...")
     
-    # Create advanced perception module
+    # 创建一个高级感知模块
     config = GraphConfig(k_neighbors=10, max_range=8.0)
     perception = AdvancedPerceptionModule(config, use_temporal_smoothing=True)
     
-    # Initialize network
+    # 初始化网络
     key = jax.random.PRNGKey(42)
     init_key, dropout_key, test_key = jax.random.split(key, 3)
     
@@ -894,19 +893,19 @@ def test_advanced_perception_module():
         angular_velocity=jnp.zeros(3)
     )
     
-    # Generate test point cloud
+    # 生成一些随机的点云
     point_cloud = jax.random.normal(test_key, (25, 3)) * 3.0
     graph, node_types = pointcloud_to_graph(drone_state, point_cloud, config)
     
-    # Initialize network parameters with dropout support
+    # 初始化网络参数，要支持dropout
     params = perception.cbf_net.init(
         {'params': init_key, 'dropout': dropout_key}, 
         graph, node_types, training=True
     )
     
-    # Test CBF computation with temporal consistency
+    # 测试带时间平滑的CBF计算
     for i in range(3):
-        # Create a test CBF function that doesn't use dropout for inference
+        # 创建一个测试用的CBF函数，在推理的时候不使用dropout
         def test_cbf_fn(state):
             test_graph, test_node_types = pointcloud_to_graph(state, point_cloud, config)
             return perception.cbf_net.apply(
@@ -914,28 +913,28 @@ def test_advanced_perception_module():
                 training=False, rngs={'dropout': dropout_key}
             )
         
-        # Compute CBF and gradients
+        # 计算CBF值和梯度
         cbf_value = test_cbf_fn(drone_state)
         cbf_grad = jax.grad(lambda state: test_cbf_fn(state).sum())(drone_state)
         
-        # Update temporal history manually for testing
+        # 手动更新历史记录来做测试
         perception.cbf_history.append({
             'cbf_value': cbf_value,
             'cbf_grad': cbf_grad
         })
         
-        print(f"  Step {i+1}: CBF={cbf_value:.4f}, Grad_norm={jnp.linalg.norm(cbf_grad.position):.4f}")
+        print(f"  第 {i+1} 步: CBF值={cbf_value:.4f}, 梯度范数={jnp.linalg.norm(cbf_grad.position):.4f}")
         
-        # Slightly modify drone state for next iteration
+        # 稍微改一下无人机状态，模拟飞了一小步
         drone_state = drone_state._replace(
             position=drone_state.position + jnp.array([0.1, 0.0, 0.0])
         )
     
-    print("✅ Advanced Perception Module Test: PASSED")
+    print("✅ 高级感知模块测试: 通过!")
     return True
 
 if __name__ == "__main__":
-    # Run basic test
-    print("Testing point cloud to graph conversion...")
+    # 跑个基础测试
+    print("开始测试点云到图的转换...")
     test_graph, test_node_types = test_pointcloud_to_graph()
-    print("Test completed!")
+    print("测试完成!")

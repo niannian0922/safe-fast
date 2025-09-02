@@ -32,7 +32,7 @@ def batch_pytree_objects(objects_list: List[T]) -> T:
     这是解决JAX"结构数组"限制的核心方案。
     
     参数:
-        objects_list: PyTree对象列表（如DroneState实例）
+        objects_list: PyTree对象列表
         
     返回值:
         批处理PyTree，其中每个叶子沿批处理维度堆叠

@@ -1,18 +1,18 @@
 """
 第四阶段：完整安全敏捷飞行系统 - 主训练脚本
 
-这是我们多阶段开发的成果，结合了：
-1. GCBF+ (MIT-REALM): 用于安全保障的神经图控制屏障函数
-2. DiffPhysDrone (SJTU): 用于端到端学习的可微分物理学  
-3. JAX原生实现以获得最大性能
+这算是我们整个多阶段开发的最终成果了，它融合了：
+1. GCBF+ (MIT-REALM): 用图神经网络搞的控制屏障函数，主要为了保证安全。
+2. DiffPhysDrone (SJTU): 用可微分物理学来实现端到端的学习。
+3. 整个都是用JAX原生实现的，性能拉满。
 
-第四阶段目标：
-- 完整端到端系统集成
-- 使用jax.lax.scan的完整BPTT训练循环
-- 多目标损失函数优化
-- 验证通过所有组件的完整梯度流
+我们第四阶段的目标：
+- 把所有模块攒在一起，做一个完整的端到端系统。
+- 用 jax.lax.scan 来实现一个完整的、高效的BPTT（随时间反向传播）训练循环。
+- 优化一个多目标的损失函数。
+- 验证梯度流能顺畅地穿过所有组件。
 
-系统架构：
+系统架构长这样：
 输入 -> GNN感知 -> 策略网络 -> 安全层 -> 物理引擎 -> 损失
    ^                                                        |
    |_________________________ BPTT梯度流 __________________|
@@ -31,26 +31,26 @@ import chex
 from dataclasses import dataclass
 import pickle
 
-# 配置JAX以获得最佳性能
-jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_compilation_cache_dir", ".jax_cache")
+# 配置一下JAX，让它性能更好
+jax.config.update("jax_enable_x64", True) # 用64位浮点数，精度更高
+jax.config.update("jax_compilation_cache_dir", ".jax_cache") # 把编译缓存存起来
 
-# 自动检测最佳可用平台
+# 自动检测一下电脑上最好的计算设备是啥
 try:
     devices = jax.devices()
-    print(f"🚀 Available JAX devices: {devices}")
+    print(f"🚀 JAX能用的设备有: {devices}")
     if any('gpu' in str(device).lower() for device in devices):
-        print("✅ Using GPU acceleration")
+        print("✅ 太棒了，用GPU加速！")
     else:
-        print("⚠️  Using CPU (GPU not available)")
+        print("⚠️  没找到GPU，只能用CPU了（会慢一些）")
 except Exception as e:
-    print(f"JAX device detection: {e}")
+    print(f"JAX设备检测出错了: {e}")
 
-# 将项目根目录添加到路径  
+# 把项目根目录加到Python的搜索路径里，这样导入模块的时候就不会出错了
 project_root = Path(__file__).parent
 sys.path.append(str(project_root))
 
-# 导入所有系统组件
+# 把我们自己写的所有模块都导入进来
 from configs.default_config import get_config, get_minimal_config
 from utils.memory_optimization import (
     get_memory_safe_config, validate_memory_config, 
@@ -73,7 +73,7 @@ from core.perception import (
     pointcloud_to_graph, DroneState as PerceptionDroneState, GraphConfig,
     AdvancedPerceptionModule, AdvancedCBFNet, test_advanced_perception_module
 )
-# 导入增强策略
+# 导入我们那个增强版的策略网络
 from core.enhanced_policy import (
     EnhancedPolicyMLP, EnhancedPolicyConfig, create_enhanced_policy_network,
     initialize_enhanced_policy, ActionHistoryBuffer
@@ -87,14 +87,14 @@ from core.loop import (
     ScanCarry, ScanOutput, create_scan_function,
     run_complete_trajectory_scan
 )
-# 导入性能调优
+# 导入性能调优相关的模块
 from core.performance_tuning import (
     PerformanceTuningConfig, get_optimized_training_config,
     LearningRateScheduler, AdaptiveLossWeightBalancer,
     CurriculumLearningManager, PerformanceMonitor,
     create_optimized_optimizer
 )
-# 导入训练组件
+# 导入训练流程的核心组件
 from core.training import (
     LossConfig, LossMetrics, compute_comprehensive_loss,
     training_step, create_default_loss_config, create_optimizer,
@@ -108,7 +108,7 @@ from core.training import (
 
 @dataclass
 class TrainingState:
-    """用于检查点和恢复的增强训练状态，支持全面跟踪"""
+    """这是一个增强版的训练状态类，用来存训练过程中的所有东西，方便中断和恢复。"""
     step: int
     epoch: int
     params: Dict
@@ -119,14 +119,14 @@ class TrainingState:
     best_metrics: Dict
     config: Dict
     
-    # 增强跟踪
+    # 额外加一些追踪信息
     total_training_time: float = 0.0
     last_checkpoint_time: float = 0.0
     consecutive_no_improvement: int = 0
     learning_rate_schedule: Optional[Dict] = None
     curriculum_stage: int = 0
     
-    # 性能跟踪
+    # 性能追踪
     gradient_norms_history: list = None
     memory_usage_history: list = None
     batch_success_rates: list = None
@@ -136,6 +136,7 @@ class TrainingState:
     last_validation_step: int = 0
     
     def __post_init__(self):
+        # 做一些初始化，防止列表是None
         if self.gradient_norms_history is None:
             self.gradient_norms_history = []
         if self.memory_usage_history is None:
@@ -147,7 +148,7 @@ class TrainingState:
 
 
 class SystemComponents(NamedTuple):
-    """所有系统组件与高级功能的打包"""
+    """把系统里所有的组件，包括那些高级功能，都打包在一起，方便管理。"""
     # 核心组件
     gnn_perception: PerceptionModule
     policy_network: EnhancedPolicyMLP
@@ -173,36 +174,36 @@ class SystemComponents(NamedTuple):
 
 
 def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.OptState]:
-    """初始化所有系统组件，包括高级功能"""
-    print("🔧 Initializing Complete Safe Agile Flight System with Advanced Features...")
+    """初始化我们系统里的所有组件，包括那些花里胡哨的高级功能。"""
+    print("🔧 正在初始化完整的安全敏捷飞行系统（带高级功能版）...")
     
-    # 从配置创建物理参数
+    # 根据配置文件创建物理引擎的参数
     physics_params = PhysicsParams(
         dt=config.physics.dt,
         mass=config.physics.drone.mass,
-        thrust_to_weight=config.physics.drone.thrust_to_weight_ratio,  # 固定参数名
+        thrust_to_weight=config.physics.drone.thrust_to_weight_ratio,
         drag_coefficient=config.physics.drone.drag_coefficient
     )
     
-    # 初始化感知模块
+    # 初始化各种随机数种子
     key = random.PRNGKey(config.training.seed)
     gnn_key, policy_key, safety_key, advanced_key = random.split(key, 4)
     
-    # Standard perception module
+    # 标准的感知模块
     gnn_perception = create_default_perception_module()
     
-    # Advanced perception module with temporal consistency
+    # 带时序一致性的高级感知模块
     graph_config = GraphConfig(
         k_neighbors=getattr(config.gcbf, 'k_neighbors', 10),
-        max_range=8.0,  # Extended range for better perception
-        max_points=200  # More points for detailed environment representation
+        max_range=8.0,
+        max_points=200
     )
     advanced_perception = AdvancedPerceptionModule(
         graph_config, 
         use_temporal_smoothing=True
     )
     
-    # Initialize enhanced policy network
+    # 初始化增强版的策略网络
     policy_config = EnhancedPolicyConfig(
         hidden_dims=(512, 256, 128),
         activation="swish",
@@ -221,13 +222,13 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
         policy_config, policy_key, input_dim=obs_dim
     )
     
-    # Initialize performance tuning components
+    # 初始化性能调优相关的组件
     perf_config = get_optimized_training_config()
     loss_balancer = AdaptiveLossWeightBalancer(perf_config)
     curriculum_manager = CurriculumLearningManager(perf_config)
     performance_monitor = PerformanceMonitor(perf_config)
     
-    # Initialize safety components
+    # 初始化安全相关的组件
     safety_config = SafetyConfig(
         max_thrust=getattr(config.safety, 'max_thrust', 0.8),
         max_torque=getattr(config.safety, 'max_torque', 0.5),
@@ -235,19 +236,19 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
         relaxation_penalty=config.safety.relaxation_penalty
     )
     
-    # Standard safety layer
+    # 标准的安全层
     safety_layer = SafetyLayer(safety_config)
     
-    # Advanced safety layer with curriculum
+    # 带课程学习的高级安全层
     advanced_safety = AdvancedSafetyLayer(safety_config)
     
-    # Hybrid safety layer combining learned and analytical
+    # 结合了学习和解析方法的混合安全层
     hybrid_safety = HybridSafetyLayer(safety_config, use_learned_cbf=True)
     
-    # Warm-start QP solver for efficiency
+    # 带热启动的QP求解器，为了效率
     warm_start_qp_solver = WarmStartQPSolver(safety_config)
     
-    # Initialize advanced training framework
+    # 初始化高级训练框架
     loss_config = LossConfig(
         cbf_violation_coef=config.training.loss_cbf_coef,
         velocity_tracking_coef=config.training.loss_velocity_coef,
@@ -259,13 +260,13 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
     training_framework = AdvancedTrainingFramework(loss_config, use_curriculum=True)
     multi_objective_optimizer = MultiObjectiveOptimizer(balance_method='adaptive_weights')
     
-    # Create action history buffer
+    # 创建动作历史的缓冲区
     action_buffer = ActionHistoryBuffer(
         history_length=policy_config.history_length,
         action_dim=3
     )
     
-    # Initialize loss weight balancing
+    # 初始化损失权重的平衡器
     initial_loss_components = {
         'cbf_loss': config.training.loss_cbf_coef,
         'velocity_loss': config.training.loss_velocity_coef,
@@ -276,12 +277,12 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
     }
     loss_balancer.initialize_weights(initial_loss_components)
     
-    # Create the complete scan function
+    # 创建那个核心的、能处理批数据的scan函数
     scan_function = create_batch_compatible_scan_function(
         gnn_perception, policy_network, safety_layer, physics_params
     )
     
-    # Bundle all components
+    # 把所有组件都打包好
     components = SystemComponents(
         gnn_perception=gnn_perception,
         policy_network=policy_network,
@@ -294,7 +295,7 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
         loss_weight_balancer=loss_balancer,
         curriculum_manager=curriculum_manager,
         performance_monitor=performance_monitor,
-        # Advanced components
+        # 高级组件
         advanced_perception=advanced_perception,
         advanced_safety=advanced_safety,
         hybrid_safety=hybrid_safety,
@@ -303,19 +304,19 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
         warm_start_qp_solver=warm_start_qp_solver
     )
     
-    # Initialize parameters for all networks
+    # 把所有网络的参数都初始化一下
     dummy_state = create_initial_drone_state(jnp.array([0.0, 0.0, 1.0]))
-    dummy_pointcloud = random.normal(gnn_key, (50, 3)) * 2.0  # 50 points
+    dummy_pointcloud = random.normal(gnn_key, (50, 3)) * 2.0
     
-    # Initialize GNN parameters
-    k_neighbors = getattr(config.gcbf, 'k_neighbors', 8)  # Safe default
+    # 初始化GNN的参数
+    k_neighbors = getattr(config.gcbf, 'k_neighbors', 8)
     graph_config = GraphConfig(k_neighbors=k_neighbors)
     dummy_graph = pointcloud_to_graph(
         PerceptionDroneState(
             position=dummy_state.position,
             velocity=dummy_state.velocity,
-            orientation=jnp.eye(3),  # Default identity orientation
-            angular_velocity=jnp.zeros(3)  # Zero angular velocity
+            orientation=jnp.eye(3),
+            angular_velocity=jnp.zeros(3)
         ),
         dummy_pointcloud,
         graph_config
@@ -323,33 +324,29 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
     
     gnn_params = gnn_perception.cbf_net.init(gnn_key, dummy_graph[0], dummy_graph[1])
     
-    # Initialize policy parameters with corrected structure
+    # 初始化策略网络的参数
     policy_input = jnp.concatenate([
-        dummy_state.position,  # 3 elements
-        dummy_state.velocity,  # 3 elements  
-        jnp.zeros(3)  # 3 elements for target relative position
+        dummy_state.position,
+        dummy_state.velocity,  
+        jnp.zeros(3)
     ])
     
-    # The policy_params are already initialized in initialize_enhanced_policy
-    # policy_params = policy_network.init(policy_key, policy_input, None)
-    
-    # Combine all parameters
+    # 把所有参数打包到一个字典里
     all_params = {
         'gnn': gnn_params,
-        'policy': policy_params,  # Use the parameters from initialize_enhanced_policy
-        'safety': {  # Safety layer parameters (if any learnable)
+        'policy': policy_params,
+        'safety': {
             'cbf_alpha': config.safety.cbf_alpha,
             'max_thrust': config.safety.max_thrust
         }
     }
     
-    # Create optimized optimizer with performance tuning
+    # 创建一个带性能调优的优化器
     perf_optimizer = create_optimized_optimizer(perf_config)
     
-    # Create adaptive learning rate schedules for different components  
+    # 为不同组件创建自适应学习率
     lr_scheduler = LearningRateScheduler(perf_config)
     
-    # Initialize with component-specific learning rates
     component_optimizers = {
         'policy': optax.chain(
             optax.clip_by_global_norm(1.0),
@@ -365,14 +362,14 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
         )
     }
     
-    # Create a simple, single optimizer instead of multi-transform
+    # 这里我们还是用一个简单的、统一的优化器
     optimizer = optax.adam(config.training.learning_rate)
     optimizer_state = optimizer.init(all_params)
     
-    print(f"✅ System initialization complete")
-    print(f"   GNN parameters: {sum(p.size for p in jax.tree_util.tree_leaves(gnn_params))}")
-    print(f"   Policy parameters: {sum(p.size for p in jax.tree_util.tree_leaves(policy_params))}")
-    print(f"   Total parameters: {sum(p.size for p in jax.tree_util.tree_leaves(all_params) if hasattr(p, 'size'))}")
+    print(f"✅ 系统初始化完成")
+    print(f"   GNN参数量: {sum(p.size for p in jax.tree_util.tree_leaves(gnn_params))}")
+    print(f"   策略网络参数量: {sum(p.size for p in jax.tree_util.tree_leaves(policy_params))}")
+    print(f"   总参数量: {sum(p.size for p in jax.tree_util.tree_leaves(all_params) if hasattr(p, 'size'))}")
     return components, all_params, optimizer_state
 
 # =============================================================================
@@ -380,32 +377,32 @@ def initialize_complete_system(config) -> Tuple[SystemComponents, Dict, optax.Op
 # =============================================================================
 
 def generate_training_scenario(config, key: chex.PRNGKey) -> Dict:
-    """生成单个训练场景"""
+    """生成一个单独的训练场景。"""
     key1, key2, key3 = random.split(key, 3)
     
-    # 随机初始位置和目标
+    # 随机生成初始位置和目标点
     initial_position = random.uniform(key1, (3,), minval=-2.0, maxval=2.0)
-    initial_position = initial_position.at[2].set(jnp.abs(initial_position[2]) + 1.0)  # 保持在地面以上
+    initial_position = initial_position.at[2].set(jnp.abs(initial_position[2]) + 1.0)
     
     target_position = random.uniform(key2, (3,), minval=-3.0, maxval=3.0)
     target_position = target_position.at[2].set(jnp.abs(target_position[2]) + 1.5)
     
-    # 生成固定大小的障碍物点云以启用堆叠
-    max_obstacles = 100  # 所有场景的固定大小
+    # 为了能把不同场景的数据堆叠（stack）起来，我们生成固定大小的障碍物点云
+    max_obstacles = 100
     n_obstacles = random.randint(key3, (), 20, max_obstacles + 1)  
     
-    # 创建全尺寸数组并填充前n_obstacles个条目
+    # 创建一个全尺寸的数组，然后把实际的障碍物填进去
     obstacle_positions = jnp.zeros((max_obstacles, 3))
     actual_obstacles = random.normal(key3, (n_obstacles, 3)) * 3.0
     obstacle_positions = obstacle_positions.at[:n_obstacles].set(actual_obstacles)
     
-    # 创建初始无人机状态
+    # 创建无人机的初始状态
     initial_state = create_initial_drone_state(
         position=initial_position,
         velocity=jnp.zeros(3)
     )
     
-    # 计算目标速度（朝向目标的简单比例控制器）
+    # 算一下目标速度（一个简单的比例控制器，指向目标）
     sequence_length = config.training.sequence_length
     target_velocities = jnp.tile(
         (target_position - initial_position) / sequence_length * 0.5,
@@ -416,30 +413,30 @@ def generate_training_scenario(config, key: chex.PRNGKey) -> Dict:
         'initial_state': initial_state,
         'target_position': target_position,
         'target_velocities': target_velocities,
-        'obstacle_pointcloud': obstacle_positions,  # Now always [max_obstacles, 3]
-        'n_actual_obstacles': n_obstacles,  # Keep track of actual count
+        'obstacle_pointcloud': obstacle_positions,
+        'n_actual_obstacles': n_obstacles,
         'scenario_id': random.randint(key, (), 0, 1000000)
     }
 
 
 def generate_training_batch(config, key: chex.PRNGKey, batch_size: int) -> Dict:
-    """使用PyTree兼容的批处理生成完整的训练批次"""
+    """用PyTree兼容的方式生成一个完整的训练批次。"""
     keys = random.split(key, batch_size)
     scenarios = [generate_training_scenario(config, k) for k in keys]
     
-    # 提取初始状态（DroneState对象）以进行正确的批处理
+    # 把初始状态（DroneState对象）单独拿出来，要做特殊的批处理
     initial_states = [s['initial_state'] for s in scenarios]
     
-    # 为DroneState对象使用PyTree批处理
+    # 用我们写的PyTree批处理工具来处理DroneState对象
     batched_initial_states = batch_drone_states(initial_states)
     
-    # 正常堆叠常规数组
+    # 普通的数组就直接用stack堆叠起来
     batch = {
-        'initial_states': batched_initial_states,  # Now properly batched DroneState
+        'initial_states': batched_initial_states,
         'target_positions': jnp.stack([s['target_position'] for s in scenarios]),
         'target_velocities': jnp.stack([s['target_velocities'] for s in scenarios]),
-        'obstacle_pointclouds': jnp.stack([s['obstacle_pointcloud'] for s in scenarios]),  # Now uniform shape
-        'n_actual_obstacles': jnp.array([s['n_actual_obstacles'] for s in scenarios]),  # Track actual counts
+        'obstacle_pointclouds': jnp.stack([s['obstacle_pointcloud'] for s in scenarios]),
+        'n_actual_obstacles': jnp.array([s['n_actual_obstacles'] for s in scenarios]),
         'scenario_ids': jnp.array([s['scenario_id'] for s in scenarios])
     }
     
@@ -447,7 +444,7 @@ def generate_training_batch(config, key: chex.PRNGKey, batch_size: int) -> Dict:
 
 
 # =============================================================================
-# COMPLETE END-TO-END TRAINING STEP
+# 完整的端到端训练步骤
 # =============================================================================
 
 @functools.partial(
@@ -461,15 +458,14 @@ def complete_forward_pass_jit(
     sequence_length: int,
     batch_size: int
 ) -> Tuple[chex.Array, Dict, Dict]:
-    """JIT-optimized forward pass with enhanced error handling and dimension matching."""
+    """一个做了JIT优化的前向传播函数，加了些错误处理和维度匹配。"""
     
-    # Extract physics and loss parameters (avoiding static_argnames issues)
+    # 把物理和损失参数直接写在函数里，避免作为静态参数传递的麻烦
     dt = 0.01
     mass = 1.0
     thrust_to_weight = 2.0
     drag_coefficient = 0.1
     
-    # Create physics params inline
     physics_params_dict = {
         'dt': dt,
         'mass': mass, 
@@ -477,7 +473,6 @@ def complete_forward_pass_jit(
         'drag_coefficient': drag_coefficient
     }
     
-    # Loss coefficients
     loss_coeffs = {
         'goal_reaching_coef': 2.0,
         'velocity_tracking_coef': 1.0,
@@ -486,7 +481,7 @@ def complete_forward_pass_jit(
         'collision_avoidance_coef': 4.0
     }
     
-    # Initialize scan carry state
+    # 初始化scan循环的初始状态
     initial_carry = ScanCarry(
         drone_state=batch['initial_states'],
         rnn_hidden_state=jnp.zeros((batch_size, 64)),
@@ -494,14 +489,14 @@ def complete_forward_pass_jit(
         cumulative_reward=jnp.zeros(batch_size)
     )
     
-    # Prepare scan inputs with proper shape handling
+    # 准备scan循环的输入
     scan_inputs = {
         'target_positions': jnp.tile(batch['target_positions'][:, None, :], (1, sequence_length, 1)),
         'obstacle_pointclouds': jnp.tile(batch['obstacle_pointclouds'][:, None, :, :], (1, sequence_length, 1, 1)),
         'timesteps': jnp.arange(sequence_length)[None, :].repeat(batch_size, axis=0)
     }
     
-    # Create physics params object inline to avoid static_argnames
+    # 在函数内部创建物理参数对象
     from core.physics import PhysicsParams
     physics_params = PhysicsParams(
         dt=dt,
@@ -510,26 +505,24 @@ def complete_forward_pass_jit(
         drag_coefficient=drag_coefficient
     )
     
-    # Enhanced scan function with full system integration
+    # 一个增强版的scan函数，集成了所有系统组件
     def advanced_scan_step(carry, inputs):
         drone_state = carry.drone_state
         step_count = carry.step_count
         
-        # Extract inputs for current timestep
         target_pos = inputs['target_positions']
         obstacle_cloud = inputs['obstacle_pointclouds']
         
-        # Advanced PID controller with obstacle avoidance
+        # 一个带避障功能的增强版PID控制器
         position_error = target_pos - drone_state.position
         velocity_error = -drone_state.velocity
         
-        # Distance-adaptive gains for better performance
+        # 根据距离自适应调整PID增益
         distance_to_goal = jnp.linalg.norm(position_error, axis=-1, keepdims=True)
         adaptive_kp = 2.5 * (1.0 + 1.0 / (1.0 + distance_to_goal))
         adaptive_kd = 1.2 * (1.0 + 0.5 / (1.0 + distance_to_goal))
         ki = 0.15
         
-        # PID control with adaptive gains
         integral_error = position_error * physics_params.dt
         control_output = jnp.tanh(
             adaptive_kp * position_error + 
@@ -537,14 +530,14 @@ def complete_forward_pass_jit(
             ki * integral_error
         )
         
-        # Obstacle avoidance using potential fields
+        # 用势场法来做避障
         obstacle_forces = jnp.zeros_like(drone_state.position)
-        for i in range(min(20, obstacle_cloud.shape[-2])):  # Use first 20 obstacles
+        for i in range(min(20, obstacle_cloud.shape[-2])):
             obstacle_pos = obstacle_cloud[:, i, :]
             obstacle_vector = drone_state.position - obstacle_pos
             obstacle_distance = jnp.linalg.norm(obstacle_vector, axis=-1, keepdims=True)
             
-            # Repulsive force (inverse square law)
+            # 一个反平方律的排斥力
             repulsive_force = jnp.where(
                 obstacle_distance < 3.0,
                 2.0 / (obstacle_distance**2 + 0.1) * (obstacle_vector / (obstacle_distance + 1e-6)),
@@ -552,22 +545,22 @@ def complete_forward_pass_jit(
             )
             obstacle_forces = obstacle_forces + repulsive_force
         
-        # Combine control with obstacle avoidance
+        # 把PID控制和避障力结合起来
         control_output = control_output + 0.3 * jnp.tanh(obstacle_forces)
         
-        # Add beneficial exploration noise
+        # 加一点探索噪声，让梯度流更好
         noise_key = random.fold_in(key, step_count[0])
         control_noise = random.normal(noise_key, control_output.shape) * 0.02
         control_output = control_output + control_noise
         
-        # Apply control limits
+        # 限制控制指令的范围
         control_output = jnp.clip(control_output, -0.8, 0.8)
         
-        # Physics step
+        # 物理引擎走一步
         from core.physics import dynamics_step
         new_drone_state = dynamics_step(drone_state, control_output, physics_params)
         
-        # Create new carry
+        # 创建新的carry状态
         new_carry = ScanCarry(
             drone_state=new_drone_state,
             rnn_hidden_state=carry.rnn_hidden_state,
@@ -575,15 +568,15 @@ def complete_forward_pass_jit(
             cumulative_reward=carry.cumulative_reward
         )
         
-        # Compute safety metrics
+        # 计算一些安全指标
         min_obstacle_dist = jnp.min(jnp.linalg.norm(
             obstacle_cloud[:, :20, :] - new_drone_state.position[:, None, :], axis=-1
         ), axis=1)
         
-        cbf_values = (min_obstacle_dist - 0.5)[:, None]  # Safety margin
+        cbf_values = (min_obstacle_dist - 0.5)[:, None]
         safety_violations = jnp.sum(cbf_values < 0, axis=-1)
         
-        # Create comprehensive outputs
+        # 创建一个内容丰富的输出
         output = ScanOutput(
             positions=new_drone_state.position,
             velocities=new_drone_state.velocity,
@@ -591,7 +584,6 @@ def complete_forward_pass_jit(
             nominal_commands=control_output,
             step_loss=0.0,
             safety_violation=float(jnp.mean(safety_violations)),
-            # Extended fields
             drone_states=jnp.concatenate([
                 new_drone_state.position,
                 new_drone_state.velocity,
@@ -606,14 +598,14 @@ def complete_forward_pass_jit(
         
         return new_carry, output
     
-    # Convert scan inputs to per-timestep format
+    # 把scan的输入数据转置一下，变成 (T, B, ...) 的格式
     scan_inputs_transposed = {
         'target_positions': scan_inputs['target_positions'].transpose(1, 0, 2),
         'obstacle_pointclouds': scan_inputs['obstacle_pointclouds'].transpose(1, 0, 2, 3),
         'timesteps': scan_inputs['timesteps'].transpose(1, 0)
     }
     
-    # Execute scan
+    # 执行scan
     final_carry, scan_outputs = jax.lax.scan(
         advanced_scan_step,
         initial_carry,
@@ -621,27 +613,22 @@ def complete_forward_pass_jit(
         length=sequence_length
     )
     
-    # Compute enhanced loss with all components
+    # 计算一个增强版的损失函数
     final_positions = scan_outputs.positions[-1]
     final_velocities = scan_outputs.velocities[-1]
     
-    # Goal reaching loss
     goal_distances = jnp.linalg.norm(final_positions - batch['target_positions'], axis=-1)
     goal_loss = jnp.mean(goal_distances ** 2)
     
-    # Velocity regulation loss
     velocity_loss = jnp.mean(jnp.sum(final_velocities ** 2, axis=-1))
     
-    # Control effort and smoothness
     control_effort = jnp.mean(jnp.sum(scan_outputs.control_commands ** 2, axis=-1))
     control_diff = jnp.diff(scan_outputs.control_commands, axis=0)
     control_smoothness = jnp.mean(jnp.sum(control_diff ** 2, axis=-1))
     
-    # Safety and collision losses
     cbf_violations = jnp.mean(jnp.maximum(0, -scan_outputs.cbf_values))
     collision_penalty = jnp.mean(jnp.maximum(0, 1.0 - scan_outputs.obstacle_distances))
     
-    # Combined loss
     total_loss = (
         loss_coeffs['goal_reaching_coef'] * goal_loss +
         loss_coeffs['velocity_tracking_coef'] * velocity_loss +
@@ -650,7 +637,6 @@ def complete_forward_pass_jit(
         loss_coeffs['collision_avoidance_coef'] * collision_penalty
     )
     
-    # Comprehensive metrics
     metrics = {
         'total_loss': total_loss,
         'goal_loss': goal_loss,
@@ -659,10 +645,9 @@ def complete_forward_pass_jit(
         'safety_loss': cbf_violations,
         'collision_loss': collision_penalty,
         'smoothness_loss': control_smoothness,
-        'gradient_norm': 0.0  # Will be filled later
+        'gradient_norm': 0.0
     }
     
-    # Additional tracking metrics
     extra_metrics = {
         'final_goal_distance': jnp.mean(goal_distances),
         'goal_success_rate': jnp.mean(goal_distances < 0.5),
@@ -680,37 +665,34 @@ def complete_forward_pass(
     params: Dict,
     batch: Dict,
     components: SystemComponents,
-    config,  # Add config parameter
+    config,
     key: chex.PRNGKey
 ) -> Tuple[chex.Array, LossMetrics, Dict]:
     """
-    Complete forward pass through the entire system
+    一个完整的、穿过所有系统组件的前向传播过程。
     
-    This is the heart of Stage 4 - full BPTT through all components:
-    1. Initial state setup
-    2. BPTT scan loop (perception -> policy -> safety -> physics)  
-    3. Multi-objective loss computation
-    4. Return loss and comprehensive metrics
+    这是我们第四阶段的核心：完整的BPTT流程
+    1. 设置初始状态
+    2. 跑BPTT的scan循环 (感知 -> 策略 -> 安全 -> 物理)
+    3. 计算多目标损失
+    4. 返回损失和各种详细的指标
     """
-    batch_size = batch['initial_states'].position.shape[0]  # Get batch size from batched DroneState
-    sequence_length = config.training.sequence_length  # Use passed config
+    batch_size = batch['initial_states'].position.shape[0]
+    sequence_length = config.training.sequence_length
     
-    # Initialize scan carry state
     initial_carry = ScanCarry(
-        drone_state=batch['initial_states'],  # This is now a batched DroneState
-        rnn_hidden_state=jnp.zeros((batch_size, 64)),  # Policy RNN state
+        drone_state=batch['initial_states'],
+        rnn_hidden_state=jnp.zeros((batch_size, 64)),
         step_count=jnp.zeros(batch_size, dtype=jnp.int32),
         cumulative_reward=jnp.zeros(batch_size)
     )
     
-    # Prepare scan inputs (target info and obstacles for each timestep)
     scan_inputs = {
         'target_positions': jnp.tile(batch['target_positions'][:, None, :], (1, sequence_length, 1)),
         'obstacle_pointclouds': jnp.tile(batch['obstacle_pointclouds'][:, None, :, :], (1, sequence_length, 1, 1)),
         'timesteps': jnp.arange(sequence_length)[None, :].repeat(batch_size, axis=0)
     }
     
-    # Run complete BPTT scan loop
     final_carry, scan_outputs = run_batch_compatible_trajectory_scan(
         components.scan_function,
         initial_carry,
@@ -720,21 +702,18 @@ def complete_forward_pass(
         sequence_length
     )
     
-    # Transpose outputs to match loss function expectations (T, B, ...) format
     scan_outputs_transposed = transpose_scan_outputs_for_loss(scan_outputs)
     
-    # Compute comprehensive loss using simplified version
     loss, metrics = compute_simple_loss(
-        scan_outputs=scan_outputs_transposed,  # Use transposed outputs
+        scan_outputs=scan_outputs_transposed,
         target_positions=batch['target_positions'],
         target_velocities=batch['target_velocities'],
         config=components.loss_config,
         physics_params=components.physics_params
     )
     
-    # Additional metrics for monitoring
     final_distances = jnp.linalg.norm(
-        final_carry.drone_state.position - batch['target_positions'], axis=-1  # Use .position from batched DroneState
+        final_carry.drone_state.position - batch['target_positions'], axis=-1
     )
     
     extra_metrics = {
@@ -761,7 +740,7 @@ def complete_training_step_jit(
     batch_size: int,
     optimizer: optax.GradientTransformation
 ) -> Tuple[Dict, optax.OptState, Dict, Dict]:
-    """JIT-optimized training step with comprehensive gradient computation."""
+    """一个JIT优化的训练步骤，包含了完整的梯度计算。"""
     
     def loss_fn(params_inner):
         loss, metrics, extra_metrics = complete_forward_pass_jit(
@@ -769,73 +748,67 @@ def complete_training_step_jit(
         )
         return loss, (metrics, extra_metrics)
     
-    # Compute loss and gradients via JAX autodiff
+    # 用JAX的自动微分来计算损失和梯度
     (loss, (metrics, extra_metrics)), gradients = jax.value_and_grad(
         loss_fn, has_aux=True
     )(params)
     
-    # Apply gradient updates
+    # 应用梯度来更新网络参数
     updates, new_optimizer_state = optimizer.update(gradients, optimizer_state, params)
     new_params = optax.apply_updates(params, updates)
     
-    # Compute gradient statistics for monitoring
+    # 算一下梯度的统计信息，方便监控
     gradient_norm = jnp.sqrt(sum(
         jnp.sum(g ** 2) for g in jax.tree_util.tree_leaves(gradients)
     ))
     
-    # Update metrics with gradient information
     updated_metrics = {**metrics, 'gradient_norm': gradient_norm}
     
     return new_params, new_optimizer_state, updated_metrics, extra_metrics
 
 
-# Remove @jit for validation - can be added back after fixing static arguments
 def complete_training_step(
     params: Dict,
     optimizer_state: optax.OptState,
     batch: Dict,
     components: SystemComponents,
-    config,  # Add config parameter
+    config,
     optimizer: optax.GradientTransformation,
     key: chex.PRNGKey
 ) -> Tuple[Dict, optax.OptState, LossMetrics, Dict]:
     """
-    Complete JIT-compiled training step with gradient computation and updates
+    一个完整的、JIT编译的训练步骤，包含了梯度计算和参数更新。
     
-    This function encapsulates the full STAGE 4 objective:
-    - End-to-end gradient flow through all components
-    - Multi-objective loss optimization  
-    - Parameter updates with proper gradient handling
+    这个函数封装了我们第四阶段的全部目标：
+    - 所有组件的端到端梯度流
+    - 多目标损失的优化
+    - 用正确的梯度处理方式来更新参数
     """
     
     def loss_fn(params_inner):
         loss, metrics, extra_metrics = complete_forward_pass(
-            params_inner, batch, components, config, key  # Pass config
+            params_inner, batch, components, config, key
         )
         return loss, (metrics, extra_metrics)
     
-    # Compute loss and gradients via JAX autodiff
     (loss, (metrics, extra_metrics)), gradients = jax.value_and_grad(
         loss_fn, has_aux=True
     )(params)
     
-    # Apply gradient updates
     updates, new_optimizer_state = optimizer.update(gradients, optimizer_state, params)
     new_params = optax.apply_updates(params, updates)
     
-    # Compute gradient statistics for monitoring
     gradient_norm = jnp.sqrt(sum(
         jnp.sum(g ** 2) for g in jax.tree_util.tree_leaves(gradients)
     ))
     
-    # Update metrics with gradient information
     updated_metrics = metrics._replace(gradient_norm=gradient_norm)
     
     return new_params, new_optimizer_state, updated_metrics, extra_metrics
 
 
 # =============================================================================
-# TRAINING LOOP MANAGEMENT AND EXECUTION
+# 训练循环的管理和执行
 # ============================================================================= 
 
 def run_training_epoch(
@@ -846,29 +819,25 @@ def run_training_epoch(
     config,
     epoch: int,
     key: chex.PRNGKey,
-    training_state: Optional[TrainingState] = None  # Added parameter with default
+    training_state: Optional[TrainingState] = None
 ) -> Tuple[Dict, optax.OptState, Dict]:
-    """Enhanced training epoch with adaptive strategies and comprehensive monitoring"""
+    """一个增强版的训练轮次（epoch），带自适应策略和全面的监控。"""
     epoch_metrics = []
     current_params = params
     current_opt_state = optimizer_state
     epoch_start_time = time.time()
     
-    # Extract parameters for training
     sequence_length = config.training.sequence_length
     batch_size = config.training.batch_size
     
-    # Performance tracking components
     loss_balancer = components.loss_weight_balancer
     curriculum_manager = components.curriculum_manager
     performance_monitor = components.performance_monitor
     
-    # Adaptive training strategy based on historical performance
     adaptive_strategy = {'issues_detected': [], 'strategy_adjustments': {}, 'recommendations': []}
     if training_state is not None:
         adaptive_strategy = adaptive_training_strategy(training_state, components, config)
     
-    # Apply adaptive adjustments if needed
     effective_sequence_length = sequence_length
     effective_batch_size = batch_size
     effective_lr = config.training.learning_rate
@@ -878,51 +847,43 @@ def run_training_epoch(
         
         if 'reduce_sequence_length' in adjustments:
             effective_sequence_length = max(5, int(sequence_length * adjustments['reduce_sequence_length']))
-            print(f"   🔧 Adaptive: Reduced sequence length to {effective_sequence_length}")
+            print(f"   🔧 自适应调整: 序列长度缩短至 {effective_sequence_length}")
             
         if 'reduce_batch_size' in adjustments:
             effective_batch_size = max(2, int(batch_size * adjustments['reduce_batch_size']))
-            print(f"   🔧 Adaptive: Reduced batch size to {effective_batch_size}")
+            print(f"   🔧 自适应调整: 批大小减小至 {effective_batch_size}")
             
         if 'reduce_lr' in adjustments:
             effective_lr = effective_lr * adjustments['reduce_lr']
-            # Update optimizer with new learning rate
             optimizer = optax.adam(effective_lr)
             current_opt_state = optimizer.init(current_params)
-            print(f"   🔧 Adaptive: Reduced learning rate to {effective_lr:.2e}")
+            print(f"   🔧 自适应调整: 学习率降低至 {effective_lr:.2e}")
             
-        # Display recommendations
         if adaptive_strategy['recommendations']:
-            print("   💡 Training Recommendations:")
+            print("   💡 训练建议:")
             for rec in adaptive_strategy['recommendations']:
                 print(f"      {rec}")
     
-    # Generate training batches for this epoch
     n_batches = config.training.batches_per_epoch
     batch_keys = random.split(key, n_batches)
     
-    # Training diagnostics
     failed_batches = 0
     successful_batches = 0
     
     for batch_idx, batch_key in enumerate(batch_keys):
         try:
-            # Get current curriculum stage
             curriculum_stage = curriculum_manager.get_current_stage()
             
-            # Adjust training parameters based on curriculum
             effective_sequence_length = min(
                 sequence_length, 
                 int(sequence_length * curriculum_stage.get('sequence_length_multiplier', 1.0))
             )
             enable_safety = curriculum_stage.get('enable_safety', True)
             
-            # Generate training batch
             batch = generate_training_batch(
                 config, batch_key, batch_size
             )
             
-            # Perform training step using JIT-optimized version
             step_key = random.fold_in(batch_key, batch_idx)
             
             try:
@@ -932,20 +893,17 @@ def run_training_epoch(
                 )
                 successful_batches += 1
             except Exception as jit_error:
-                print(f"  ⚠️ JIT training step failed, falling back to non-JIT: {jit_error}")
-                # Fallback to non-JIT version
+                print(f"  ⚠️ JIT训练步骤失败了，切换到普通模式重试: {jit_error}")
                 try:
                     current_params, current_opt_state, metrics, extra_metrics = complete_training_step(
                         current_params, current_opt_state, batch, components, config, optimizer, step_key
                     )
                     successful_batches += 1
                 except Exception as fallback_error:
-                    print(f"  ❌ Both JIT and non-JIT training failed: {fallback_error}")
+                    print(f"  ❌ 普通模式也失败了: {fallback_error}")
                     failed_batches += 1
-                    # Skip this batch but continue training
                     continue
             
-            # Update performance monitoring
             step_number = epoch * n_batches + batch_idx
             gradient_norm = float(metrics.get('gradient_norm', 0.0))
             total_loss = float(metrics.get('total_loss', 0.0))
@@ -957,15 +915,13 @@ def run_training_epoch(
                 step=step_number
             )
             
-            # Update curriculum learning progress
             curriculum_advanced = curriculum_manager.update_progress(
                 total_loss, step_number
             )
             
             if curriculum_advanced:
-                print(f"  🎓 Curriculum advanced to stage: {curriculum_manager.current_stage}")
+                print(f"  🎓 课程学习进入下一阶段: {curriculum_manager.current_stage}")
             
-            # Update adaptive loss weights
             loss_components = {
                 'policy_loss': total_loss,
                 'safety_loss': float(extra_metrics.get('safety_violations', 0)),
@@ -974,9 +930,7 @@ def run_training_epoch(
             
             updated_weights = loss_balancer.update_weights(loss_components, step_number)
             
-            # Collect comprehensive metrics with better error handling
             def safe_float_conversion(v):
-                """Safely convert values to float"""
                 try:
                     if hasattr(v, 'item'):
                         return float(v.item())
@@ -985,7 +939,7 @@ def run_training_epoch(
                     elif hasattr(v, '__float__'):
                         return float(v)
                     else:
-                        return 0.0  # Default fallback
+                        return 0.0
                 except (ValueError, TypeError, AttributeError):
                     return 0.0
             
@@ -1001,27 +955,24 @@ def run_training_epoch(
             }
             epoch_metrics.append(batch_metrics)
             
-            # Enhanced progress logging
             if batch_idx % 10 == 0 or batch_idx == n_batches - 1:
                 current_stage_info = curriculum_manager.get_current_stage()
-                print(f"  Batch {batch_idx+1}/{n_batches}: "
-                      f"Loss={total_loss:.6f}, "
-                      f"Goal Success={extra_metrics.get('goal_success_rate', 0):.3f}, "
-                      f"SeqLen={effective_sequence_length}, "
-                      f"GradNorm={gradient_norm:.4f}")
+                print(f"  批次 {batch_idx+1}/{n_batches}: "
+                      f"损失={total_loss:.6f}, "
+                      f"目标成功率={extra_metrics.get('goal_success_rate', 0):.3f}, "
+                      f"序列长度={effective_sequence_length}, "
+                      f"梯度范数={gradient_norm:.4f}")
                 
-                # Performance warnings
                 if diagnostics.get('gradient_explosion', False):
-                    print(f"    ⚠️  Gradient explosion detected!")
+                    print(f"    ⚠️  检测到梯度爆炸！")
                 if diagnostics.get('loss_plateaued', False):
-                    print(f"    📉 Loss plateau detected")
+                    print(f"    📉 损失进入平台期")
                 if diagnostics.get('training_unstable', False):
-                    print(f"    🌊 Training instability detected")
+                    print(f"    🌊 训练不稳定")
                     
         except Exception as batch_error:
-            print(f"  ❌ Critical error in batch {batch_idx}: {batch_error}")
+            print(f"  ❌ 批次 {batch_idx} 发生严重错误: {batch_error}")
             failed_batches += 1
-            # Add failure metrics for this batch
             epoch_metrics.append({
                 'total_loss': float('inf'),
                 'batch_success': False,
@@ -1029,21 +980,18 @@ def run_training_epoch(
             })
             continue
     
-    # Report batch success rate
     total_batches = successful_batches + failed_batches
     if total_batches > 0:
         success_rate = successful_batches / total_batches
-        print(f"  📊 Batch success rate: {success_rate:.2%} ({successful_batches}/{total_batches})")
+        print(f"  📊 批次成功率: {success_rate:.2%} ({successful_batches}/{total_batches})")
         
         if success_rate < 0.5:
-            print("  ⚠️ Warning: High batch failure rate. Consider reducing batch size or sequence length.")
+            print("  ⚠️ 警告: 批次失败率太高了，考虑减小批大小或序列长度。")
     
-    # Aggregate epoch metrics (only from successful batches)
     successful_metrics = [m for m in epoch_metrics if m.get('batch_success', True)]
     
     if not successful_metrics:
-        print("  ❌ No successful batches in this epoch!")
-        # Return current state without changes
+        print("  ❌ 这个epoch里没有一个批次是成功的！")
         return current_params, current_opt_state, {'total_loss': float('inf'), 'success_rate': 0.0}
     
     aggregated_metrics = {}
@@ -1053,9 +1001,8 @@ def run_training_epoch(
             if values:
                 aggregated_metrics[key] = float(jnp.mean(jnp.array(values)))
         else:
-            aggregated_metrics[key] = successful_metrics[-1][key]  # Take last value for non-numeric
+            aggregated_metrics[key] = successful_metrics[-1][key]
     
-    # Add epoch-level metrics
     aggregated_metrics['batch_success_rate'] = success_rate if total_batches > 0 else 1.0
     aggregated_metrics['failed_batches'] = failed_batches
     aggregated_metrics['successful_batches'] = successful_batches
@@ -1069,17 +1016,15 @@ def run_validation(
     config,
     key: chex.PRNGKey
 ) -> Dict:
-    """Run validation to assess model performance"""
-    print("🔍 Running validation...")
+    """跑一下验证集，评估一下模型性能。"""
+    print("🔍 正在跑验证集...")
     
-    # Generate validation batch
     val_batch = generate_training_batch(
         config, key, config.training.validation_batch_size
     )
     
-    # Run forward pass without gradients
     loss, metrics, extra_metrics = complete_forward_pass(
-        params, val_batch, components, config, key  # Pass config
+        params, val_batch, components, config, key
     )
     
     validation_metrics = {
@@ -1090,9 +1035,9 @@ def run_validation(
         "val_control_effort": float(extra_metrics['control_effort'])
     }
     
-    print(f"  Validation Loss: {validation_metrics['val_loss']:.6f}")
-    print(f"  Goal Success Rate: {validation_metrics['val_goal_success_rate']:.3f}")
-    print(f"  Safety Violations: {validation_metrics['val_safety_violations']}")
+    print(f"  验证集损失: {validation_metrics['val_loss']:.6f}")
+    print(f"  目标成功率: {validation_metrics['val_goal_success_rate']:.3f}")
+    print(f"  安全违规次数: {validation_metrics['val_safety_violations']}")
     
     return validation_metrics
 
@@ -1102,59 +1047,53 @@ def save_checkpoint(
     checkpoint_dir: Path,
     is_best: bool = False
 ):
-    """Save training checkpoint with enhanced metadata and error handling"""
+    """保存训练状态到检查点，带增强的元数据和错误处理。"""
     try:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-        # Enhanced checkpoint metadata
         checkpoint_metadata = {
             'timestamp': time.time(),
             'step': training_state.step,
             'epoch': training_state.epoch,
             'best_loss': training_state.best_loss,
             'total_training_time': getattr(training_state, 'total_training_time', 0),
-            'version': '1.0',  # Checkpoint format version
+            'version': '1.0',
             'jax_version': jax.__version__,
         }
         
-        # Prepare checkpoint data
         checkpoint_data = {
             'training_state': training_state,
             'metadata': checkpoint_metadata
         }
         
-        # Save current checkpoint
         checkpoint_path = checkpoint_dir / f"checkpoint_{training_state.step:06d}.pkl"
         with open(checkpoint_path, 'wb') as f:
             pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
         
-        # Save best model if applicable
         if is_best:
             best_path = checkpoint_dir / "best_model.pkl"
             with open(best_path, 'wb') as f:
                 pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"💾 Saved best model at step {training_state.step} (loss: {training_state.best_loss:.6f})")
+            print(f"💾 已保存当前最佳模型 (第 {training_state.step} 步, 损失: {training_state.best_loss:.6f})")
         
-        # Save latest checkpoint link
         latest_path = checkpoint_dir / "latest_checkpoint.pkl"
         with open(latest_path, 'wb') as f:
             pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
         
-        print(f"💾 Checkpoint saved: {checkpoint_path}")
+        print(f"💾 检查点已保存: {checkpoint_path}")
         
-        # Clean up old checkpoints (keep only last 5)
+        # 清理一下旧的检查点，只保留最新的5个
         checkpoint_files = sorted(checkpoint_dir.glob("checkpoint_*.pkl"))
         if len(checkpoint_files) > 5:
             for old_checkpoint in checkpoint_files[:-5]:
                 try:
                     old_checkpoint.unlink()
-                    print(f"🗑️ Cleaned up old checkpoint: {old_checkpoint}")
+                    print(f"🗑️ 已清理旧的检查点: {old_checkpoint}")
                 except Exception as e:
-                    print(f"⚠️ Failed to clean up {old_checkpoint}: {e}")
+                    print(f"⚠️ 清理 {old_checkpoint} 失败: {e}")
                     
     except Exception as e:
-        print(f"❌ Failed to save checkpoint: {e}")
-        # Don't raise exception to avoid interrupting training
+        print(f"❌ 保存检查点失败: {e}")
         import traceback
         traceback.print_exc()
 
@@ -1162,32 +1101,30 @@ def save_checkpoint(
 def load_checkpoint(
     checkpoint_path: Path
 ) -> Optional[TrainingState]:
-    """Load training checkpoint with error handling"""
+    """加载训练检查点，带错误处理。"""
     try:
         if not checkpoint_path.exists():
-            print(f"⚠️ Checkpoint file not found: {checkpoint_path}")
+            print(f"⚠️ 找不到检查点文件: {checkpoint_path}")
             return None
             
         with open(checkpoint_path, 'rb') as f:
             checkpoint_data = pickle.load(f)
         
-        # Handle both old and new checkpoint formats
         if isinstance(checkpoint_data, dict) and 'training_state' in checkpoint_data:
             training_state = checkpoint_data['training_state']
             metadata = checkpoint_data.get('metadata', {})
-            print(f"📥 Loaded checkpoint from step {training_state.step}")
+            print(f"📥 已从第 {training_state.step} 步加载检查点")
             if 'timestamp' in metadata:
                 checkpoint_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(metadata['timestamp']))
-                print(f"   Created: {checkpoint_time}")
+                print(f"   创建于: {checkpoint_time}")
         else:
-            # Legacy format
             training_state = checkpoint_data
-            print(f"📥 Loaded legacy checkpoint from step {training_state.step}")
+            print(f"📥 已从第 {training_state.step} 步加载旧版检查点")
             
         return training_state
         
     except Exception as e:
-        print(f"❌ Failed to load checkpoint: {e}")
+        print(f"❌ 加载检查点失败: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -1198,32 +1135,27 @@ def find_and_resume_training(
     components: SystemComponents,
     config
 ) -> Tuple[Optional[TrainingState], bool]:
-    """Smart training resumption with state validation and recovery"""
-    print(f"🔍 Looking for checkpoints in {checkpoint_dir}")
+    """智能地恢复训练，带状态验证和恢复功能。"""
+    print(f"🔍 正在 {checkpoint_dir} 寻找检查点")
     
-    # Find the latest valid checkpoint
     latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
     if latest_checkpoint is None:
-        print("   No previous checkpoints found - starting fresh training")
+        print("   没有找到之前的检查点 - 开始新的训练")
         return None, False
     
-    print(f"   Found checkpoint: {latest_checkpoint}")
+    print(f"   找到了检查点: {latest_checkpoint}")
     
-    # Load checkpoint
     loaded_state, checkpoint_info = load_checkpoint(latest_checkpoint, components)
     if loaded_state is None:
-        print("   Failed to load checkpoint - starting fresh training")
+        print("   加载检查点失败 - 开始新的训练")
         return None, False
     
-    # Validate loaded state compatibility
     compatibility_issues = []
     
-    # Check configuration compatibility
     if hasattr(loaded_state, 'config') and loaded_state.config:
         loaded_config = loaded_state.config
         current_config_dict = config.__dict__ if hasattr(config, '__dict__') else dict(config)
         
-        # Key parameters that should match
         critical_params = [
             ('training.batch_size', 'batch_size'),
             ('training.sequence_length', 'sequence_length'),
@@ -1232,7 +1164,6 @@ def find_and_resume_training(
         
         for config_path, param_name in critical_params:
             try:
-                # Navigate nested config
                 current_val = current_config_dict
                 loaded_val = loaded_config
                 
@@ -1245,46 +1176,40 @@ def find_and_resume_training(
             except (AttributeError, KeyError):
                 continue
     
-    # Display compatibility status
     if compatibility_issues:
-        print("   ⚠️ Configuration differences detected:")
+        print("   ⚠️  检测到配置差异:")
         for issue in compatibility_issues:
             print(f"      {issue}")
         
-        # Ask for confirmation in interactive mode
-        proceed = True  # Auto-proceed for now
+        proceed = True
         if not proceed:
-            print("   Training resumption cancelled")
+            print("   已取消恢复训练")
             return None, False
     
-    # Validate parameter structure compatibility
     try:
-        # Test parameter tree structure
         test_leaves_loaded = jax.tree_util.tree_leaves(loaded_state.params)
-        print(f"   Loaded parameters: {sum(p.size if hasattr(p, 'size') else 0 for p in test_leaves_loaded)}")
+        print(f"   已加载的参数量: {sum(p.size if hasattr(p, 'size') else 0 for p in test_leaves_loaded)}")
         
-        # Ensure all required fields exist
         required_fields = ['step', 'epoch', 'params', 'optimizer_state', 'loss_history']
         missing_fields = [f for f in required_fields if not hasattr(loaded_state, f)]
         
         if missing_fields:
-            print(f"   ❌ Missing required fields: {missing_fields}")
+            print(f"   ❌ 缺少必要字段: {missing_fields}")
             return None, False
             
     except Exception as e:
-        print(f"   ❌ Parameter validation failed: {e}")
+        print(f"   ❌ 参数验证失败: {e}")
         return None, False
     
-    # Display resumption info
     performance_stats = checkpoint_info.get('performance_stats', {})
-    print(f"   ✅ Resuming from step {loaded_state.step}, epoch {loaded_state.epoch}")
-    print(f"   📊 Best loss so far: {loaded_state.best_loss:.6f}")
-    print(f"   ⏱️ Total training time: {loaded_state.total_training_time:.1f}s")
+    print(f"   ✅ 从第 {loaded_state.step} 步, 第 {loaded_state.epoch} 轮恢复训练")
+    print(f"   📊 目前最佳损失: {loaded_state.best_loss:.6f}")
+    print(f"   ⏱️ 已训练总时长: {loaded_state.total_training_time:.1f}s")
     
     if performance_stats:
-        print(f"   📈 Recent performance:")
-        print(f"      Gradient norm: {performance_stats.get('avg_gradient_norm', 0):.6f}")
-        print(f"      Batch success: {performance_stats.get('batch_success_rate', 1.0):.3f}")
+        print(f"   📈 最近性能:")
+        print(f"      梯度范数: {performance_stats.get('avg_gradient_norm', 0):.6f}")
+        print(f"      批次成功率: {performance_stats.get('batch_success_rate', 1.0):.3f}")
     
     return loaded_state, True
 
@@ -1294,25 +1219,21 @@ def adaptive_training_strategy(
     components: SystemComponents,
     config
 ) -> Dict[str, Any]:
-    """Adaptive training strategy based on current performance"""
+    """根据当前性能自适应调整训练策略。"""
     strategy_adjustments = {}
     
-    # Analyze recent training progress
     recent_losses = training_state.loss_history[-20:] if len(training_state.loss_history) >= 20 else training_state.loss_history
     recent_gradients = training_state.gradient_norms_history[-20:] if len(training_state.gradient_norms_history) >= 20 else []
     
-    # Detect training issues
     issues_detected = []
     
     if len(recent_losses) >= 10:
-        # Check for loss stagnation
         recent_improvement = recent_losses[0] - recent_losses[-1]
         if recent_improvement < 0.01 * recent_losses[0]:
             issues_detected.append("loss_stagnation")
             strategy_adjustments['reduce_lr'] = 0.5
             strategy_adjustments['increase_batch_size'] = 1.5
         
-        # Check for loss explosion
         if any(l > 2 * recent_losses[0] for l in recent_losses[-5:]):
             issues_detected.append("loss_explosion")
             strategy_adjustments['reduce_lr'] = 0.1
@@ -1321,19 +1242,16 @@ def adaptive_training_strategy(
     if recent_gradients:
         avg_grad_norm = float(jnp.mean(jnp.array(recent_gradients)))
         
-        # Vanishing gradients
         if avg_grad_norm < 1e-6:
             issues_detected.append("vanishing_gradients")
             strategy_adjustments['increase_lr'] = 2.0
             strategy_adjustments['reduce_gradient_clipping'] = 0.5
         
-        # Exploding gradients
         elif avg_grad_norm > 10.0:
             issues_detected.append("exploding_gradients")
             strategy_adjustments['increase_gradient_clipping'] = 2.0
             strategy_adjustments['reduce_lr'] = 0.3
     
-    # Check batch success rate
     if training_state.batch_success_rates:
         recent_success_rate = float(jnp.mean(jnp.array(training_state.batch_success_rates[-20:])))
         if recent_success_rate < 0.8:
@@ -1341,7 +1259,6 @@ def adaptive_training_strategy(
             strategy_adjustments['reduce_batch_size'] = 0.75
             strategy_adjustments['reduce_sequence_length'] = 0.8
     
-    # Curriculum advancement check
     if hasattr(components, 'curriculum_manager'):
         current_stage = getattr(components.curriculum_manager, 'current_stage', 0)
         if current_stage < 2 and len(recent_losses) >= 10:
@@ -1356,54 +1273,52 @@ def adaptive_training_strategy(
 
 
 def generate_training_recommendations(issues: list, adjustments: Dict[str, Any]) -> list:
-    """Generate human-readable training recommendations"""
+    """生成一些人类可读的训练建议。"""
     recommendations = []
     
     if "loss_stagnation" in issues:
-        recommendations.append("💡 Loss has plateaued. Consider: learning rate decay, curriculum advancement, or architecture changes.")
+        recommendations.append("💡 损失进入平台期了。可以考虑：用学习率衰减、推进课程学习、或者改改网络结构。")
     
     if "loss_explosion" in issues:
-        recommendations.append("⚠️ Loss instability detected. Reducing learning rate and sequence length.")
+        recommendations.append("⚠️ 损失不稳定。正在降低学习率和序列长度。")
     
     if "vanishing_gradients" in issues:
-        recommendations.append("🔍 Vanishing gradients detected. Consider: higher learning rate, residual connections, or attention mechanisms.")
+        recommendations.append("🔍 检测到梯度消失。可以考虑：提高学习率、用残差连接、或者引入注意力机制。")
     
     if "exploding_gradients" in issues:
-        recommendations.append("💥 Exploding gradients detected. Implementing stronger gradient clipping and learning rate reduction.")
+        recommendations.append("💥 检测到梯度爆炸。正在用更强的梯度裁剪和更低的学习率。")
     
     if "batch_failures" in issues:
-        recommendations.append("🔄 High batch failure rate. Reducing computational load per batch.")
+        recommendations.append("🔄 批次失败率有点高。正在降低每个批次的计算负载。")
     
     if adjustments.get('advance_curriculum'):
-        recommendations.append("🎓 Ready for curriculum advancement based on consistent improvement.")
+        recommendations.append("🎓 进步明显，准备进入课程学习的下一阶段。")
     
     if not issues:
-        recommendations.append("✅ Training appears stable. Continuing with current strategy.")
+        recommendations.append("✅ 训练看起来很稳定，继续保持当前策略。")
     
     return recommendations
 
 
 def monitor_training_memory(step: int, return_info: bool = False) -> Optional[Dict]:
-    """Enhanced memory monitoring with trend analysis"""
+    """一个增强版的内存监控，能分析趋势。"""
     try:
         from utils.memory_optimization import get_memory_info
         memory_info = get_memory_info()
         
         if memory_info['system_used_percent'] > 90:
-            print(f"  🐏 High memory usage at step {step}: {memory_info['system_used_percent']:.1f}%")
+            print(f"  🐏 第 {step} 步内存占用过高: {memory_info['system_used_percent']:.1f}%")
             
-            # Suggest memory optimizations
             if memory_info['system_used_percent'] > 95:
-                print("     💡 Consider: reducing batch size or sequence length")
+                print("     💡 建议：减小批大小或者序列长度。")
                 
         elif memory_info['system_used_percent'] > 85:
-            print(f"  📊 Memory usage at step {step}: {memory_info['system_used_percent']:.1f}%")
+            print(f"  📊 第 {step} 步内存占用: {memory_info['system_used_percent']:.1f}%")
             
         if return_info:
             return memory_info
             
     except ImportError:
-        # Fallback memory monitoring using basic system info
         import psutil
         memory = psutil.virtual_memory()
         basic_info = {
@@ -1412,14 +1327,14 @@ def monitor_training_memory(step: int, return_info: bool = False) -> Optional[Di
         }
         
         if memory.percent > 90:
-            print(f"  🐏 High memory usage at step {step}: {memory.percent:.1f}%")
+            print(f"  🐏 第 {step} 步内存占用过高: {memory.percent:.1f}%")
             
         if return_info:
             return basic_info
             
     except Exception as e:
-        if step % 50 == 0:  # Only log occasionally to avoid spam
-            print(f"  ⚠️ Memory monitoring failed: {e}")
+        if step % 50 == 0:
+            print(f"  ⚠️ 内存监控失败了: {e}")
         
         if return_info:
             return None
@@ -1430,7 +1345,7 @@ def create_enhanced_training_state(
     optimizer_state: optax.OptState,
     config
 ) -> TrainingState:
-    """Create an enhanced training state with all tracking features"""
+    """创建一个带所有追踪功能的增强版训练状态。"""
     return TrainingState(
         step=0,
         epoch=0,
@@ -1454,29 +1369,25 @@ def create_enhanced_training_state(
     )
 
 def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
-    """Enhanced checkpoint discovery with validation"""
+    """一个增强版的检查点发现功能，带验证。"""
     try:
         if not checkpoint_dir.exists():
             return None
             
-        # First check for explicit latest checkpoint
         latest_path = checkpoint_dir / "latest_checkpoint.pkl"
         if latest_path.exists():
-            # Validate the latest checkpoint
             try:
                 with open(latest_path, 'rb') as f:
                     checkpoint_data = pickle.load(f)
                 if isinstance(checkpoint_data, dict) or hasattr(checkpoint_data, 'step'):
                     return latest_path
             except:
-                print("   ⚠️ Latest checkpoint appears corrupted, searching for alternatives...")
+                print("   ⚠️ 最新的检查点好像坏了，找找别的...")
             
-        # Fall back to finding numerically latest checkpoint
         checkpoint_files = list(checkpoint_dir.glob("checkpoint_*.pkl"))
         if not checkpoint_files:
             return None
             
-        # Extract step numbers and find latest valid checkpoint
         valid_checkpoints = []
         
         for checkpoint_file in checkpoint_files:
@@ -1484,30 +1395,28 @@ def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
                 step_str = checkpoint_file.stem.split('_')[-1]
                 step_num = int(step_str)
                 
-                # Quick validation - try to load the checkpoint
                 with open(checkpoint_file, 'rb') as f:
                     checkpoint_data = pickle.load(f)
                 
                 if isinstance(checkpoint_data, dict) or hasattr(checkpoint_data, 'step'):
                     valid_checkpoints.append((step_num, checkpoint_file))
             except (ValueError, IndexError, EOFError, pickle.UnpicklingError):
-                print(f"   ⚠️ Skipping corrupted checkpoint: {checkpoint_file}")
+                print(f"   ⚠️ 跳过已损坏的检查点: {checkpoint_file}")
                 continue
                 
         if not valid_checkpoints:
             return None
             
-        # Return the latest valid checkpoint
         valid_checkpoints.sort(key=lambda x: x[0], reverse=True)
         return valid_checkpoints[0][1]
         
     except Exception as e:
-        print(f"❌ Error finding latest checkpoint: {e}")
+        print(f"❌ 寻找最新检查点时出错: {e}")
         return None
 
 
 def create_backup_checkpoint(training_state: TrainingState, checkpoint_dir: Path):
-    """Create a backup checkpoint with timestamp"""
+    """创建一个带时间戳的备份检查点。"""
     try:
         backup_dir = checkpoint_dir / "backups"
         backup_dir.mkdir(exist_ok=True)
@@ -1528,19 +1437,19 @@ def create_backup_checkpoint(training_state: TrainingState, checkpoint_dir: Path
         with open(backup_path, 'wb') as f:
             pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
         
-        print(f"💾 Backup checkpoint created: {backup_path}")
+        print(f"💾 备份检查点已创建: {backup_path}")
         
-        # Clean up old backups (keep only last 3)
+        # 清理一下旧的备份，只保留最新的3个
         backup_files = sorted(backup_dir.glob("backup_*.pkl"), key=lambda x: x.stat().st_mtime)
         if len(backup_files) > 3:
             for old_backup in backup_files[:-3]:
                 try:
                     old_backup.unlink()
                 except Exception as e:
-                    print(f"⚠️ Could not clean up old backup: {e}")
+                    print(f"⚠️ 清理旧备份失败: {e}")
                     
     except Exception as e:
-        print(f"❌ Failed to create backup checkpoint: {e}")
+        print(f"❌ 创建备份检查点失败: {e}")
 
 
 def validate_complete_system_integration(
@@ -1548,36 +1457,36 @@ def validate_complete_system_integration(
     params: Dict,
     config
 ) -> bool:
-    """Comprehensive validation of the complete Stage 4 system"""
+    """对我们第四阶段的完整系统进行全面验证。"""
     print("\n" + "=" * 60)
-    print("🔍 STAGE 4 SYSTEM VALIDATION")
+    print("🔍 第四阶段系统验证")
     print("=" * 60)
     
     try:
-        # Test 1: Generate and process a single scenario
+        # 测试1: 生成并处理一个场景
         key = random.PRNGKey(42)
         test_scenario = generate_training_scenario(config, key)
-        print("✅ Test 1: Scenario generation - PASSED")
+        print("✅ 测试 1: 场景生成 - 通过")
         
-        # Test 2: Batch processing
+        # 测试2: 批处理
         test_batch = generate_training_batch(config, key, batch_size=2)
-        print("✅ Test 2: Batch generation - PASSED")
+        print("✅ 测试 2: 批次生成 - 通过")
         
-        # Test 3: Forward pass without gradients
+        # 测试3: 不带梯度的前向传播
         loss, metrics, extra = complete_forward_pass(
-            params, test_batch, components, config, key  # Pass config
+            params, test_batch, components, config, key
         )
         
-        assert jnp.isfinite(loss), "Loss must be finite"
+        assert jnp.isfinite(loss), "损失必须是有限值"
         metrics_leaves = jax.tree_util.tree_leaves(metrics)
-        assert all(jnp.isfinite(leaf) for leaf in metrics_leaves), "All metrics must be finite"
-        print("✅ Test 3: Forward pass computation - PASSED")
-        print(f"   Forward pass loss: {loss:.6f}")
+        assert all(jnp.isfinite(leaf) for leaf in metrics_leaves), "所有指标必须是有限值"
+        print("✅ 测试 3: 前向传播计算 - 通过")
+        print(f"   前向传播损失: {loss:.6f}")
         
-        # Test 4: Gradient computation
+        # 测试4: 梯度计算
         def test_loss_fn(test_params):
             test_loss, _, _ = complete_forward_pass(
-                test_params, test_batch, components, config, key  # Pass config
+                test_params, test_batch, components, config, key
             )
             return test_loss
         
@@ -1586,25 +1495,23 @@ def validate_complete_system_integration(
             jnp.sum(g ** 2) for g in jax.tree_util.tree_leaves(test_gradients)
         ))
         
-        assert jnp.isfinite(gradient_norm), "Gradient norm must be finite"
-        print("✅ Test 4: Gradient computation - PASSED")
-        print(f"   Gradient norm: {gradient_norm:.6f}")
+        assert jnp.isfinite(gradient_norm), "梯度范数必须是有限值"
+        print("✅ 测试 4: 梯度计算 - 通过")
+        print(f"   梯度范数: {gradient_norm:.6f}")
         
-        # Accept smaller gradients for the simplified system
         if gradient_norm > 1e-12:
-            print("   ✅ Gradients are present and finite")
+            print("   ✅ 梯度存在且有效")
         else:
-            print("   ⚠️  Very small gradients - may indicate simplified control policy")
+            print("   ⚠️  梯度非常小 - 可能是因为用了简化的控制策略")
         
-        # Test 5: Complete training step (JIT compiled)
+        # 测试5: 完整的训练步骤
         optimizer = create_optimizer(config.training.learning_rate)
         optimizer_state = optimizer.init(params)
         
         new_params, new_opt_state, step_metrics, step_extra = complete_training_step(
-            params, optimizer_state, test_batch, components, config, optimizer, key  # Pass config
+            params, optimizer_state, test_batch, components, config, optimizer, key
         )
         
-        # Verify parameter updates
         param_diff_norm = jnp.sqrt(sum(
             jnp.sum((p1 - p2) ** 2) 
             for p1, p2 in zip(
@@ -1613,122 +1520,110 @@ def validate_complete_system_integration(
             )
         ))
         
-        print("✅ Test 5: Complete training step - PASSED")
-        print(f"   Parameter update norm: {param_diff_norm:.8f}")
+        print("✅ 测试 5: 完整训练步骤 - 通过")
+        print(f"   参数更新范数: {param_diff_norm:.8f}")
         
         if param_diff_norm > 1e-15:
-            print("   ✅ Parameters were updated (even if minimally)")
+            print("   ✅ 参数已更新")
         else:
-            print("   ⚠️  No parameter updates - expected with simplified control policy")
+            print("   ⚠️  参数没有更新 - 这在简化控制策略下是正常的")
         
-        # Test 6: JIT compilation verification - SKIPPED for validation
-        # The JIT compilation issue is due to passing non-array SystemComponents
-        # This can be fixed by restructuring the function signature with static_argnames
-        print("⚠️  Test 6: JIT compilation - SKIPPED (requires static_argnames fix)")
-        print("   The core system works correctly, JIT is an optimization")
+        print("⚠️  测试 6: JIT编译 - 跳过 (需要修复静态参数问题)")
+        print("   核心系统功能正常，JIT只是一个优化项")
         
-        print("\n🎉 STAGE 4 VALIDATION: ALL CRITICAL TESTS PASSED!")
-        print("\nKey accomplishments:")
-        print("  ✅ Complete end-to-end system integration")
-        print("  ✅ PyTree batching (solved Array of Structs problem)")  
-        print("  ✅ BPTT gradient flow through all components")
-        print("  ✅ Multi-objective loss function")
-        print("  ✅ Batch-compatible scan functions")
-        print("  ✅ GCBF+ safety framework integration")
-        print("  ✅ DiffPhysDrone physics integration")
-        print("  ✅ Comprehensive validation suite")
-        print("  ⚠️  JIT optimization pending (minor engineering task)")
+        print("\n🎉 第四阶段验证: 所有关键测试通过！")
+        print("\n主要成果:")
+        print("  ✅ 完整的端到端系统集成")
+        print("  ✅ PyTree批处理 (解决了结构体数组的问题)")  
+        print("  ✅ 所有组件的BPTT梯度流")
+        print("  ✅ 多目标损失函数")
+        print("  ✅ 批处理兼容的scan函数")
+        print("  ✅ GCBF+安全框架集成")
+        print("  ✅ DiffPhysDrone物理模型集成")
+        print("  ✅ 全面的验证套件")
+        print("  ⚠️  JIT优化待完成 (一个小工程问题)")
         
         return True
         
     except Exception as e:
-        print(f"❌ STAGE 4 VALIDATION FAILED: {e}")
+        print(f"❌ 第四阶段验证失败: {e}")
         import traceback
         traceback.print_exc()
         return False
-    """Validate basic physics engine functionality."""
+    """验证基础物理引擎的功能。"""
     print("\n" + "=" * 60)
-    print("VALIDATING BASIC PHYSICS ENGINE")
+    print("验证基础物理引擎")
     print("=" * 60)
     
-    # Create physics parameters and initial state
     params = PhysicsParams()
     initial_state = create_initial_drone_state(
         position=jnp.array([0.0, 0.0, 1.0]),
         velocity=jnp.array([0.0, 0.0, 0.0])
     )
     
-    print(f"Initial state: pos={initial_state.position}, vel={initial_state.velocity}")
+    print(f"初始状态: 位置={initial_state.position}, 速度={initial_state.velocity}")
     
-    # Test free fall (zero thrust)
+    # 测试自由落体（零推力）
     zero_control = jnp.zeros(3)
     state_after_fall = dynamics_step(initial_state, zero_control, params)
     
-    print(f"After free fall: pos={state_after_fall.position}, vel={state_after_fall.velocity}")
+    print(f"自由落体后: 位置={state_after_fall.position}, 速度={state_after_fall.velocity}")
     
-    # Should fall due to gravity
-    assert state_after_fall.position[2] < initial_state.position[2], "Drone should fall with zero thrust"
-    assert state_after_fall.velocity[2] < 0, "Downward velocity should develop"
+    assert state_after_fall.position[2] < initial_state.position[2], "零推力下无人机应该下落"
+    assert state_after_fall.velocity[2] < 0, "应该产生向下的速度"
     
-    # Test hover equilibrium
+    # 测试悬停平衡
     hover_thrust = jnp.array([0.0, 0.0, 1.0 / params.thrust_to_weight])
     state_after_hover = dynamics_step(initial_state, hover_thrust, params)
     
-    print(f"After hover thrust: pos={state_after_hover.position}, vel={state_after_hover.velocity}")
+    print(f"悬停推力后: 位置={state_after_hover.position}, 速度={state_after_hover.velocity}")
     
-    # Altitude change should be minimal with proper hover thrust
     altitude_change = abs(state_after_hover.position[2] - initial_state.position[2])
-    assert altitude_change < 0.1, f"Hover should maintain altitude, got change: {altitude_change}"
+    assert altitude_change < 0.1, f"悬停应该保持高度, 但高度变化了: {altitude_change}"
     
-    # Validate state integrity
-    assert validate_physics_state(state_after_fall), "Physics state should remain valid"
-    assert validate_physics_state(state_after_hover), "Physics state should remain valid"
+    assert validate_physics_state(state_after_fall), "物理状态应保持有效"
+    assert validate_physics_state(state_after_hover), "物理状态应保持有效"
     
-    print("✅ Basic physics engine validation: PASSED")
+    print("✅ 基础物理引擎验证: 通过")
     return True
 
 
 def validate_gradient_flow():
-    """Validate end-to-end gradient computation through physics engine."""
+    """验证端到端的梯度计算是否能穿过物理引擎。"""
     print("\n" + "=" * 60)
-    print("VALIDATING GRADIENT FLOW")
+    print("验证梯度流")
     print("=" * 60)
     
     params = PhysicsParams()
     initial_state = create_initial_drone_state(jnp.array([0.0, 0.0, 1.0]))
     
     def single_step_loss(control_input):
-        """Simple loss function for gradient testing."""
+        """一个简单的损失函数，用来测梯度。"""
         new_state = dynamics_step(initial_state, control_input, params)
-        # Minimize distance to target position [1, 1, 2]
         target = jnp.array([1.0, 1.0, 2.0])
         return jnp.sum((new_state.position - target) ** 2)
     
-    # Compute analytical gradients
     control_input = jnp.array([0.1, 0.2, 0.3])
     analytical_gradients = grad(single_step_loss)(control_input)
     
-    print(f"Control input: {control_input}")
-    print(f"Analytical gradients: {analytical_gradients}")
+    print(f"控制输入: {control_input}")
+    print(f"解析梯度: {analytical_gradients}")
     
-    # Verify gradients are finite and non-zero
-    assert jnp.all(jnp.isfinite(analytical_gradients)), "Gradients must be finite"
-    assert jnp.linalg.norm(analytical_gradients) > 1e-6, "Gradients should be meaningful"
+    assert jnp.all(jnp.isfinite(analytical_gradients)), "梯度必须是有限值"
+    assert jnp.linalg.norm(analytical_gradients) > 1e-6, "梯度应该有意义，不能太小"
     
-    # Test multi-step gradient flow (simplified BPTT)
+    # 测试多步的梯度流（简化的BPTT）
     def multi_step_loss(initial_control):
-        """Multi-step simulation loss for BPTT testing."""
+        """一个多步仿真的损失，用来测BPTT。"""
         state = initial_state
         total_loss = 0.0
         
-        # Apply same control for multiple steps
         for step in range(5):
             state = dynamics_step(state, initial_control, params)
-            # Accumulate position tracking loss
             target = jnp.array([1.0, 1.0, 2.0])
             step_loss = jnp.sum((state.position - target) ** 2)
             
-            # Apply temporal gradient decay (DiffPhysDrone innovation)
+            # 用一下时间梯度衰减
             decayed_loss = apply_temporal_gradient_decay(
                 step_loss, step, params.gradient_decay_alpha, params.dt
             )
@@ -1737,121 +1632,107 @@ def validate_gradient_flow():
         return total_loss
     
     multi_step_gradients = grad(multi_step_loss)(control_input)
-    print(f"Multi-step BPTT gradients: {multi_step_gradients}")
+    print(f"多步BPTT梯度: {multi_step_gradients}")
     
-    # Verify multi-step gradients
-    assert jnp.all(jnp.isfinite(multi_step_gradients)), "Multi-step gradients must be finite"
-    assert jnp.linalg.norm(multi_step_gradients) > 1e-6, "Multi-step gradients should be meaningful"
+    assert jnp.all(jnp.isfinite(multi_step_gradients)), "多步梯度必须是有限值"
+    assert jnp.linalg.norm(multi_step_gradients) > 1e-6, "多步梯度应该有意义"
     
-    print("✅ Gradient flow validation: PASSED")
+    print("✅ 梯度流验证: 通过")
     return True
 
 
 def validate_jit_compilation():
-    """Validate JIT compilation functionality and performance."""
+    """验证JIT编译功能和性能。"""
     print("\n" + "=" * 60)
-    print("VALIDATING JIT COMPILATION")
+    print("验证JIT编译")
     print("=" * 60)
     
     params = PhysicsParams()
     initial_state = create_initial_drone_state(jnp.array([0.0, 0.0, 1.0]))
     control_input = jnp.array([0.1, 0.1, 0.3])
     
-    # Compare JIT and non-JIT results
     normal_result = dynamics_step(initial_state, control_input, params)
     jit_result = dynamics_step_jit(initial_state, control_input, params)
     
-    # Results should be identical
     position_diff = jnp.linalg.norm(normal_result.position - jit_result.position)
     velocity_diff = jnp.linalg.norm(normal_result.velocity - jit_result.velocity)
     
-    print(f"Position difference (JIT vs normal): {position_diff}")
-    print(f"Velocity difference (JIT vs normal): {velocity_diff}")
+    print(f"位置差异 (JIT vs 普通): {position_diff}")
+    print(f"速度差异 (JIT vs 普通): {velocity_diff}")
     
-    assert position_diff < 1e-10, "JIT and normal results should match exactly"
-    assert velocity_diff < 1e-10, "JIT and normal results should match exactly"
+    assert position_diff < 1e-10, "JIT和普通版本的结果应该完全一样"
+    assert velocity_diff < 1e-10, "JIT和普通版本的结果应该完全一样"
     
-    # Performance benchmark
     n_iterations = 1000
     
-    # Warmup JIT compilation
     _ = dynamics_step_jit(initial_state, control_input, params)
     
-    # Benchmark JIT performance
     start_time = time.time()
     state = initial_state
     for _ in range(n_iterations):
         state = dynamics_step_jit(state, control_input, params)
     jit_time = time.time() - start_time
     
-    # Benchmark normal performance (without JIT warmup overhead)
     start_time = time.time()
     state = initial_state  
     for _ in range(n_iterations):
         state = dynamics_step(state, control_input, params)
     normal_time = time.time() - start_time
     
-    print(f"Performance comparison ({n_iterations} iterations):")
-    print(f"  JIT compiled: {jit_time:.4f}s ({jit_time/n_iterations*1000:.2f}ms per step)")
-    print(f"  Normal: {normal_time:.4f}s ({normal_time/n_iterations*1000:.2f}ms per step)")
-    print(f"  Speedup: {normal_time/jit_time:.1f}x")
+    print(f"性能对比 ({n_iterations} 次迭代):")
+    print(f"  JIT编译版: {jit_time:.4f}s ({jit_time/n_iterations*1000:.2f}ms 每步)")
+    print(f"  普通版: {normal_time:.4f}s ({normal_time/n_iterations*1000:.2f}ms 每步)")
+    print(f"  加速比: {normal_time/jit_time:.1f}x")
     
-    # JIT should be faster (allow some variance)
     if jit_time < normal_time:
-        print("✅ JIT provides performance improvement")
+        print("✅ JIT带来了性能提升")
     else:
-        print("⚠️  JIT may not show improvement for this simple case (acceptable)")
+        print("⚠️  在这个简单场景下JIT可能没啥提升（正常）")
     
-    print("✅ JIT compilation validation: PASSED")
+    print("✅ JIT编译验证: 通过")
     return True
 
 
 def validate_temporal_gradient_decay():
-    """Validate temporal gradient decay mechanism from DiffPhysDrone."""
+    """验证时间梯度衰减机制。"""
     print("\n" + "=" * 60) 
-    print("VALIDATING TEMPORAL GRADIENT DECAY")
+    print("验证时间梯度衰减")
     print("=" * 60)
     
-    # Test decay schedule creation
     sequence_length = 10
     alpha = 0.9
     dt = 0.1
     
     decay_schedule = create_temporal_decay_schedule(sequence_length, alpha, dt)
-    print(f"Decay schedule: {decay_schedule}")
+    print(f"衰减序列: {decay_schedule}")
     
-    # Verify exponential decay pattern
     expected_schedule = jnp.array([alpha**(i * dt) for i in range(sequence_length)])
-    assert jnp.allclose(decay_schedule, expected_schedule), "Decay schedule should follow exponential pattern"
+    assert jnp.allclose(decay_schedule, expected_schedule), "衰减序列应该符合指数规律"
     
-    # Test gradient decay application
     test_gradient = jnp.ones(3)
     
     decay_factors = []
     for timestep in range(5):
         decayed_grad = apply_temporal_gradient_decay(test_gradient, timestep, alpha, dt)
-        decay_factors.append(decayed_grad[0])  # All components should be identical
+        decay_factors.append(decayed_grad[0])
     
-    print(f"Decay factors over time: {decay_factors}")
+    print(f"随时间的衰减因子: {decay_factors}")
     
-    # Should decrease monotonically
     for i in range(1, len(decay_factors)):
-        assert decay_factors[i] <= decay_factors[i-1], "Decay should be monotonically decreasing"
+        assert decay_factors[i] <= decay_factors[i-1], "衰减应该是单调递减的"
     
-    # First factor should be 1.0 (no decay at t=0)
-    assert abs(decay_factors[0] - 1.0) < 1e-10, "No decay should be applied at timestep 0"
+    assert abs(decay_factors[0] - 1.0) < 1e-10, "在第0步不应该有衰减"
     
-    print("✅ Temporal gradient decay validation: PASSED")
+    print("✅ 时间梯度衰减验证: 通过")
     return True
 
 
 def validate_multi_agent_capability():
-    """Validate multi-agent physics and GCBF+ integration preparation."""
+    """验证多智能体物理和GCBF+集成准备情况。"""
     print("\n" + "=" * 60)
-    print("VALIDATING MULTI-AGENT CAPABILITY")
+    print("验证多智能体能力")
     print("=" * 60)
     
-    # Create multi-agent system
     n_agents = 4
     positions = jnp.array([
         [0.0, 0.0, 1.0],
@@ -1861,86 +1742,69 @@ def validate_multi_agent_capability():
     ])
     
     multi_state = create_initial_multi_agent_state(positions)
-    print(f"Created multi-agent state with {n_agents} agents")
-    print(f"State shape: {multi_state.drone_states.shape}")
-    print(f"Adjacency matrix shape: {multi_state.adjacency_matrix.shape}")
+    print(f"创建了包含 {n_agents} 个智能体的多智能体状态")
+    print(f"状态形状: {multi_state.drone_states.shape}")
+    print(f"邻接矩阵形状: {multi_state.adjacency_matrix.shape}")
     
-    # Test multi-agent dynamics
     key = random.PRNGKey(42)
     control_inputs = random.normal(key, (n_agents, 3)) * 0.1
     
     params = PhysicsParams()
     new_multi_state = multi_agent_dynamics_step(multi_state, control_inputs, params)
     
-    # State should evolve
     state_changed = not jnp.allclose(new_multi_state.drone_states, multi_state.drone_states)
-    assert state_changed, "Multi-agent state should evolve with dynamics"
+    assert state_changed, "多智能体状态应该演化"
     
-    # Time should advance
-    assert new_multi_state.global_time > multi_state.global_time, "Global time should advance"
+    assert new_multi_state.global_time > multi_state.global_time, "全局时间应该推进"
     
-    # Adjacency matrix should be recomputed  
-    assert new_multi_state.adjacency_matrix.shape == (n_agents, n_agents), "Adjacency matrix shape preserved"
+    assert new_multi_state.adjacency_matrix.shape == (n_agents, n_agents), "邻接矩阵形状应保持"
     
-    # Test JIT compilation for multi-agent
     jit_multi_result = multi_agent_dynamics_step_jit(multi_state, control_inputs, params)
     
-    # Results should match
     states_match = jnp.allclose(new_multi_state.drone_states, jit_multi_result.drone_states, rtol=1e-10)
-    assert states_match, "JIT multi-agent results should match non-JIT"
+    assert states_match, "JIT和普通版本的多智能体结果应该匹配"
     
-    print("✅ Multi-agent capability validation: PASSED")
+    print("✅ 多智能体能力验证: 通过")
     return True
 
 
 def validate_system_integration():
-    """Validate complete system integration and readiness for Stage 2."""
+    """验证系统集成和为第二阶段做的准备。"""
     print("\n" + "=" * 60)
-    print("VALIDATING SYSTEM INTEGRATION")
+    print("验证系统集成")
     print("=" * 60)
     
-    # Load configuration
-    config = get_minimal_config()  # Use minimal config for faster testing
+    config = get_minimal_config()
     
-    # Create physics parameters from configuration
     params = PhysicsParams(
         dt=config.physics.dt,
         mass=config.physics.drone.mass,
         gradient_decay_alpha=config.physics.gradient_decay.alpha
     )
     
-    # Create initial state
     initial_state = create_initial_drone_state(jnp.array([0.0, 0.0, 1.0]))
     
-    # Simulate complete BPTT scenario
     def complete_simulation_loss(control_sequence):
-        """Complete simulation mimicking the future Stage 2 BPTT loop."""
+        """一个完整的仿真，模仿未来第二阶段的BPTT循环。"""
         state = initial_state
         total_loss = 0.0
         
         for step, control_input in enumerate(control_sequence):
-            # Physics step
             state = dynamics_step(state, control_input, params)
             
-            # Multiple loss components (mimicking future GCBF+ integration)
             target_position = jnp.array([2.0, 1.0, 3.0])
             
-            # Efficiency loss (position tracking)
             efficiency_loss = jnp.sum((state.position - target_position) ** 2)
             
-            # Safety loss (altitude constraint - simplified CBF)
             min_altitude = 0.5
             safety_loss = jnp.maximum(0.0, min_altitude - state.position[2]) ** 2
             
-            # Control smoothness loss
             control_loss = jnp.sum(control_input ** 2)
             
-            # Combine losses with weights from config
             step_loss = (config.training.loss_goal_coef * efficiency_loss + 
                         config.training.loss_cbf_coef * safety_loss +
                         config.training.loss_control_coef * control_loss)
             
-            # Apply temporal gradient decay
             if config.physics.gradient_decay.enable:
                 step_loss = apply_temporal_gradient_decay(
                     step_loss, step, params.gradient_decay_alpha, params.dt
@@ -1950,30 +1814,26 @@ def validate_system_integration():
         
         return total_loss
     
-    # Generate control sequence
     key = random.PRNGKey(12345)
     sequence_length = 10
     control_sequence = random.normal(key, (sequence_length, 3)) * 0.2
     
-    print(f"Running complete simulation with {sequence_length} steps...")
+    print(f"正在用 {sequence_length} 步跑一个完整的仿真...")
     
-    # Compute loss and gradients
     loss_value = complete_simulation_loss(control_sequence)
     gradients = grad(complete_simulation_loss)(control_sequence)
     
-    print(f"Simulation loss: {loss_value:.4f}")
-    print(f"Gradient statistics:")
-    print(f"  Shape: {gradients.shape}")
-    print(f"  Mean magnitude: {jnp.mean(jnp.abs(gradients)):.6f}")
-    print(f"  Max gradient: {jnp.max(jnp.abs(gradients)):.6f}")
-    print(f"  Gradient norm: {jnp.linalg.norm(gradients):.6f}")
+    print(f"仿真损失: {loss_value:.4f}")
+    print(f"梯度统计:")
+    print(f"  形状: {gradients.shape}")
+    print(f"  平均大小: {jnp.mean(jnp.abs(gradients)):.6f}")
+    print(f"  最大值: {jnp.max(jnp.abs(gradients)):.6f}")
+    print(f"  范数: {jnp.linalg.norm(gradients):.6f}")
     
-    # Validate results
-    assert jnp.isfinite(loss_value), "Simulation loss must be finite"
-    assert jnp.all(jnp.isfinite(gradients)), "All gradients must be finite"
-    assert jnp.linalg.norm(gradients) > 1e-8, "Gradients should be meaningful"
+    assert jnp.isfinite(loss_value), "仿真损失必须是有限值"
+    assert jnp.all(jnp.isfinite(gradients)), "所有梯度必须是有限值"
+    assert jnp.linalg.norm(gradients) > 1e-8, "梯度应该有意义"
     
-    # Test JIT compilation of complete pipeline
     @jit
     def jit_complete_simulation(control_seq):
         return complete_simulation_loss(control_seq)
@@ -1981,31 +1841,28 @@ def validate_system_integration():
     jit_loss_value = jit_complete_simulation(control_sequence)
     jit_gradients = grad(jit_complete_simulation)(control_sequence)
     
-    # JIT results should match
-    assert jnp.isclose(loss_value, jit_loss_value, rtol=1e-10), "JIT loss should match"
-    assert jnp.allclose(gradients, jit_gradients, rtol=1e-10), "JIT gradients should match"
+    assert jnp.isclose(loss_value, jit_loss_value, rtol=1e-10), "JIT损失应该匹配"
+    assert jnp.allclose(gradients, jit_gradients, rtol=1e-10), "JIT梯度应该匹配"
     
-    print("✅ System integration validation: PASSED")
+    print("✅ 系统集成验证: 通过")
     return True
 
 
 def main():
-    """Execute complete Stage 4: End-to-end training system"""
+    """执行第四阶段：端到端训练系统"""
     print("\n" + "=" * 80)
-    print("🚀 SAFE AGILE FLIGHT - STAGE 4: COMPLETE SYSTEM TRAINING")
-    print("Combining GCBF+ (MIT-REALM) and DiffPhysDrone (SJTU) methodologies")
-    print("End-to-End JAX-Native Differentiable System")
+    print("🚀 安全敏捷飞行 - 第四阶段: 完整系统训练")
+    print("融合 GCBF+ (MIT-REALM) 和 DiffPhysDrone (SJTU) 的方法论")
+    print("端到端JAX原生可微分系统")
     print("=" * 80)
     
-    # Parse command line arguments for debug mode and resumption
-    import sys
+    # 解析一下命令行参数，看看是不是要用debug模式或者恢复训练
     debug_mode = '--debug' in sys.argv
     resume_from_checkpoint = '--resume' in sys.argv or '--continue' in sys.argv
     custom_seq_length = None
     custom_batch_size = None
     custom_epochs = None
     
-    # Parse custom parameters
     for i, arg in enumerate(sys.argv):
         if arg == '--sequence_length' and i + 1 < len(sys.argv):
             custom_seq_length = int(sys.argv[i + 1])
@@ -2014,56 +1871,49 @@ def main():
         elif arg == '--num_epochs' and i + 1 < len(sys.argv):
             custom_epochs = int(sys.argv[i + 1])
     
-    # Load and optimize configuration
     if debug_mode:
-        print("🐛 Debug mode enabled - using minimal configuration")
+        print("🐛 Debug模式已开启 - 使用最小化配置")
         config = get_debug_config(get_minimal_config())
     else:
         base_config = get_config()
         config = get_memory_safe_config(base_config)
     
-    # Apply custom parameters if provided
     if custom_seq_length:
         config.training.sequence_length = custom_seq_length
-        print(f"⚙️ Custom sequence length: {custom_seq_length}")
+        print(f"⚙️ 自定义序列长度: {custom_seq_length}")
     
     if custom_batch_size:
         config.training.batch_size = custom_batch_size
-        print(f"⚙️ Custom batch size: {custom_batch_size}")
+        print(f"⚙️ 自定义批大小: {custom_batch_size}")
         
     if custom_epochs:
         config.training.num_epochs = custom_epochs
-        print(f"⚙️ Custom epochs: {custom_epochs}")
+        print(f"⚙️ 自定义轮次数: {custom_epochs}")
     
-    # Validate final configuration
     if not validate_memory_config(config):
-        print("❌ Memory validation failed. Consider using --debug mode or reducing parameters.")
+        print("❌ 内存验证失败。可以试试用 --debug 模式或者减小参数。")
         return False
     
-    print(f"🔧 Configuration loaded: {config.experiment_name}")
-    print(f"   Sequence length: {config.training.sequence_length}")
-    print(f"   Batch size: {config.training.batch_size}")
-    print(f"   Learning rate: {config.training.learning_rate}")
+    print(f"🔧 配置已加载: {config.experiment_name}")
+    print(f"   序列长度: {config.training.sequence_length}")
+    print(f"   批大小: {config.training.batch_size}")
+    print(f"   学习率: {config.training.learning_rate}")
     
-    # Initialize complete system
-    print("\n🛠️ Initializing complete system...")
+    print("\n🛠️ 正在初始化完整系统...")
     components, params, optimizer_state = initialize_complete_system(config)
     
-    # Create simple optimizer (not the complex multi-component one from init)
     optimizer = optax.adam(config.training.learning_rate)
     optimizer_state = optimizer.init(params)
     
-    # Validate system integration
-    print("\n🔍 Validating complete system integration...")
+    print("\n🔍 正在验证完整系统集成...")
     validation_success = validate_complete_system_integration(
         components, params, config
     )
     
     if not validation_success:
-        print("❌ System validation failed. Aborting training.")
+        print("❌ 系统验证失败，中止训练。")
         return False
     
-    # Initialize training state using enhanced function
     if resume_from_checkpoint:
         training_state, resume_success = find_and_resume_training(checkpoint_dir, components, config)
         if not resume_success:
@@ -2071,15 +1921,13 @@ def main():
     else:
         training_state = create_enhanced_training_state(params, optimizer_state, config)
     
-    # Setup checkpoint directory
     checkpoint_dir = Path(f"checkpoints/{config.experiment_name}")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"\n💾 Checkpoint directory: {checkpoint_dir}")
+    print(f"\n💾 检查点目录: {checkpoint_dir}")
     
-    # Training loop
     print("\n" + "=" * 60)
-    print("🏃 STARTING TRAINING LOOP")
+    print("🏃 开始训练循环")
     print("=" * 60)
     
     key = random.PRNGKey(config.training.seed)
@@ -2087,12 +1935,10 @@ def main():
     try:
         for epoch in range(config.training.num_epochs):
             epoch_start_time = time.time()
-            print(f"\n🔄 Epoch {epoch + 1}/{config.training.num_epochs}")
+            print(f"\n🔄 第 {epoch + 1}/{config.training.num_epochs} 轮")
             
-            # Generate epoch key
             epoch_key, key = random.split(key)
             
-            # Run enhanced training epoch with adaptive strategies
             training_state.params, training_state.optimizer_state, epoch_metrics = run_training_epoch(
                 training_state.params,
                 training_state.optimizer_state,
@@ -2101,20 +1947,17 @@ def main():
                 config,
                 epoch,
                 epoch_key,
-                training_state  # Pass training_state for adaptive strategies
+                training_state
             )
             
-            # Update training state
             training_state.epoch = epoch
             training_state.step += config.training.batches_per_epoch
             current_loss = float(epoch_metrics['total_loss'])
             training_state.loss_history.append(current_loss)
             training_state.metrics_history.append(epoch_metrics)
             
-            # Monitor memory usage
             monitor_training_memory(training_state.step)
             
-            # Run validation every N epochs
             if (epoch + 1) % config.training.validation_frequency == 0:
                 val_key, key = random.split(key)
                 val_metrics = run_validation(training_state.params, components, config, val_key)
@@ -2122,87 +1965,79 @@ def main():
             
             epoch_time = time.time() - epoch_start_time
             
-            # Log epoch results
-            print(f"  ⏱️ Epoch time: {epoch_time:.2f}s")
-            print(f"  📈 Training loss: {current_loss:.6f}")
-            print(f"  🎯 Goal success rate: {epoch_metrics.get('extra_goal_success_rate', 0):.3f}")
-            print(f"  ⚠️ Safety violations: {epoch_metrics.get('extra_safety_violations', 0)}")
-            print(f"  🅾️ Control effort: {epoch_metrics.get('extra_control_effort', 0):.4f}")
+            print(f"  ⏱️ 本轮耗时: {epoch_time:.2f}s")
+            print(f"  📈 训练损失: {current_loss:.6f}")
+            print(f"  🎯 目标成功率: {epoch_metrics.get('extra_goal_success_rate', 0):.3f}")
+            print(f"  ⚠️ 安全违规次数: {epoch_metrics.get('extra_safety_violations', 0)}")
+            print(f"  🅾️ 控制力消耗: {epoch_metrics.get('extra_control_effort', 0):.4f}")
             
-            # Check for best model
             is_best = current_loss < training_state.best_loss
             if is_best:
                 training_state.best_loss = current_loss
-                print(f"  🏆 New best loss: {current_loss:.6f}")
+                print(f"  🏆 新的最佳损失: {current_loss:.6f}")
             
-            # Save checkpoints
             if (epoch + 1) % config.training.checkpoint_frequency == 0:
                 save_checkpoint(training_state, checkpoint_dir, is_best)
             
-            # Early stopping check
             if len(training_state.loss_history) >= 20:
                 recent_losses = training_state.loss_history[-20:]
                 if all(l >= recent_losses[0] * 0.999 for l in recent_losses[-10:]):
-                    print("\n⏹️ Early stopping triggered: loss has plateaued")
+                    print("\n⏹️ 提前停止：损失已进入平台期")
                     break
     
     except KeyboardInterrupt:
-        print("\n⏹️ Training interrupted by user")
+        print("\n⏹️ 用户中断了训练")
         save_checkpoint(training_state, checkpoint_dir, is_best=False)
     
     except Exception as e:
-        print(f"\n❌ Training failed with error: {e}")
+        print(f"\n❌ 训练失败，错误: {e}")
         import traceback
         traceback.print_exc()
         return False
     
-    # Final validation and summary
     print("\n" + "=" * 60)
-    print("🏁 TRAINING COMPLETED")
+    print("🏁 训练完成")
     print("=" * 60)
     
-    # Final validation
     final_key, key = random.split(key)
     final_val_metrics = run_validation(training_state.params, components, config, final_key)
     
-    print(f"Final Results:")
-    print(f"  Best training loss: {training_state.best_loss:.6f}")
-    print(f"  Final validation loss: {final_val_metrics['val_loss']:.6f}")
-    print(f"  Final goal success rate: {final_val_metrics['val_goal_success_rate']:.3f}")
-    print(f"  Total training epochs: {training_state.epoch + 1}")
-    print(f"  Total training steps: {training_state.step}")
+    print(f"最终结果:")
+    print(f"  最佳训练损失: {training_state.best_loss:.6f}")
+    print(f"  最终验证集损失: {final_val_metrics['val_loss']:.6f}")
+    print(f"  最终目标成功率: {final_val_metrics['val_goal_success_rate']:.3f}")
+    print(f"  总训练轮次: {training_state.epoch + 1}")
+    print(f"  总训练步数: {training_state.step}")
     
-    # Save final checkpoint
     save_checkpoint(training_state, checkpoint_dir, is_best=True)
     
-    # Success criteria
     success = (
-        final_val_metrics['val_goal_success_rate'] > 0.7 and  # 70% goal success
-        final_val_metrics['val_safety_violations'] < 5 and     # <5 safety violations per batch
-        training_state.best_loss < 1.0                         # Reasonable loss threshold
+        final_val_metrics['val_goal_success_rate'] > 0.7 and
+        final_val_metrics['val_safety_violations'] < 5 and
+        training_state.best_loss < 1.0
     )
     
     if success:
-        print("\n🎉 STAGE 4 SUCCESSFULLY COMPLETED!")
-        print("\nKey accomplishments:")
-        print("  ✅ Complete end-to-end system integration")
-        print("  ✅ BPTT gradient flow through all components")
-        print("  ✅ Multi-objective loss function optimization")
-        print("  ✅ GCBF+ safety constraints")
-        print("  ✅ DiffPhysDrone physics integration")
-        print("  ✅ Successful goal-reaching behavior")
-        print("  ✅ Maintained safety constraints")
-        print("  ✅ JAX-native high-performance implementation")
+        print("\n🎉 第四阶段成功完成！")
+        print("\n主要成果:")
+        print("  ✅ 完整的端到端系统集成")
+        print("  ✅ 所有组件的BPTT梯度流")
+        print("  ✅ 多目标损失函数优化")
+        print("  ✅ GCBF+安全约束")
+        print("  ✅ DiffPhysDrone物理模型集成")
+        print("  ✅ 成功的到达目标行为")
+        print("  ✅ 保持了安全约束")
+        print("  ✅ JAX原生高性能实现")
         
-        print("\n🚀 SYSTEM READY FOR ADVANCED RESEARCH AND DEPLOYMENT!")
+        print("\n🚀 系统已准备好进行更深入的研究和部署！")
         return True
     else:
-        print("\n⚠️ STAGE 4 TRAINING COMPLETED BUT PERFORMANCE CRITERIA NOT FULLY MET")
-        print("Consider:")
-        print("  - Adjusting hyperparameters")
-        print("  - Increasing training duration")
-        print("  - Tuning loss function weights")
-        print("  - Implementing curriculum learning")
+        print("\n⚠️ 第四阶段训练完成，但性能未完全达标")
+        print("可以考虑:")
+        print("  - 调整超参数")
+        print("  - 增加训练时长")
+        print("  - 调整损失函数权重")
+        print("  - 实现课程学习")
         return False
 
 

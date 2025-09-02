@@ -650,18 +650,18 @@ def run_complete_system_tests():
         
         # Final validation summary
         print("=" * 80)
-        print("<� COMPLETE SYSTEM INTEGRATION: ALL TESTS PASSED!")
+        print("🎉 COMPLETE SYSTEM INTEGRATION: ALL TESTS PASSED!")
         print()
         print(" VERIFIED CAPABILITIES:")
-        print("   " System component initialization and integration")
-        print("   " Neural network parameter initialization")
-        print("   " Forward pass through all components (GNN � Policy � Safety � Physics)")
-        print("   " End-to-end gradient flow and backpropagation")
-        print("   " Training step with optimizer updates")
-        print("   " Memory optimization for different sequence lengths")
-        print("   " JIT compilation of physics and training components")
+        print("   ✓ System component initialization and integration")
+        print("   ✓ Neural network parameter initialization")  
+        print("   ✓ Forward pass through all components (GNN → Policy → Safety → Physics)")
+        print("   ✓ End-to-end gradient flow and backpropagation")
+        print("   ✓ Training step with optimizer updates")
+        print("   ✓ Memory optimization for different sequence lengths")
+        print("   ✓ JIT compilation of physics and training components")
         print()
-        print("=� STAGE 4 SYSTEM READY FOR PRODUCTION TRAINING!")
+        print("🎯 STAGE 4 SYSTEM READY FOR PRODUCTION TRAINING!")
         print("=" * 80)
         
         return True

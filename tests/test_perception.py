@@ -23,8 +23,9 @@ import pytest
 from jax import random, grad, jit
 
 # 导入被测试的模块
+from core.physics import DroneState, create_initial_drone_state
 from core.perception import (
-    DroneState, GraphConfig, 
+    GraphConfig, 
     pointcloud_to_graph, 
     compute_pairwise_distances,
     find_knn_edges,
@@ -46,11 +47,10 @@ class TestPointCloudToGraph:
             obstacle_node_features=3
         )
         
-        self.drone_state = DroneState(
+        self.drone_state = create_initial_drone_state(
             position=jnp.array([0.0, 0.0, 1.0]),
             velocity=jnp.array([1.0, 0.0, 0.0]),
-            orientation=jnp.eye(3),
-            angular_velocity=jnp.zeros(3)
+            hover_initialization=False
         )
         
         self.point_cloud = jnp.array([
@@ -188,11 +188,10 @@ class TestGNNArchitecture:
         self.config = GraphConfig()
         
         # Create test graph
-        self.drone_state = DroneState(
+        self.drone_state = create_initial_drone_state(
             position=jnp.array([0.0, 0.0, 1.0]),
             velocity=jnp.array([1.0, 0.0, 0.0]),
-            orientation=jnp.eye(3),
-            angular_velocity=jnp.zeros(3)
+            hover_initialization=False
         )
         
         point_cloud = jnp.array([
@@ -236,13 +235,13 @@ class TestGNNArchitecture:
 
     def test_cbf_net(self):
         """Test CBF network end-to-end"""
-        cbf_net = CBFNet(gnn_layers=2, head_sizes=(128, 64))
+        cbf_net = CBFNet(gnn_layers=2)
         
         # Initialize parameters
-        params = cbf_net.init(self.rng_key, self.graph, self.node_types)
+        params = cbf_net.init(self.rng_key, self.graph, 1)  # 1 agent
         
         # Forward pass
-        cbf_value = cbf_net.apply(params, self.graph, self.node_types)
+        cbf_value = cbf_net.apply(params, self.graph, 1)  # 1 agent
         
         # Should output single scalar for ego node
         assert cbf_value.shape == ()  # Scalar
@@ -254,16 +253,17 @@ class TestGNNArchitecture:
     def test_cbf_gradients(self):
         """Test CBF gradient computation"""
         cbf_net = CBFNet()
-        params = cbf_net.init(self.rng_key, self.graph, self.node_types)
+        params = cbf_net.init(self.rng_key, self.graph, 1)  # 1 agent
         
         def cbf_fn(drone_state):
             graph, node_types = pointcloud_to_graph(
                 drone_state, jnp.array([[1., 0., 0.]]), self.config
             )
-            return cbf_net.apply(params, graph, node_types)
+            return cbf_net.apply(params, graph, 1)  # 1 agent
         
         # Compute gradients w.r.t. drone position
-        grad_fn = grad(lambda state: cbf_fn(state).sum())
+        # 使用allow_int=True来处理整数值的输入
+        grad_fn = grad(lambda state: cbf_fn(state), allow_int=True)
         gradients = grad_fn(self.drone_state)
         
         # Gradients should exist and be finite
@@ -280,11 +280,10 @@ class TestIntegrationFunctions:
     def setup_method(self):
         """Setup test fixtures"""
         self.rng_key = random.PRNGKey(123)
-        self.drone_state = DroneState(
+        self.drone_state = create_initial_drone_state(
             position=jnp.array([0.0, 0.0, 1.0]),
             velocity=jnp.array([0.5, 0.0, 0.0]),
-            orientation=jnp.eye(3),
-            angular_velocity=jnp.zeros(3)
+            hover_initialization=False
         )
         self.point_cloud = jnp.array([
             [2., 0., 0.], [0., 2., 0.], [-2., 0., 0.]
@@ -370,11 +369,10 @@ class TestIntegrationFunctions:
         
         # Process batch using vmap
         def single_cbf_fn(pos):
-            state = DroneState(
+            state = create_initial_drone_state(
                 position=pos,
                 velocity=self.drone_state.velocity,
-                orientation=self.drone_state.orientation,
-                angular_velocity=self.drone_state.angular_velocity
+                hover_initialization=False
             )
             return get_cbf_from_pointcloud(params, state, self.point_cloud)
         
