@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+outputs/
+artifacts/
+*.pkl
+*.npy
+baseline_*/
+*.pdf

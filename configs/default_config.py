@@ -1,13 +1,10 @@
 """
-默认配置文件 - 阶段1 MVP配置管理
-基于GCBF+和DiffPhysDrone的深度代码分析和最佳实践设计
+默认配置文件 —— 单机版安全敏捷飞行
 
-本配置系统基于对以下源码库的完整分析：
-1. GCBF+ (MIT): GNN架构、CBF-QP求解、多智能体安全控制
-2. DiffPhysDrone (上海交大): 可微分物理学、时间梯度衰减、BPTT训练循环
-
-使用ml_collections进行超参数管理，实现代码与实验配置的完全分离
-这是保持研究可复现性和可扩展性的关键架构决策
+配置围绕当前仓库实现的“单无人机 + JAX 原生管线”整理，吸收了
+GCBF+（图神经 CBF / qpax 安全层）与 DiffPhysDrone（可微物理 / BPTT）
+的核心思路，但仅保留对现有代码实际生效的字段，避免多智能体遗留选项
+误导使用者。
 """
 
 import ml_collections
@@ -51,8 +48,8 @@ def get_config():
     
     # 控制约束
     config.physics.control = ml_collections.ConfigDict()
-    config.physics.control.max_thrust = 0.8  # 标准化最大推力
-    config.physics.control.min_thrust = 0.0  # 标准化最小推力
+    config.physics.control.max_thrust = 5.0  # 对应世界系加速度界
+    config.physics.control.min_thrust = -5.0  # 允许对称加速度
     config.physics.control.thrust_delay = 1.0/15.0  # 控制延迟（tau参数）
     config.physics.control.smoothing_factor = 12.0  # 指数平滑（lambda参数）
     
@@ -67,10 +64,10 @@ def get_config():
     config.gcbf = ml_collections.ConfigDict()
     
     # 图构建参数
-    config.gcbf.sensing_radius = 0.5  # 邻居检测的R参数
-    config.gcbf.max_neighbors = 16  # 固定大小邻域的M参数
-    config.gcbf.k_neighbors = 8  # KNN图构建
-    config.gcbf.graph_construction_method = "knn"  # "knn"或"radius"
+    config.gcbf.sensing_radius = 3.0  # 与 GraphConfig.max_distance 对齐（约两倍半径）
+    config.gcbf.max_neighbors = 64  # 单无人机点云上限
+    config.gcbf.k_neighbors = 8  # 与 core.perception.GraphConfig 默认一致
+    config.gcbf.graph_construction_method = "knn"  # 当前实现仅使用 KNN
     
     # CBF参数
     config.gcbf.alpha = 1.0  # CBF类K函数参数
@@ -79,7 +76,7 @@ def get_config():
     
     # GNN架构（来自GCBF+论文）
     config.gcbf.gnn = ml_collections.ConfigDict()
-    config.gcbf.gnn.hidden_dims = [256, 256, 128]  # GNN架构
+    config.gcbf.gnn.hidden_dims = [128, 128, 128]  # 与 core.perception 中的轻量版一致
     config.gcbf.gnn.output_dim = 1  # CBF标量输出
     config.gcbf.gnn.activation = "relu"  # 激活函数
     config.gcbf.gnn.use_attention = True  # 图注意力机制
@@ -92,7 +89,7 @@ def get_config():
     config.policy = ml_collections.ConfigDict()
     
     # 输入/输出维度
-    config.policy.input_dim = 13  # 3(pos) + 3(vel) + 9(orientation) + 3(angular_vel) - 5 = 13
+    config.policy.input_dim = 10  # 3(pos) + 3(vel) + 3(target offset) + 1(cbf value)
     config.policy.output_dim = 3  # 3D control input
     
     # 架构
@@ -103,29 +100,20 @@ def get_config():
     config.policy.activation = "relu"  # 激活函数
     config.policy.output_activation = "tanh"  # 控制输出激活函数
     config.policy.use_rnn = False  # 启用RNN内存
+    config.policy.action_limit = 5.0  # 与物理加速度上限一致
     
     # =============================================================================
     # 安全层配置（基于QP的安全过滤器）
     # =============================================================================
     config.safety = ml_collections.ConfigDict()
     
-    # 控制限制
-    config.safety.max_thrust = 0.8  # 最大推力大小
-    config.safety.max_torque = 0.5  # 最大力矩大小
-    
     # CBF参数
-    config.safety.cbf_alpha = 1.0  # CBF alpha参数
-    
-    # 安全层配置 (qpax集成)
-    config.safety.solver = "qpax"  # 可微分QP求解器
-    config.safety.max_iterations = 100  # 最大QP迭代次数
-    config.safety.tolerance = 1e-6  # 松弛变量惩罚
-    config.safety.regularization = 1e-8  # 正则化参数
-    
-    # 三层安全机制参数
-    config.safety.relaxation_penalty = 1e6  # 松弛变量的Beta参数
-    config.safety.failsafe_mode = "emergency_brake"  # 故障安全策略
-    config.safety.enable_backoff = True  # 启用自动退出机制
+    config.safety.alpha0 = 1.0
+    config.safety.alpha1 = 2.0
+    config.safety.max_acceleration = 5.0
+    config.safety.relaxation_penalty = 150.0
+    config.safety.max_relaxation = 3.0
+    config.safety.violation_tolerance = 1e-5
     
     # 带性能优化的训练配置
     config.training = ml_collections.ConfigDict()
@@ -173,6 +161,7 @@ def get_config():
     config.training.curriculum.stage1_steps = 300  # 效率优先阶段
     config.training.curriculum.stage2_steps = 400  # 安全感知阶段  
     config.training.curriculum.stage3_steps = 300  # 联合优化
+    config.training.curriculum.stage_noise_level = (0.0, 0.02, 0.05)
     config.training.curriculum.annealing_start = 1e-6  # 初始松弛惩罚
     config.training.curriculum.annealing_end = 1e6    # 最终松弛惩罚
     
@@ -182,16 +171,16 @@ def get_config():
     config.env = ml_collections.ConfigDict()
     
     # 多代理设置
-    config.env.num_agents = 8  # 代理数量（与GCBF+论文一致）
-    config.env.area_size = 4.0  # 环境边长
-    config.env.num_obstacles = 8  # 静态障碍物数量
-    config.env.obstacle_types = ["sphere", "box", "cylinder"]  # 障碍物基元
+    config.env.num_agents = 1  # 仅支持单无人机
+    config.env.area_size = 8.0  # 目标区域半径配置
+    config.env.num_obstacles = 16  # 点云采样的障碍点数估计
+    config.env.obstacle_types = ["point_cloud"]  # 当前实现基于点云
     
     # LiDAR配置（用于现实世界部署）
     config.env.lidar = ml_collections.ConfigDict()
-    config.env.lidar.num_rays = 32  # LiDAR光线数量
-    config.env.lidar.max_range = 2.0  # 最大传感距离
-    config.env.lidar.angular_resolution = 360.0 / 32  # 角度分辨率（度）
+    config.env.lidar.num_rays = 64
+    config.env.lidar.max_range = 6.0
+    config.env.lidar.angular_resolution = 360.0 / 64
     
     # 目标配置
     config.env.goal_tolerance = 0.1  # 目标到达容差
@@ -243,8 +232,8 @@ def get_minimal_config():
     config.training.max_steps = 100
     config.training.batch_size = 8
     config.training.sequence_length = 10  # 测试内存的较短序列
-    config.env.num_agents = 2
-    config.gcbf.max_neighbors = 4
+    config.env.num_agents = 1
+    config.gcbf.max_neighbors = 16
     config.gcbf.k_neighbors = 3  # 测试用的较小值
     
     # 禁用测试中的昂贵功能

@@ -19,8 +19,9 @@ import jax
 import jax.numpy as jnp
 from jax import tree_util
 from typing import List, Any, Union, Dict, TypeVar, Generic
-import chex
-from flax import struct
+from core.flax_compat import struct as _flax_struct
+
+dataclass = _flax_struct.dataclass  # pylint: disable=invalid-name
 
 T = TypeVar('T')
 
@@ -240,6 +241,133 @@ def unbatch_drone_states(batched_states: 'DroneState') -> List['DroneState']:
     """用于解批处理DroneState对象的专用函数。"""
     return unbatch_pytree_objects(batched_states)
 
+
+# =============================================================================
+# 训练数据生成函数
+# =============================================================================
+
+def generate_training_batch(
+    batch_size: int,
+    workspace_bounds: tuple[float, float, float] = (10.0, 10.0, 5.0),
+    max_target_distance: float = 8.0,
+    min_target_distance: float = 2.0,
+    curriculum_stage: float = 1.0,
+    rng_key: jax.Array | None = None,
+) -> Dict[str, Any]:
+    """
+    生成与当前 DroneState 结构兼容的训练样本。
+
+    该函数提供一个轻量级的数据生成器，用于效率阶段或单元测试：
+    - 根据课程阶段调整任务难度（距离与高度范围）；
+    - 返回批处理后的 `DroneState` PyTree 以及目标位置数组；
+    - 保持与 `core.physics.DroneState` 字段一致，不再引用已移除的属性。
+    """
+
+    if rng_key is None:
+        rng_key = jax.random.PRNGKey(42)
+
+    curriculum_stage = jnp.clip(curriculum_stage, 0.0, 1.0)
+
+    # 根据课程阶段调整距离与高度范围
+    distance_scale = 0.3 + 0.7 * curriculum_stage
+    max_distance = max_target_distance * distance_scale
+    min_distance = min_target_distance * distance_scale
+
+    z_center = workspace_bounds[2] * 0.5
+    z_variation = jnp.interp(curriculum_stage, jnp.array([0.0, 0.3, 0.7, 1.0]), jnp.array([0.1, 0.3, 0.7, 1.0]))
+    z_min = jnp.maximum(0.5, z_center - workspace_bounds[2] * 0.5 * z_variation)
+    z_max = jnp.minimum(workspace_bounds[2], z_center + workspace_bounds[2] * 0.5 * z_variation)
+
+    from core.physics import DroneState  # 延迟导入避免循环依赖
+
+    def sample_single(key):
+        key_pos, key_z, key_dir, key_dist = jax.random.split(key, 4)
+        xy = jax.random.uniform(
+            key_pos,
+            (2,),
+            minval=jnp.array([-workspace_bounds[0] / 2, -workspace_bounds[1] / 2]),
+            maxval=jnp.array([workspace_bounds[0] / 2, workspace_bounds[1] / 2]),
+        )
+        z = jax.random.uniform(key_z, (), minval=z_min, maxval=z_max)
+        position = jnp.concatenate([xy, jnp.array([z])])
+
+        direction = jax.random.normal(key_dir, (3,))
+        direction = direction / (jnp.linalg.norm(direction) + 1e-6)
+        distance = jax.random.uniform(key_dist, (), minval=min_distance, maxval=max_distance)
+        target = position + direction * distance
+        target = jnp.clip(
+            target,
+            jnp.array([-workspace_bounds[0] / 2, -workspace_bounds[1] / 2, 0.5]),
+            jnp.array([workspace_bounds[0] / 2, workspace_bounds[1] / 2, workspace_bounds[2]]),
+        )
+
+        state = DroneState(
+            position=position,
+            velocity=jnp.zeros(3, dtype=position.dtype),
+            acceleration=jnp.zeros(3, dtype=position.dtype),
+            time=jnp.array(0.0, dtype=position.dtype),
+            orientation=jnp.eye(3, dtype=position.dtype),
+        )
+        return state, target
+
+    keys = jax.random.split(rng_key, batch_size)
+    samples = [sample_single(k) for k in keys]
+    states, targets = zip(*samples)
+
+    batched_state = batch_pytree_objects(list(states))
+    target_array = jnp.stack(targets, axis=0)
+
+    return {
+        "initial_states": batched_state,
+        "target_positions": target_array,
+        "curriculum_stage": float(curriculum_stage),
+    }
+def generate_test_scenarios(num_scenarios: int = 10,
+                          workspace_bounds: tuple = (10.0, 10.0, 10.0),
+                          difficulty_level: float = 0.5,
+                          rng_key: jax.Array | None = None) -> List[Dict[str, Any]]:
+    """
+    生成测试场景列表
+    
+    为评估和验证生成多样化的测试场景。
+    
+    Args:
+        num_scenarios: 场景数量
+        workspace_bounds: 工作空间边界
+        difficulty_level: 难度级别 (0.0-1.0)
+        rng_key: JAX随机密钥
+    
+    Returns:
+        scenarios: 场景列表
+    """
+    if rng_key is None:
+        rng_key = jax.random.PRNGKey(42)
+    
+    scenarios = []
+    
+    # 根据难度调整距离范围
+    base_min_dist = 2.0
+    base_max_dist = 8.0
+    
+    min_distance = base_min_dist + difficulty_level * 3.0
+    max_distance = base_max_dist + difficulty_level * 4.0
+    
+    for i in range(num_scenarios):
+        rng_scenario, rng_key = jax.random.split(rng_key)
+        
+        scenario = generate_training_batch(
+            batch_size=1,
+            workspace_bounds=workspace_bounds,
+            max_target_distance=max_distance,
+            min_target_distance=min_distance,
+            rng_key=rng_scenario
+        )
+        
+        scenarios.append(scenario)
+    
+    return scenarios
+
+
 # 使所有函数可供导入
 __all__ = [
     'batch_pytree_objects',
@@ -249,5 +377,7 @@ __all__ = [
     'tree_batch_dimension_size',
     'safe_pytree_stack',
     'batch_drone_states',
-    'unbatch_drone_states'
+    'unbatch_drone_states',
+    'generate_training_batch',
+    'generate_test_scenarios'
 ]
