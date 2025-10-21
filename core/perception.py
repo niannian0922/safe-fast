@@ -1,15 +1,7 @@
 """
 core.perception
-================
 
-This module adapts the GCBF+ perception stack to the single-drone setting used
-throughout the refactored code base.  It turns a LiDAR-style point cloud into a
-`jraph.GraphsTuple`, applies a lightweight attention GNN, and produces a scalar
-control barrier function (CBF) value together with its gradient w.r.t. the drone
-position via automatic differentiation.
-
-All routines are pure functions and therefore safe to use inside JAX
-transformations such as `jit` and `lax.scan`.
+本模块将 GCBF+ 的感知栈改造为单机形态：把 LiDAR 风格的点云转换为`jraph.GraphsTuple`，再通过轻量级注意力 GNN 生成标量 CBF 值，并配合自动微分求出相对于无人机位置的梯度。所有函数均为纯函数，可放心用于 `jit`、`lax.scan` 等 JAX 变换。
 """
 
 from __future__ import annotations
@@ -27,32 +19,32 @@ from .physics import DroneState
 
 
 # ---------------------------------------------------------------------------
-# Graph construction
+# 图构建
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class GraphConfig:
     """
-    Configuration for graph construction.
+    图构建相关配置。
 
-    The incoming point cloud is expected to have at least `max_points` samples
-    (padding with zeros is acceptable).  Any additional points are ignored.
+    输入点云需要至少包含 `max_points` 个样本（允许用 0 填充），多余的点
+    会被忽略。
     """
 
     max_points: int = 64
     max_distance: float = 6.0
     k_neighbors: int = 8
 
-    ego_feature_dim: int = 9  # position, velocity, acceleration
-    obstacle_feature_dim: int = 9  # padded to match ego feature dim
-    edge_feature_dim: int = 4  # relative xyz + distance
+    ego_feature_dim: int = 9  # 位置、速度、加速度
+    obstacle_feature_dim: int = 9  # 填充至与自机特征维度相同
+    edge_feature_dim: int = 4  # 相对 xyz 与距离
 
 
 def _relative_point_cloud(
     state: DroneState, point_cloud_world: jnp.ndarray
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Returns relative vectors and distances."""
+    """返回相对向量与对应距离。"""
     rel = point_cloud_world - state.position
     dist = jnp.linalg.norm(rel, axis=-1)
     return rel, dist
@@ -64,17 +56,17 @@ def build_graph_from_point_cloud(
     config: GraphConfig,
 ) -> Tuple[jraph.GraphsTuple, jnp.ndarray]:
     """
-    Converts a point cloud into a `GraphsTuple`.  Returns the graph and a node
-    mask that marks real obstacle nodes (True) versus padded placeholders.
+    将点云转换为 `GraphsTuple`，并返回图以及节点掩码；掩码中 True 表示真实障碍
+    节点，False 表示填充节点。
     """
-    # Use only the first `max_points` samples and treat the remainder as padding.
+    # 只保留前 `max_points` 个样本，其余作为填充处理。
     cloud = point_cloud_world[: config.max_points]
     rel, dist = _relative_point_cloud(state, cloud)
     non_zero = jnp.any(jnp.abs(rel) > 1e-6, axis=-1)
     obstacle_mask = (dist <= config.max_distance) & non_zero
     rel = jnp.where(obstacle_mask[:, None], rel, 0.0)
 
-    # Assemble node features.
+    # 组装节点特征。
     ego_features = jnp.concatenate([state.position, state.velocity, state.acceleration])
     ego_features = jnp.pad(
         ego_features[: config.ego_feature_dim],
@@ -106,12 +98,12 @@ def build_graph_from_point_cloud(
     distances = jnp.linalg.norm(
         all_positions[:, None, :] - all_positions[None, :, :], axis=-1
     )
-    # Prevent invalid nodes from being selected as neighbours.
+    # 防止无效节点被选为邻居。
     node_mask = jnp.concatenate([jnp.array([True]), obstacle_mask], axis=0)
     valid_matrix = node_mask[:, None] & node_mask[None, :]
     large = jnp.max(distances) + 1e3
     distances = jnp.where(valid_matrix, distances, large)
-    distances = distances + jnp.eye(n_nodes) * 1e6  # exclude self
+    distances = distances + jnp.eye(n_nodes) * 1e6  # 排除自身
 
     k = max(0, min(config.k_neighbors, n_nodes - 1))
     if k == 0:
@@ -119,14 +111,14 @@ def build_graph_from_point_cloud(
         receivers = jnp.zeros((0,), dtype=jnp.int32)
         edges = jnp.zeros((0, config.edge_feature_dim), dtype=jnp.float32)
     else:
-        _, neighbors = jax.lax.top_k(-distances, k)  # take k smallest distances
+        _, neighbors = jax.lax.top_k(-distances, k)  # 选取距离最小的 k 个
         senders = jnp.repeat(jnp.arange(n_nodes), k)
         receivers = neighbors.reshape(-1)
         edge_vectors = all_positions[receivers] - all_positions[senders]
         edge_dist = jnp.linalg.norm(edge_vectors, axis=-1, keepdims=True)
         edges = jnp.concatenate([edge_vectors, edge_dist], axis=-1)
 
-        # Mask edges touching padded nodes by zeroing their contribution.
+        # 触碰填充节点的边会被掩蔽，其贡献清零。
         valid_edges = node_mask[senders] & node_mask[receivers]
         senders = jnp.where(valid_edges, senders, 0)
         receivers = jnp.where(valid_edges, receivers, 0)
@@ -145,7 +137,7 @@ def build_graph_from_point_cloud(
 
 
 # ---------------------------------------------------------------------------
-# GNN + CBF head (adapted from GCBF+)
+# GNN + CBF 头部（改写自 GCBF+）
 # ---------------------------------------------------------------------------
 
 
@@ -224,14 +216,14 @@ class CBFNetwork(nn.Module):
     @nn.compact
     def __call__(self, graph: jraph.GraphsTuple) -> jnp.ndarray:
         embeddings = self.backbone(graph)
-        ego_embedding = embeddings[0]  # first node is always the ego drone
+        ego_embedding = embeddings[0]  # 第一个节点始终代表自机
         x = MLP(self.head_widths)(ego_embedding)
         x = nn.Dense(1, kernel_init=nn.initializers.xavier_uniform())(x)
         return jnp.squeeze(nn.tanh(x), axis=0)
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# 公共接口
 # ---------------------------------------------------------------------------
 
 
@@ -257,12 +249,11 @@ def _analytic_cbf_statistics(
     temperature: float = 10.0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Analytic soft-min distance based barrier used as a fallback when the neural
-    CBF is unavailable or numerically unstable.
+    基于 soft-min 距离的解析屏障，当神经网络 CBF 不可用或数值发散时作为回退方案。
     """
     points = point_cloud_world
     if points.shape[0] == 0:
-        # No obstacles -> large positive value
+        # 没有障碍物时返回较大的正值
         value = jnp.array(1.0, dtype=jnp.float32)
         grad = jnp.zeros(3, dtype=jnp.float32)
         hess = jnp.zeros((3, 3), dtype=jnp.float32)
@@ -287,9 +278,8 @@ def compute_cbf_statistics(
     config: GraphConfig,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Evaluate the CBF and return the value, gradient, and Hessian w.r.t. position.
-    Falls back to an analytic soft-min distance barrier when the learned CBF is
-    unavailable or numerically unstable.
+    计算 CBF 的值、梯度与相对于位置的 Hessian；若神经 CBF 不可用或数值不稳，则
+    回退到 soft-min 解析屏障。
     """
     graph, _ = build_graph_from_point_cloud(state, point_cloud_world, config)
     use_network = params is not None and len(jtu.tree_leaves(params)) > 0

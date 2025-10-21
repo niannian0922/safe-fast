@@ -1,12 +1,7 @@
 """
 core.safety
-============
 
-Control-barrier-function (CBF) safety layer implemented as a differentiable
-quadratic programme.  The formulation mirrors the double-integrator CBF used in
-GCBF+: the decision variables are the acceleration command ``u`` and a
-non-negative relaxation slack ``δ`` that guarantees feasibility.  Solving the
-QP with ``qpax`` keeps the layer fully differentiable.
+以可微分二次规划实现的 CBF 安全层。整体结构沿用 GCBF+ 中的双积分器 CBF，决策变量包括加速度指令 ``u`` 以及用于保证可行性的非负松弛量 ``δ``。借助``qpax`` 求解可保持该层的端到端可微。
 """
 
 from __future__ import annotations
@@ -78,7 +73,7 @@ def _qp_forward(
     u_safe_raw = primal[:3]
     relaxation = primal[3]
 
-    # Preserve gradients for the policy while stopping gradients from the QP
+    # 为策略保留梯度，同时阻断来自 QP 的梯度
     u_safe = u_nom + jax.lax.stop_gradient(u_safe_raw - u_nom)
     relaxation = jax.lax.stop_gradient(relaxation)
     residual = jnp.maximum(jnp.max(G @ primal - h_vec), 0.0)
@@ -97,10 +92,10 @@ def _qp_backward(
 ):
     u_safe, _ = res
     grad_u, grad_diag = grad_output
-    del grad_diag  # diagnostics are stop_gradient'ed
+    del grad_diag  # 诊断信息已通过 stop_gradient 阻断
 
     grad_u_nom = grad_u
-    # No gradients w.r.t. CBF inputs
+    # 对 CBF 输入不回传梯度
     zeros_grad = jax.tree_util.tree_map(jnp.zeros_like, cbf_inputs)
     return grad_u_nom, zeros_grad
 
@@ -144,7 +139,7 @@ def _qp_raw(
     u_safe_raw = primal[:3]
     relaxation = primal[3]
 
-    # Preserve gradients for the policy while stopping gradients from the QP
+    # 为策略保留梯度，同时阻断来自 QP 的梯度
     u_safe = u_nom + jax.lax.stop_gradient(u_safe_raw - u_nom)
     relaxation = jax.lax.stop_gradient(relaxation)
     residual = jnp.maximum(jnp.max(G @ primal - h_vec), 0.0)
@@ -222,7 +217,7 @@ def _qp_custom_vjp_bwd(saved, grad_outputs):
 
 _qp_custom_vjp.defvjp(_qp_custom_vjp_fwd, _qp_custom_vjp_bwd)
 
-try:  # pragma: no cover - optional dependency resolved at runtime
+try:  # pragma: no cover - 可选依赖在运行时加载
     import qpax  # type: ignore
 
     HAS_QPAX = True
@@ -232,27 +227,27 @@ except ImportError:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
-# Configuration and diagnostics
+# 配置与诊断结构体
 # ---------------------------------------------------------------------------
 
 
 @struct.dataclass
 class SafetyConfig:
     """
-    Parameters governing the CBF-QP safety filter.
+    控制 CBF-QP 安全滤波器的参数。
 
-    Attributes
+    属性说明
     ----------
     alpha0, alpha1:
-        Class-K gains for the second-order (relative-degree-two) CBF condition.
+        二阶（相对阶数为 2）CBF 条件的 Class-K 增益。
     max_acceleration:
-        Box constraint for the acceleration command.
+        加速度指令的盒约束上界。
     relaxation_penalty:
-        Quadratic weight applied to the slack variable δ.
+        作用于松弛变量 δ 的二次惩罚权重。
     max_relaxation:
-        Upper bound on δ to avoid runaway solutions.
+        δ 的上界，用于避免解发散。
     tolerance:
-        Acceptable maximum constraint violation (diagnostics only).
+        可接受的最大约束违背量（仅用于诊断）。
     """
 
     alpha0: float = 1.0
@@ -271,7 +266,7 @@ class SafetyDiagnostics:
 
 
 # ---------------------------------------------------------------------------
-# Helper functions
+# 辅助函数
 # ---------------------------------------------------------------------------
 
 
@@ -284,38 +279,38 @@ def _assemble_qp(
     config: SafetyConfig,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Construct (Q, q, G, h) for the optimisation variable ``[u, δ]``.
+    为优化变量 ``[u, δ]`` 构造 (Q, q, G, h)。
     """
     velocity = state.velocity
 
-    # CBF terms for a double-integrator model
+    # 双积分器模型对应的 CBF 项
     lf_h = jnp.dot(grad_p, velocity)
     psi1 = lf_h + config.alpha0 * h_value
 
-    # Hessian-based term: ∂ψ1/∂p = H_h * v + α0 * grad_p
+    # Hessian 项：∂ψ1/∂p = H_h * v + α0 * grad_p
     partial_psi1_pos = hess_p @ velocity + config.alpha0 * grad_p
     lf_psi1 = jnp.dot(partial_psi1_pos, velocity)
-    lg_psi1 = grad_p  # derivative wrt velocity maps directly to control input
+    lg_psi1 = grad_p  # 对速度求导后可直接映射为控制输入
 
     rhs = lf_psi1 + config.alpha1 * psi1
 
-    # Cost: 0.5 (u - u_nom)^T (I) (u - u_nom) + 0.5 ρ δ^2
+    # 代价项：0.5 (u - u_nom)^T I (u - u_nom) + 0.5 ρ δ^2
     accel_weight = jnp.ones(3)
     H_diag = jnp.concatenate([accel_weight, jnp.array([config.relaxation_penalty])])
     Q = jnp.diag(H_diag)
     q = jnp.concatenate([-accel_weight * u_nom, jnp.array([0.0])])
 
-    # CBF constraint: -Lg ψ1 · u - δ <= rhs
+    # CBF 约束：-Lg ψ1 · u - δ <= rhs
     cbf_row = jnp.concatenate([-lg_psi1, jnp.array([-1.0])])
     cbf_rhs = rhs
 
-    # Box constraints on u
+    # 对 u 施加盒约束
     eye = jnp.eye(3)
     upper = jnp.concatenate([eye, jnp.zeros((3, 1))], axis=1)
     lower = jnp.concatenate([-eye, jnp.zeros((3, 1))], axis=1)
     accel_bound = jnp.full((3,), config.max_acceleration)
 
-    # Slack bounds: δ >= 0, δ <= max_relaxation
+    # 松弛变量范围：δ >= 0，δ <= max_relaxation
     slack_lb = jnp.array([[0.0, 0.0, 0.0, -1.0]])
     slack_lb_rhs = jnp.array([0.0])
     slack_ub = jnp.array([[0.0, 0.0, 0.0, 1.0]])
@@ -345,16 +340,14 @@ def _solve_qp(
     G: jnp.ndarray,
     h_vec: jnp.ndarray,
 ) -> jnp.ndarray:
-    """
-    Solve the QP and return the primal vector ``[u, δ]``.
-    """
-    if not HAS_QPAX:  # pragma: no cover - qpax is expected in production
-        raise RuntimeError("qpax is required for the differentiable safety layer.")
+    """求解该 QP 并返回原始变量 ``[u, δ]``。"""
+    if not HAS_QPAX:  # pragma: no cover - 生产部署默认会提供 qpax
+        raise RuntimeError("可微安全层需要安装 qpax。")
 
     sol = qpax.solve_qp_primal(
         Q,
         q,
-        jnp.zeros((0, Q.shape[0])),  # no equality constraints
+        jnp.zeros((0, Q.shape[0])),  # 无等式约束
         jnp.zeros((0,)),
         G,
         h_vec,
@@ -365,7 +358,7 @@ def _solve_qp(
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# 公共接口
 # ---------------------------------------------------------------------------
 
 
@@ -378,23 +371,23 @@ def safety_filter(
     config: SafetyConfig,
 ) -> Tuple[jnp.ndarray, SafetyDiagnostics]:
     """
-    Apply the differentiable CBF-QP filter.
+    应用可微的 CBF-QP 安全滤波器。
 
-    Parameters
+    参数
     ----------
     u_nom:
-        Nominal acceleration command from the policy.
+        策略输出的名义加速度指令。
     h_value, grad_position, hessian_position:
-        CBF value and its first/second spatial derivatives.
+        CBF 值及其一阶、二阶空间导数。
     state:
-        Current drone state.
+        当前无人机状态。
 
-    Returns
+    返回值
     -------
     u_safe:
-        Filtered acceleration command.
+        经过滤波后的加速度指令。
     diagnostics:
-        Constraint violation magnitude and slack usage (for logging only).
+        约束违背幅度与松弛使用情况（仅用于日志记录）。
     """
     u_safe, diagnostics = _qp_custom_vjp(
         u_nom,

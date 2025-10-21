@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-策略蒸馏 + 课程调度实验模板
-==========================
-
-该脚本批量生成策略蒸馏相关实验命令，可用于探索不同冻结步数、
-蒸馏权重、噪声课程的组合。默认仅打印命令，添加 `--execute` 真正运行。
+策略蒸馏 + 课程调度实验模板,该脚本批量生成策略蒸馏相关实验命令，可用于探索不同冻结步数、蒸馏权重、噪声课程的组合。默认仅打印命令，添加 `--execute` 真正运行。
 """
 
 from __future__ import annotations
@@ -92,12 +88,12 @@ def build_command(preset: Dict, output_root: Path, episodes: int, horizon: int, 
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate distillation experiment commands.")
-    parser.add_argument("--episodes", type=int, default=240)
-    parser.add_argument("--horizon", type=int, default=60)
-    parser.add_argument("--output-root", type=Path, default=ROOT / "outputs" / "distill_sweep")
-    parser.add_argument("--distill-policy", type=str, default=os.environ.get("DISTILL_POLICY_PATH"))
-    parser.add_argument("--execute", action="store_true", help="执行命令而不是仅打印")
+    parser = argparse.ArgumentParser(description="批量生成蒸馏实验命令")
+    parser.add_argument("--episodes", type=int, default=240, help="每个实验的训练轮数")
+    parser.add_argument("--horizon", type=int, default=60, help="单次 rollout 的步长")
+    parser.add_argument("--output-root", type=Path, default=ROOT / "outputs" / "distill_sweep", help="输出根目录")
+    parser.add_argument("--distill-policy", type=str, default=os.environ.get("DISTILL_POLICY_PATH"), help="教师策略参数路径")
+    parser.add_argument("--execute", action="store_true", help="直接执行命令而非只打印")
     parser.add_argument("--fast", action="store_true", help="快速冒烟模式")
     args = parser.parse_args()
 

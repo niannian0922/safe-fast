@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 训练指标回归检测脚本
-====================
 
-示例：
+比如:
     python tools/check_regression.py outputs/validation_stage --max-violation 20 --max-relax 0.05
 """
 
@@ -66,11 +65,11 @@ def evaluate_directory(exp_dir: Path, thresholds: dict) -> Tuple[bool, Dict[str,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Check for metric regressions in training outputs.")
-    parser.add_argument("paths", nargs="+", type=Path, help="输出目录（包含 training_results.pkl 或 metrics.json）")
-    parser.add_argument("--max-violation", type=float, default=20.0)
-    parser.add_argument("--max-relax", type=float, default=0.05)
-    parser.add_argument("--min-success", type=float, default=0.9)
+    parser = argparse.ArgumentParser(description="检测训练输出中的指标是否出现回归。")
+    parser.add_argument("paths", nargs="+", type=Path, help="输出目录（需包含 training_results.pkl 或 metrics.json）")
+    parser.add_argument("--max-violation", type=float, default=20.0, help="允许的最大违约值")
+    parser.add_argument("--max-relax", type=float, default=0.05, help="松弛均值的上限")
+    parser.add_argument("--min-success", type=float, default=0.9, help="成功率下限阈值")
     args = parser.parse_args()
 
     thresholds = {

@@ -2,12 +2,11 @@
 可视化工具模块
 
 提供无人机轨迹和训练过程的可视化功能，用于验证训练效果和调试。
-
-主要功能：
-1. plot_trajectory: 绘制无人机飞行轨迹
-2. plot_training_metrics: 绘制训练指标变化
-3. create_animation: 创建轨迹动画 (可选)
-4. 各种辅助可视化函数
+主要功能有：
+plot_trajectory: 绘制无人机飞行轨迹
+plot_training_metrics: 绘制训练指标变化
+create_animation: 创建轨迹动画 
+辅助可视化函数
 """
 
 import matplotlib.pyplot as plt

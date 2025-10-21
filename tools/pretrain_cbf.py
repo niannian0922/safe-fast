@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pretrain the CBF network using the analytic soft-min barrier."""
+"""使用解析 soft-min 屏障对 CBF 网络进行预训练。"""
 
 from __future__ import annotations
 
@@ -74,17 +74,17 @@ def generate_dataset(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="CBF pretraining (analytic supervision)")
-    parser.add_argument("--dataset-size", type=int, default=512)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--steps", type=int, default=2000)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-range", type=float, default=3.0)
-    parser.add_argument("--max-velocity", type=float, default=2.0)
-    parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--output", type=str, default="outputs/cbf_pretrained.pkl")
-    parser.add_argument("--init-params", type=str, default=None)
-    parser.add_argument("--no-jit", action="store_true", help="禁用 JIT 更新（调试用）")
+    parser = argparse.ArgumentParser(description="使用解析监督对 CBF 网络进行预训练")
+    parser.add_argument("--dataset-size", type=int, default=512, help="数据集大小")
+    parser.add_argument("--batch-size", type=int, default=32, help="批大小")
+    parser.add_argument("--steps", type=int, default=2000, help="训练步数")
+    parser.add_argument("--seed", type=int, default=0, help="随机种子")
+    parser.add_argument("--max-range", type=float, default=3.0, help="采样范围上限")
+    parser.add_argument("--max-velocity", type=float, default=2.0, help="速度采样上限")
+    parser.add_argument("--log-every", type=int, default=100, help="日志输出频率")
+    parser.add_argument("--output", type=str, default="outputs/cbf_pretrained.pkl", help="输出文件路径")
+    parser.add_argument("--init-params", type=str, default=None, help="初始参数文件")
+    parser.add_argument("--no-jit", action="store_true", help="禁用 JIT 更新（用于调试）")
     args = parser.parse_args()
 
     rng = jax.random.PRNGKey(args.seed)

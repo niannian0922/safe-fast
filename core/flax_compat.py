@@ -1,9 +1,9 @@
 """
-Helper to keep Flax compatible with older JAX releases.
+为旧版 JAX 提供兼容补丁，以确保 Flax 正常运行。
 
-Recent Flax versions expect `jax.config.define_bool_state`, which was renamed
-to `register_bool_state` in newer JAX builds.  On JAX 0.4.x the symbol may be
-absent, so we provide a small shim before importing Flax.
+较新的 Flax 期望 `jax.config.define_bool_state`，而在较新的 JAX 中该函数被
+重命名为 `register_bool_state`。在 JAX 0.4.x 上该符号可能不存在，因此在导入
+Flax 之前先做一个简易垫片。
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ if not hasattr(jax.config, "define_bool_state"):
             return getattr(jax.config, name)
         jax.config.define_bool_state = _define_bool_state  # type: ignore[attr-defined]
 
-# Ensure `jax.linear_util` is available (Flax imports it)
+# 确保 `jax.linear_util` 可用（Flax 会导入它）
 if not hasattr(jax, "linear_util"):
     try:
         from jax._src import linear_util as _linear_util  # type: ignore
@@ -36,7 +36,7 @@ if not hasattr(jax, "linear_util"):
     if _linear_util is not None:
         jax.linear_util = _linear_util  # type: ignore[attr-defined]
 
-# Provide KeyArray alias expected by Flax when using older JAX releases
+# 为旧版 JAX 提供 Flax 期望的 KeyArray 别名
 if not hasattr(jax.random, "KeyArray"):
     jax.random.KeyArray = jnp.ndarray  # type: ignore[attr-defined]
 
@@ -54,6 +54,6 @@ if not hasattr(jax.random, "default_prng_impl"):
         if default_impl is not None:
             jax.random.default_prng_impl = lambda: default_impl  # type: ignore[attr-defined]
 
-from flax import struct  # noqa: E402  (import after patching)
+from flax import struct  # noqa: E402  (在补丁后再导入)
 
 __all__ = ["struct"]

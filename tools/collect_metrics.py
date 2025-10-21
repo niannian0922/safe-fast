@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect evaluation metrics from multiple experiment directories."""
+"""从多个实验目录汇总评估指标。"""
 
 from __future__ import annotations
 
@@ -45,10 +45,10 @@ def load_metrics(exp_dir: Path) -> Dict[str, Any]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Collect evaluation metrics")
-    parser.add_argument("paths", nargs="+", type=Path, help="Experiment directories")
-    parser.add_argument("--output", type=Path, default=None, help="Optional JSON output")
-    parser.add_argument("--csv", type=Path, default=None, help="Optional CSV output")
+    parser = argparse.ArgumentParser(description="收集实验的评估指标")
+    parser.add_argument("paths", nargs="+", type=Path, help="实验输出目录")
+    parser.add_argument("--output", type=Path, default=None, help="可选的 JSON 输出文件")
+    parser.add_argument("--csv", type=Path, default=None, help="可选的 CSV 输出文件")
     args = parser.parse_args()
 
     records: List[Dict[str, Any]] = []
@@ -56,7 +56,7 @@ def main():
         if p.is_dir():
             records.append(load_metrics(p))
         else:
-            print(f"warning: {p} is not a directory; skipped")
+            print(f"警告: {p} 不是目录，已跳过")
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

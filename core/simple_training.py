@@ -64,14 +64,21 @@ def compute_goal_loss(positions: jnp.ndarray,
     
     这种方法解决了各向同性损失函数 vs 各向异性无人机动力学的矛盾。
     
-    Args:
-        positions: [T, 3] 轨迹位置序列
-        target_position: [3] 目标位置
-        config: 损失配置
-    
-    Returns:
-        goal_loss: 标量损失值
-        metrics: 详细指标字典
+    参数
+    ----------
+    positions:
+        `[T, 3]` 的轨迹位置序列。
+    target_position:
+        `[3]` 目标位置向量。
+    config:
+        损失配置对象。
+
+    返回
+    ----------
+    goal_loss:
+        标量损失值。
+    metrics:
+        详细指标字典。
     """
     # 计算位置误差向量
     position_errors = positions - target_position  # [T, 3]
@@ -128,13 +135,19 @@ def compute_control_loss(controls: jnp.ndarray,
     
     通过L2正则化惩罚过大的控制指令，鼓励节能飞行。
     
-    Args:
-        controls: [T, control_dim] 控制指令序列
-        config: 损失配置
-    
-    Returns:
-        control_loss: 标量损失值
-        metrics: 详细指标字典
+    参数
+    ----------
+    controls:
+        `[T, control_dim]` 控制指令序列。
+    config:
+        损失配置对象。
+
+    返回
+    ----------
+    control_loss:
+        标量损失值。
+    metrics:
+        详细指标字典。
     """
     # L2范数的平方和
     control_magnitudes = jnp.linalg.norm(controls, axis=1)  # [T]
@@ -161,13 +174,19 @@ def compute_smoothness_loss(controls: jnp.ndarray,
     惩罚相邻时间步控制指令的剧烈变化，近似于"急动度"(Jerk)。
     这确保飞行轨迹平滑稳定，避免高频抖动。
     
-    Args:
-        controls: [T, control_dim] 控制指令序列
-        config: 损失配置
-    
-    Returns:
-        smoothness_loss: 标量损失值
-        metrics: 详细指标字典
+    参数
+    ----------
+    controls:
+        `[T, control_dim]` 控制指令序列。
+    config:
+        损失配置对象。
+
+    返回
+    ----------
+    smoothness_loss:
+        标量损失值。
+    metrics:
+        详细指标字典。
     """
     if controls.shape[0] <= 1:
         # 只有一个时间步，没有平滑度概念
@@ -200,13 +219,19 @@ def compute_hover_loss(trajectory_outputs: Dict[str, jnp.ndarray],
     惩罚轨迹终点的速度，鼓励无人机在到达目标时减速至悬停状态，
     而不是直接冲过去。这解决了网络只学会"冲向目标"而不会"停下来"的问题。
     
-    Args:
-        trajectory_outputs: 轨迹数据字典，需要包含 'velocities'
-        config: 损失配置
-    
-    Returns:
-        hover_loss: 标量损失值
-        metrics: 详细指标字典
+    参数
+    ----------
+    trajectory_outputs:
+        轨迹数据字典，需要包含 `'velocities'`。
+    config:
+        损失配置对象。
+
+    返回
+    ----------
+    hover_loss:
+        标量损失值。
+    metrics:
+        详细指标字典。
     """
     # 检查是否包含速度信息
     if 'velocities' not in trajectory_outputs:
@@ -258,17 +283,24 @@ def compute_efficiency_loss(trajectory_outputs: Dict[str, jnp.ndarray],
     这是模块的核心函数，整合所有损失项并返回总损失和详细指标。
     新增了各向异性目标损失和悬停损失，专门针对无人机的物理特性设计。
     
-    Args:
-        trajectory_outputs: 轨迹数据字典，包含：
-            - 'positions': [T, 3] 位置序列
-            - 'controls': [T, control_dim] 控制指令序列
-            - 'velocities': [T, 3] 速度序列（可选，用于悬停损失）
-        target_position: [3] 目标位置
-        config: 损失配置
-    
-    Returns:
-        total_loss: 总损失标量值，用于反向传播
-        metrics_dict: 详细指标字典，用于监控训练过程
+    参数
+    ----------
+    trajectory_outputs:
+        轨迹数据字典，需包含：
+            - `'positions'`: `[T, 3]` 位置序列；
+            - `'controls'`: `[T, control_dim]` 控制指令序列；
+            - `'velocities'`: `[T, 3]` 速度序列（可选，用于悬停损失）。
+    target_position:
+        `[3]` 目标位置。
+    config:
+        损失配置对象。
+
+    返回
+    ----------
+    total_loss:
+        总损失（标量），用于反向传播。
+    metrics_dict:
+        详细指标字典，用于监控训练过程。
     """
     # 提取轨迹数据
     positions = trajectory_outputs['positions']
@@ -307,12 +339,17 @@ def create_efficiency_loss_fn(target_position: jnp.ndarray,
     返回一个部分应用的损失函数，只需要trajectory_outputs作为输入。
     这种设计方便在训练循环中使用。
     
-    Args:
-        target_position: [3] 目标位置
-        config: 损失配置
-    
-    Returns:
-        loss_fn: 损失函数 trajectory_outputs -> (loss, metrics)
+    参数
+    ----------
+    target_position:
+        `[3]` 目标位置。
+    config:
+        损失配置对象。
+
+    返回
+    ----------
+    loss_fn:
+        接受 `trajectory_outputs` 并返回 `(loss, metrics)` 的损失函数。
     """
     def loss_fn(trajectory_outputs: Dict[str, jnp.ndarray]) -> Tuple[float, Dict[str, float]]:
         return compute_efficiency_loss(trajectory_outputs, target_position, config)
@@ -322,12 +359,12 @@ def create_efficiency_loss_fn(target_position: jnp.ndarray,
 
 # 用于验证的默认配置（物理感知版本）
 DEFAULT_EFFICIENCY_CONFIG = EfficiencyLossConfig(
-    goal_weight=10.0,
-    z_axis_weight_multiplier=10.0,  # 强调Z轴控制的重要性
-    control_weight=0.1,
-    smoothness_weight=0.5,
-    final_goal_weight=50.0,
-    hover_weight=5.0,  # 鼓励悬停行为
+    goal_weight=16.0,
+    z_axis_weight_multiplier=12.0,  # 强调Z轴控制的重要性
+    control_weight=0.08,
+    smoothness_weight=0.45,
+    final_goal_weight=80.0,
+    hover_weight=8.0,  # 鼓励悬停行为
     time_decay_factor=0.95
 )
 
@@ -336,11 +373,15 @@ def validate_trajectory_outputs(trajectory_outputs: Dict[str, jnp.ndarray]) -> N
     """
     验证轨迹输出数据的格式和完整性
     
-    Args:
-        trajectory_outputs: 待验证的轨迹数据
-    
-    Raises:
-        ValueError: 如果数据格式不正确
+    参数
+    ----------
+    trajectory_outputs:
+        待验证的轨迹数据。
+
+    异常
+    ----------
+    ValueError:
+        当数据格式不正确时抛出。
     """
     required_keys = ['positions', 'controls']
     

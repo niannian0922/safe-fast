@@ -1,16 +1,15 @@
 """
-Entry-point training script for the refactored safe agile flight pipeline.
+重构后的安全敏捷飞行训练入口。
 
-This script wires together the core modules:
+本脚本串联了以下核心模块：
 
-- `core.physics` for differentiable point-mass dynamics;
-- `core.policy` for the control policy (MLP/GRU);
-- `core.perception` for the GNN-based CBF estimator;
-- `core.safety` for the differentiable CBF-QP safety filter;
-- `core.simple_training` for efficiency-oriented loss shaping.
+- `core.physics`：可微分的点质量动力学；
+- `core.policy`：控制策略（MLP/GRU）；
+- `core.perception`：GNN CBF 估计器；
+- `core.safety`：可微 CBF-QP 安全层；
+- `core.simple_training`：面向效率的损失塑形。
 
-The goal is to provide a compact yet complete baseline that can be iterated on
-for research experimentation.
+目标是提供一个紧凑但完整的基线，方便在研究实验中持续迭代。
 """
 
 from __future__ import annotations
@@ -56,7 +55,7 @@ import optax
 
 
 # ---------------------------------------------------------------------------
-# Configurations
+# 配置定义
 # ---------------------------------------------------------------------------
 
 
@@ -167,12 +166,12 @@ def sample_augmented_point_cloud(
 
 
 # ---------------------------------------------------------------------------
-# Rollout data structures
+# Rollout 相关的数据结构
 # ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
-# Environment helpers
+# 环境辅助函数
 # ---------------------------------------------------------------------------
 
 
@@ -183,7 +182,7 @@ def sample_initial_state(rng: jax.Array) -> DroneState:
 
 
 # ---------------------------------------------------------------------------
-# Rollout logic
+# Rollout 逻辑
 # ---------------------------------------------------------------------------
 
 
@@ -476,50 +475,50 @@ def make_train_step(
 
 
 # ---------------------------------------------------------------------------
-# Main routine
+# 主训练流程
 # ---------------------------------------------------------------------------
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train safe policy with CBF-QP.")
-    parser.add_argument("--episodes", type=int, default=None, help="Training episodes.")
-    parser.add_argument("--horizon", type=int, default=None, help="Rollout horizon.")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed.")
+    parser = argparse.ArgumentParser(description="使用 CBF-QP 训练安全策略。")
+    parser.add_argument("--episodes", type=int, default=None, help="训练的 episode 数量")
+    parser.add_argument("--horizon", type=int, default=None, help="单次 rollout 的步长")
+    parser.add_argument("--seed", type=int, default=None, help="随机种子")
     parser.add_argument(
         "--grad-decay",
         type=float,
         default=None,
-        help="Temporal gradient decay factor.",
+        help="时间梯度衰减系数",
     )
     parser.add_argument(
         "--safety-weight",
         type=float,
         default=None,
-        help="Weight for soft CBF penalty.",
+        help="软 CBF 惩罚项的权重",
     )
     parser.add_argument(
         "--solver-weight",
         type=float,
         default=None,
-        help="Weight for constraint violation penalty.",
+        help="约束违约惩罚的权重",
     )
     parser.add_argument(
         "--relaxation-weight",
         type=float,
         default=None,
-        help="Weight for slack usage in the safety layer.",
+        help="安全层松弛项的权重",
     )
     parser.add_argument(
         "--relax-usage-weight",
         type=float,
         default=None,
-        help="Weight for the average activation of the relaxation slack.",
+        help="松弛项平均激活率的权重",
     )
     parser.add_argument(
         "--policy-lr",
         type=float,
         default=None,
-        help="Learning rate for the policy parameters.",
+        help="策略参数的学习率",
     )
     parser.add_argument(
         "--target-position",
@@ -527,194 +526,194 @@ def parse_args() -> argparse.Namespace:
         nargs=3,
         default=None,
         metavar=("X", "Y", "Z"),
-        help="Goal position in metres.",
+        help="目标位置（米）",
     )
     parser.add_argument(
         "--use-rnn",
         action="store_true",
-        help="Enable GRU-based policy instead of pure MLP.",
+        help="启用基于 GRU 的策略（默认使用纯 MLP）",
     )
     parser.add_argument(
         "--stage-steps",
         type=str,
         default=None,
-        help="Comma-separated curriculum stage lengths (e.g. 300,400,300).",
+        help="逗号分隔的课程阶段长度（例如 300,400,300）",
     )
     parser.add_argument(
         "--noise-levels",
         type=str,
         default=None,
-        help="Comma-separated noise std for each stage (e.g. 0.0,0.02,0.05).",
+        help="逗号分隔的各阶段噪声标准差（如 0.0,0.02,0.05）",
     )
     parser.add_argument(
         "--disable-curriculum",
         action="store_true",
-        help="Disable staged curriculum (use last noise level only).",
+        help="禁用分阶段课程（仅使用最后阶段的噪声）",
     )
     parser.add_argument(
         "--disable-safety",
         action="store_true",
-        help="Bypass CBF/QP safety layer (policy output is used directly).",
+        help="跳过 CBF/QP 安全层（直接使用策略输出）",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
         default=None,
-        help="Optional directory to store final parameters and training history.",
+        help="可选：用于保存最终参数和训练日志的目录",
     )
     parser.add_argument(
         "--cbf-params",
         type=str,
         default=None,
-        help="Optional pickle file containing pretrained CBF parameters.",
+        help="可选：预训练 CBF 参数的 pickle 文件",
     )
     parser.add_argument(
         "--policy-params",
         type=str,
         default=None,
-        help="Optional pickle file containing pretrained policy parameters.",
+        help="可选：预训练策略参数的 pickle 文件",
     )
     parser.add_argument(
         "--policy-freeze-steps",
         type=int,
         default=None,
-        help="Number of initial episodes to freeze policy updates.",
+        help="策略冻结的初始 episode 数",
     )
     parser.add_argument(
         "--cbf-blend-alpha",
         type=float,
         default=None,
-        help="Blend factor between neural and analytic CBF (1.0 = neural).",
+        help="神经/解析 CBF 的混合权重（1.0 代表仅使用神经 CBF）",
     )
     parser.add_argument(
         "--disable-pointcloud-augment",
         action="store_true",
-        help="Disable random point cloud augmentation during training.",
+        help="训练期间禁用点云增强",
     )
     parser.add_argument(
         "--success-threshold",
         type=float,
         default=None,
-        help="Success rate threshold for checkpointing/rollback.",
+        help="触发 checkpoint/回滚的成功率阈值",
     )
     parser.add_argument(
         "--success-eval-schedule",
         type=str,
         default=None,
-        help="Comma-separated blend factors for success evaluation (e.g. 0.0,0.5,1.0).",
+        help="逗号分隔的成功率评估混合因子（如 0.0,0.5,1.0）",
     )
     parser.add_argument(
         "--success-eval-noise",
         type=str,
         default=None,
-        help="Comma-separated noise values used during success eval per stage.",
+        help="逗号分隔的成功率评估噪声",
     )
     parser.add_argument(
         "--success-eval-random-pc",
         type=str,
         default=None,
-        help="Comma-separated 0/1 flags for random point cloud during success eval per stage.",
+        help="逗号分隔的 0/1 标记，控制各阶段成功率评估是否启用随机点云",
     )
     parser.add_argument(
         "--violation-threshold",
         type=float,
         default=None,
-        help="Maximum allowed violation during eval before triggering rollback.",
+        help="评估阶段允许的最大违约值，超出则触发回滚",
     )
     parser.add_argument(
         "--violation-schedule",
         type=str,
         default=None,
-        help="Comma-separated violation thresholds per stage.",
+        help="逗号分隔的各阶段违约阈值",
     )
     parser.add_argument(
         "--robust-eval-frequency",
         type=int,
         default=None,
-        help="How often (episodes) to run robustness evaluation.",
+        help="执行鲁棒性评估的频率（以 episode 计）",
     )
     parser.add_argument(
         "--robust-eval-trials",
         type=int,
         default=None,
-        help="Number of rollouts per noise level in robustness evaluation.",
+        help="鲁棒性评估中每个噪声水平的 rollout 次数",
     )
     parser.add_argument(
         "--robust-eval-noise",
         type=str,
         default=None,
-        help="Comma-separated noise levels for robustness stress testing.",
+        help="逗号分隔的鲁棒性噪声水平",
     )
     parser.add_argument(
         "--robust-eval-no-pc",
         action="store_true",
-        help="Disable random point cloud augmentation during robustness evaluation.",
+        help="鲁棒性评估时禁用点云增强",
     )
     parser.add_argument(
         "--blend-backoff",
         type=float,
         default=None,
-        help="Blend reduction applied when violations exceed thresholds.",
+        help="违约超过阈值时应用的混合权重衰减",
     )
     parser.add_argument(
         "--blend-min",
         type=float,
         default=None,
-        help="Minimum allowed blend after automatic backoff.",
+        help="自动退回后的混合权重下限",
     )
     parser.add_argument(
         "--relax-boost",
         type=float,
         default=None,
-        help="Multiplier applied to relaxation penalties when violations exceed thresholds.",
+        help="违约超过阈值时松弛惩罚的放大倍数",
     )
     parser.add_argument(
         "--relax-max",
         type=float,
         default=None,
-        help="Maximum relaxation penalty multiplier.",
+        help="松弛惩罚的放大上限",
     )
     parser.add_argument(
         "--solver-boost",
         type=float,
         default=None,
-        help="Multiplier applied to solver violation penalties when thresholds are exceeded.",
+        help="违约超过阈值时求解器惩罚的放大倍数",
     )
     parser.add_argument(
         "--solver-max",
         type=float,
         default=None,
-        help="Maximum solver penalty multiplier.",
+        help="求解器惩罚的放大上限",
     )
     parser.add_argument(
         "--relax-alert",
         type=float,
         default=None,
-        help="Relaxation mean threshold that triggers adaptive penalties even without eval.",
+        help="即便不评估也会触发自适应惩罚的松弛均值阈值",
     )
     parser.add_argument(
         "--distill-policy",
         type=str,
         default=None,
-        help="Optional policy parameters used for distillation regularization.",
+        help="可选：用于蒸馏正则的教师策略参数",
     )
     parser.add_argument(
         "--distill-weight",
         type=float,
         default=None,
-        help="Weight for policy distillation loss.",
+        help="策略蒸馏损失的权重",
     )
     parser.add_argument(
         "--blend-levels",
         type=str,
         default=None,
-        help="Comma-separated blend factors matching stage steps.",
+        help="逗号分隔的混合权重设置，与阶段步数一一对应",
     )
     parser.add_argument(
         "--augment-levels",
         type=str,
         default=None,
-        help="Comma-separated 0/1 flags for point cloud augmentation per stage.",
+        help="逗号分隔的 0/1 标记，控制各阶段是否启用点云增强",
     )
     return parser.parse_args()
 
@@ -742,18 +741,18 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         try:
             values = tuple(int(s.strip()) for s in raw.split(",") if s.strip())
         except ValueError as exc:  # pragma: no cover
-            raise ValueError(f"Invalid stage_steps spec: {raw}") from exc
+            raise ValueError(f"stage_steps 格式不合法: {raw}") from exc
         if not values:
-            raise ValueError("stage_steps must contain at least one integer")
+            raise ValueError("stage_steps 至少需要包含一个整数")
         return values
 
     def parse_float_tuple(raw: str) -> Tuple[float, ...]:
         try:
             values = tuple(float(s.strip()) for s in raw.split(",") if s.strip())
         except ValueError as exc:  # pragma: no cover
-            raise ValueError(f"Invalid noise_levels spec: {raw}") from exc
+            raise ValueError(f"noise_levels 格式不合法: {raw}") from exc
         if not values:
-            raise ValueError("noise_levels must contain at least one float")
+            raise ValueError("noise_levels 至少需要包含一个浮点数")
         return values
 
     curriculum_enabled = bool(cfg.training.curriculum.enable) and not args.disable_curriculum
@@ -778,18 +777,18 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         try:
             values = tuple(float(s.strip()) for s in raw.split(",") if s.strip())
         except ValueError as exc:
-            raise ValueError(f"Invalid blend_levels spec: {raw}") from exc
+            raise ValueError(f"blend_levels 格式不合法: {raw}") from exc
         if not values:
-            raise ValueError("blend_levels must contain at least one value")
+            raise ValueError("blend_levels 至少需要包含一个数值")
         return values
 
     def parse_int_optional(raw: str) -> Tuple[int, ...]:
         try:
             values = tuple(int(s.strip()) for s in raw.split(",") if s.strip())
         except ValueError as exc:
-            raise ValueError(f"Invalid augment_levels spec: {raw}") from exc
+            raise ValueError(f"augment_levels 格式不合法: {raw}") from exc
         if not values:
-            raise ValueError("augment_levels must contain at least one value")
+            raise ValueError("augment_levels 至少需要包含一个数值")
         return values
 
     if args.blend_levels:
@@ -805,9 +804,9 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
     stage_count = len(stage_steps) if curriculum_enabled else 1
 
     if len(blend_levels) != len(stage_steps):
-        raise ValueError("blend_levels must match stage_steps length")
+        raise ValueError("blend_levels 的长度必须与 stage_steps 一致")
     if len(augment_levels) != len(stage_steps):
-        raise ValueError("augment_levels must match stage_steps length")
+        raise ValueError("augment_levels 的长度必须与 stage_steps 一致")
 
     policy_freeze_steps = (
         args.policy_freeze_steps
@@ -1011,7 +1010,7 @@ def main(
     )
 
     if config.use_safety:
-        # Start with analytic CBF, optionally load pretrained neural parameters.
+        # 以解析 CBF 起步，可选加载预训练的神经网络参数。
         if cbf_params_path:
             with Path(cbf_params_path).open("rb") as fh:
                 cbf_payload = pickle.load(fh)

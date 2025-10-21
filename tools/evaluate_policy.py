@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a saved training artifact over multiple rollouts."""
+"""针对保存的训练成果执行多次 rollout 评估。"""
 
 from __future__ import annotations
 
@@ -172,17 +172,17 @@ def evaluate(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate a training artifact.")
-    parser.add_argument("artifact", type=Path, help="Path to training_results.pkl")
-    parser.add_argument("--trials", type=int, default=64, help="Number of rollouts")
-    parser.add_argument("--seed", type=int, default=2025, help="Random seed")
-    parser.add_argument("--noise", type=float, default=0.0, help="Observation noise scale")
+    parser = argparse.ArgumentParser(description="评估单个训练成果。")
+    parser.add_argument("artifact", type=Path, help="training_results.pkl 的路径")
+    parser.add_argument("--trials", type=int, default=64, help="rollout 次数")
+    parser.add_argument("--seed", type=int, default=2025, help="随机种子")
+    parser.add_argument("--noise", type=float, default=0.0, help="观测噪声的标准差")
     parser.add_argument(
         "--random-point-cloud",
         action="store_true",
-        help="Use augmented point clouds during evaluation",
+        help="评估时是否使用扰动点云",
     )
-    parser.add_argument("--json", type=Path, default=None, help="Optional JSON output path")
+    parser.add_argument("--json", type=Path, default=None, help="可选的 JSON 输出路径")
     args = parser.parse_args()
 
     result = evaluate(

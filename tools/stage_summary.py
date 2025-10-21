@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Summarize stored stage_* result artifacts.
+"""汇总 stage_* 结果文件的辅助脚本。
 
-The script scans given directories (or defaults to `stage*_results*` under the
-current working tree), loads any ``*.pkl`` files, and extracts a compact set of
-diagnostics such as final success rate, best distance, and last recorded loss
-values.  The output is a readable table or, with ``--json``, a machine-friendly
-JSON blob.
+脚本会扫描指定目录（若未提供则默认查找当前工作路径下的 `stage*_results*`），
+加载其中的 ``*.pkl`` 文件，并提取终端成功率、最佳距离、最后一次 loss 等关键
+指标。默认以可读表格输出；若传入 ``--json`` 则生成机器友好的 JSON。
 """
 
 from __future__ import annotations
@@ -17,7 +15,7 @@ import pickle
 from pathlib import Path
 from typing import Any, Dict, Iterable
 
-# Ensure custom dataclasses (e.g., TrainingConfig) are importable when loading pickles
+# 确保在加载 pickle 时能导入自定义 dataclass（例如 TrainingConfig）
 try:  # pragma: no cover - soft dependency
     import train_safe_policy  # noqa: F401
 except Exception:
@@ -25,7 +23,7 @@ except Exception:
 
 
 def _to_scalar(value: Any) -> float | int | None:
-    """Convert common numeric containers to Python scalars."""
+    """将常见的数值容器转换为 Python 标量。"""
 
     try:
         if hasattr(value, "__array__"):
@@ -95,9 +93,9 @@ def iter_pickles(root: Path) -> Iterable[Path]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Summarize stage_* result pickles")
-    parser.add_argument("paths", nargs="*", help="Directories or pickle files to scan")
-    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    parser = argparse.ArgumentParser(description="汇总 stage_* 结果文件")
+    parser.add_argument("paths", nargs="*", help="需要扫描的目录或 pickle 文件")
+    parser.add_argument("--json", action="store_true", help="以 JSON 形式输出")
     args = parser.parse_args()
 
     if args.paths:

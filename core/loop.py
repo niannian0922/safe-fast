@@ -2,10 +2,9 @@
 core.loop
 =========
 
-JAX-native rollout utilities that couple perception, policy, safety filtering,
-and physics into a single differentiable `lax.scan` loop.  The helper
-structures defined here are reused by the training script to keep the main file
-compact and to facilitate future reuse in evaluation code.
+基于 JAX 的 rollout 工具，将感知、策略、安全过滤与物理仿真耦合成可微的
+`lax.scan` 循环。这里的辅助结构会被训练脚本复用，使主文件保持精简，也方便
+后续在评估代码中再次调用。
 """
 
 from __future__ import annotations
@@ -63,10 +62,7 @@ def rollout_episode(
     cbf_blend_alpha: float = 1.0,
 ) -> Tuple[RolloutCarry, RolloutStepOutput]:
     """
-    Execute a differentiable rollout for a single episode.
-
-    Parameters mirror the training script to keep the public API simple; no RNG
-    is consumed inside the loop to avoid non-determinism during JIT compilation.
+    执行一次可微分的单回合 rollout。参数设计与训练脚本保持一致，保持公共接口简洁；循环内部不再额外消耗 RNG，以避免 JIT 编译时出现非确定性。
     """
 
     carry = RolloutCarry(drone=initial_state, policy=policy_state)

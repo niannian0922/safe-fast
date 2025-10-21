@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
 安全训练批处理脚本
-==================
-
 该脚本用于执行一组预定义的安全训练实验，自动化完成以下流程：
-1. 构造训练命令（可自定义 episodes / 噪声 / 混合策略等参数）；
-2. 支持 `--dry-run` 打印命令而不真正执行，方便先审查；
-3. 每个实验结束后调用 `tools/collect_metrics.py`、`tools/stage_summary.py`
-   以及生成快速可视化；
-4. 将所有指标写入单一 JSON/CSV，便于后续汇报。
+构造训练命令（可自定义 episodes / 噪声 / 混合策略等参数）；
+支持 `--dry-run` 打印命令而不真正执行，方便先审查；
+每个实验结束后调用 `tools/collect_metrics.py`、`tools/stage_summary.py`以及生成快速可视化；
+将所有指标写入单一 JSON/CSV，便于后续汇报。
 
-示例：
+比如：
     python tools/run_safety_suite.py --output-root outputs/safety_suite --fast
     python tools/run_safety_suite.py --dry-run
 """
@@ -112,7 +109,7 @@ def run_command(cmd: List[str]) -> None:
 
 def collect_artifacts(exp_dir: Path, summary_rows: List[Dict]) -> None:
     if not exp_dir.exists():
-        print(f"[warn] {exp_dir} not found, skip metrics collection.")
+        print(f"[警告] 未找到 {exp_dir}，已跳过指标收集。")
         return
 
     collect_cmd = [
@@ -142,25 +139,25 @@ def collect_artifacts(exp_dir: Path, summary_rows: List[Dict]) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run predefined safe-training experiments.")
+    parser = argparse.ArgumentParser(description="执行预定义的安全训练实验。")
     parser.add_argument(
         "--output-root",
         type=Path,
         default=ROOT / "outputs" / "safety_suite",
-        help="Directory to store experiment outputs.",
+        help="用于存放实验输出的目录。",
     )
-    parser.add_argument("--episodes", type=int, default=300, help="Episodes per experiment.")
-    parser.add_argument("--horizon", type=int, default=60, help="Rollout horizon per experiment.")
-    parser.add_argument("--robust-frequency", type=int, default=50, help="Robust eval frequency.")
+    parser.add_argument("--episodes", type=int, default=300, help="每个实验的训练轮数")
+    parser.add_argument("--horizon", type=int, default=60, help="单次 rollout 的步长")
+    parser.add_argument("--robust-frequency", type=int, default=50, help="鲁棒性评估的频率")
     parser.add_argument(
         "--only",
         type=str,
         nargs="*",
         default=None,
-        help="Subset of presets to execute (by key).",
+        help="仅执行指定 key 的实验预设",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Print commands only.")
-    parser.add_argument("--fast", action="store_true", help="Use small episodes/horizon for smoke.")
+    parser.add_argument("--dry-run", action="store_true", help="仅打印命令，不实际执行")
+    parser.add_argument("--fast", action="store_true", help="使用较小的 episodes/horizon 进行冒烟测试")
     args = parser.parse_args()
 
     output_root = args.output_root

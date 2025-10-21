@@ -2,17 +2,8 @@
 core.physics
 ================
 
-Minimal differentiable quadrotor-style point-mass dynamics that stays faithful
-to the methodological commitments in *GCBF+* and *DiffPhysDrone*:
+轻量的可微分四旋翼点质量动力学实现，保持全流程可微与 JAX 优先；控制量视为世界坐标系下的加速度，并受盒约束限制；离散时间更新与 CBF-QP 使用的线性化模型一致；可选的时间梯度衰减用于稳定长视角的 BPTT 训练。
 
-- single-agent, fully differentiable, JAX-first implementation;
-- controls act as accelerations in world coordinates and are box-constrained;
-- discrete-time update matches the linearised model used for CBF-QP;
-- optional temporal gradient decay to stabilise long-horizon BPTT.
-
-The implementation intentionally omits multi-agent conveniences from the legacy
-code base so that every function is a small, pure PyTree transformation that can
-be dropped directly inside a `jax.lax.scan`.
 """
 
 from __future__ import annotations
@@ -25,20 +16,20 @@ import jax.numpy as jnp
 from core.flax_compat import struct
 
 # ---------------------------------------------------------------------------
-# State and parameter containers
+# 状态与参数容器
 # ---------------------------------------------------------------------------
 
 
 @struct.dataclass
 class DroneState:
-    """Single-drone point-mass state compatible with JAX transformations."""
+    """与 JAX 变换兼容的单机点质量状态表示。"""
 
-    position: jnp.ndarray  # (3,)
-    velocity: jnp.ndarray  # (3,)
-    acceleration: jnp.ndarray  # (3,) -- most recent commanded acceleration
-    time: jnp.ndarray  # scalar simulation time
+    position: jnp.ndarray  # (3,) 位置
+    velocity: jnp.ndarray  # (3,) 速度
+    acceleration: jnp.ndarray  # (3,) 最近一次下发的加速度指令
+    time: jnp.ndarray  # 标量仿真时间
 
-    # Orientation is optional but kept to ease later perception integration.
+    # 姿态信息可选，保留它方便后续做感知模块的融合。
     orientation: jnp.ndarray = struct.field(
         default_factory=lambda: jnp.eye(3)
     )  # (3,3)
@@ -46,23 +37,23 @@ class DroneState:
 
 @dataclass(frozen=True)
 class PhysicsParams:
-    """Physical constants shared with the safety layer."""
+    """与安全层共享的物理常量。"""
 
-    dt: float = 1.0 / 15.0  # control frequency (s)
-    gravity: float = 9.80665  # m/s^2, only used for reference
-    max_acceleration: float = 5.0  # |u|_inf bound (m/s^2)
-    max_velocity: float = 10.0  # soft speed cap (m/s)
-    workspace_radius: float = 30.0  # used for soft position clamp
-    gradient_decay: float = 0.4  # DiffPhys-style temporal gradient decay
+    dt: float = 1.0 / 15.0  # 控制频率（秒）
+    gravity: float = 9.80665  # 重力加速度，仅作为参考
+    max_acceleration: float = 5.0  # 加速度无穷范数上限（m/s^2）
+    max_velocity: float = 10.0  # 速度软上限（m/s）
+    workspace_radius: float = 30.0  # 软位置裁剪使用的工作半径
+    gradient_decay: float = 0.4  # DiffPhys 风格的时间梯度衰减系数
 
 
 # ---------------------------------------------------------------------------
-# Utility helpers
+# 工具函数
 # ---------------------------------------------------------------------------
 
 
 def _clip_vector_norm(vector: jnp.ndarray, limit: float) -> jnp.ndarray:
-    """Clips a vector to the given Euclidean norm in a smooth fashion."""
+    """在保持平滑的前提下，将向量范数裁剪到给定欧氏长度。"""
     vector = jnp.asarray(vector)
     norm = jnp.linalg.norm(vector) + 1e-8
     scale = jnp.minimum(1.0, limit / norm)
@@ -74,7 +65,7 @@ def _project_box(u: jnp.ndarray, limit: float) -> jnp.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Core dynamics
+# 核心动力学
 # ---------------------------------------------------------------------------
 
 
@@ -84,11 +75,10 @@ def dynamics_step(
     params: PhysicsParams,
 ) -> DroneState:
     """
-    Forward Euler step for a point-mass model.
+    点质量模型的显式欧拉更新。
 
-    `control_input` is interpreted as world-frame acceleration (m/s²) and is
-    box-clipped to `±params.max_acceleration`.  This matches the control channel
-    assumed when constructing the CBF-QP constraints.
+    `control_input` 被视为世界坐标系下的加速度（m/s²），并会被裁剪到
+    `±params.max_acceleration`，与构造 CBF-QP 约束时假设的控制通道保持一致。
     """
     u = _project_box(control_input, params.max_acceleration)
     dt = params.dt
@@ -107,14 +97,12 @@ def dynamics_step(
 
 
 # ---------------------------------------------------------------------------
-# Temporal gradient decay (DiffPhysDrone)
+# 时间梯度衰减（DiffPhysDrone）
 # ---------------------------------------------------------------------------
 
 
 def temporal_gradient_decay(x: jnp.ndarray, alpha: float) -> jnp.ndarray:
-    """
-    Implements the DiffPhys `g_decay` operator in JAX form.
-    """
+    """以 JAX 形式实现 DiffPhys 中的 `g_decay` 运算。"""
     return alpha * x + (1.0 - alpha) * jax.lax.stop_gradient(x)
 
 
@@ -122,9 +110,7 @@ def apply_temporal_gradient_decay_to_state(
     state: DroneState,
     decay_alpha: float,
 ) -> DroneState:
-    """
-    Applies temporal gradient decay to position, velocity, and acceleration.
-    """
+    """将时间梯度衰减应用到位置、速度与加速度。"""
     return DroneState(
         position=temporal_gradient_decay(state.position, decay_alpha),
         velocity=temporal_gradient_decay(state.velocity, decay_alpha),
@@ -135,7 +121,7 @@ def apply_temporal_gradient_decay_to_state(
 
 
 # ---------------------------------------------------------------------------
-# Convenience initialisers
+# 便捷初始化函数
 # ---------------------------------------------------------------------------
 
 
@@ -143,7 +129,7 @@ def create_initial_state(
     position: jnp.ndarray | None = None,
     velocity: jnp.ndarray | None = None,
 ) -> DroneState:
-    """Returns a zero-velocity hover state at the specified position."""
+    """在给定位置返回零速度悬停状态。"""
     pos = jnp.zeros(3) if position is None else position
     vel = jnp.zeros(3) if velocity is None else velocity
     return DroneState(
@@ -155,7 +141,7 @@ def create_initial_state(
 
 
 # ---------------------------------------------------------------------------
-# Batch utilities (optional)
+# 批量操作工具（可选）
 # ---------------------------------------------------------------------------
 
 
@@ -164,9 +150,7 @@ def dynamics_step_batch(
     controls: jnp.ndarray,
     params: PhysicsParams,
 ) -> Tuple[jnp.ndarray, Callable]:
-    """
-    vmap-friendly wrapper operating on stacked DroneState components.
-    """
+    """对堆叠后的 DroneState 组件执行、适用于 vmap 的包装函数。"""
     def _single_step(position, velocity, acceleration, time, orientation, control):
         next_state = dynamics_step(
             DroneState(position, velocity, acceleration, time, orientation),
