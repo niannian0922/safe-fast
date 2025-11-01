@@ -50,7 +50,7 @@ from core.simple_training import (
     compute_efficiency_loss,
 )
 from core.loop import rollout_episode as execute_rollout
-from configs import default_config
+from configs import default_config, stage1_analytic, stage1_efficiency
 import optax
 
 
@@ -94,6 +94,7 @@ class TrainingConfig:
     success_eval_noise: float = 0.0
     success_eval_random_pc: bool = False
     success_threshold: float = 0.95
+    success_tolerance: float = 0.1
     success_patience: int = 3
     success_eval_schedule: Tuple[float, ...] | None = None
     success_eval_noise_schedule: Tuple[float, ...] | None = None
@@ -114,13 +115,44 @@ class TrainingConfig:
     blend_backoff: float = 0.2
     blend_min: float = 0.2
     relaxation_alert: float = 0.1
+    hard_nan_rate: float = 0.05
+    hard_relaxation_exceed_rate: float = 0.5
+    hard_qp_fail_rate: float = 0.3
+    point_cloud_modes: Tuple[str, ...] = ("ring",)
+    hard_abort_warmup_episodes: int = 40
+    hard_nan_schedule: Tuple[float, ...] | None = None
+    hard_relax_schedule: Tuple[float, ...] | None = None
+    hard_qp_fail_schedule: Tuple[float, ...] | None = None
+    relaxation_scale_schedule: Tuple[float, ...] | None = None
+    solver_scale_schedule: Tuple[float, ...] | None = None
+    target_distance_schedule: Tuple[float, ...] | None = None
+    teacher_gain_p: float = 0.0
+    teacher_gain_d: float = 0.0
+    teacher_weight: float = 0.0
+    velocity_alignment_weight: float = 0.0
+    desired_speed: float = 1.0
+    final_velocity_weight: float = 0.0
+    distance_bonus_weight: float = 0.0
+    distance_bonus_threshold: float = 0.0
+    initial_xy_range: float = 0.5
+    initial_z_range: Tuple[float, float] = (0.8, 1.2)
+    trajectory_projection_weight: float = 0.0
+    distance_tracking_weight: float = 0.0
+    teacher_force_schedule: Tuple[float, ...] | None = None
+    final_distance_weight: float = 0.0
 
 
 def _ensure_param_dict(obj):
-    if isinstance(obj, dict) and "params" in obj:
-        if set(obj.keys()) == {"params"}:
-            return obj
-        return {"params": obj["params"]}
+    if isinstance(obj, dict):
+        if "params" in obj:
+            if set(obj.keys()) == {"params"}:
+                return obj
+            return {"params": obj["params"]}
+        if "params_policy" in obj:
+            val = obj["params_policy"]
+            if isinstance(val, dict) and set(val.keys()) == {"params"}:
+                return val
+            return {"params": val}
     return obj
 
 
@@ -136,14 +168,96 @@ def make_ring_point_cloud(
     return jnp.stack([x, y, z], axis=1)
 
 
+def _clamp_point_cloud(cloud: jnp.ndarray, graph_config: GraphConfig) -> jnp.ndarray:
+    max_dist = jnp.asarray(graph_config.max_distance, dtype=cloud.dtype)
+    cloud = jnp.clip(cloud, -max_dist, max_dist)
+    z = jnp.clip(cloud[:, 2], 0.05, max_dist)
+    return cloud.at[:, 2].set(z)
+
+
+def make_cylinder_point_cloud(
+    num_points: int,
+    graph_config: GraphConfig,
+    rng: jax.Array,
+) -> Tuple[jnp.ndarray, jax.Array]:
+    rng_angle, rng_radius, rng_height_scale, rng_height_offset, rng_noise, rng_next = jax.random.split(rng, 6)
+    angles = jax.random.uniform(rng_angle, (num_points,), minval=0.0, maxval=2.0 * jnp.pi)
+    base_radius = 0.4 * graph_config.max_distance
+    radii = base_radius * (0.6 + 0.4 * jax.random.uniform(rng_radius, (num_points,)))
+    x = radii * jnp.cos(angles)
+    y = radii * jnp.sin(angles)
+    heights = (0.6 + 0.4 * jax.random.uniform(rng_height_scale, (num_points,))) * 1.5
+    z = jax.random.uniform(rng_height_offset, (num_points,), minval=-0.5, maxval=0.5) * heights + 1.0
+    cloud = jnp.stack([x, y, z], axis=1)
+    cloud += 0.1 * jax.random.normal(rng_noise, cloud.shape)
+    return _clamp_point_cloud(cloud, graph_config), rng_next
+
+
+def make_box_point_cloud(
+    num_points: int,
+    graph_config: GraphConfig,
+    rng: jax.Array,
+) -> Tuple[jnp.ndarray, jax.Array]:
+    rng_center, rng_extent, rng_points, rng_next = jax.random.split(rng, 4)
+    center = jax.random.uniform(
+        rng_center,
+        (3,),
+        minval=jnp.array([-1.0, -1.0, 0.5]),
+        maxval=jnp.array([1.0, 1.0, 1.5]),
+    )
+    extent = jax.random.uniform(rng_extent, (3,), minval=0.5, maxval=1.5)
+    points = jax.random.uniform(rng_points, (num_points, 3), minval=-extent, maxval=extent)
+    cloud = center + points
+    return _clamp_point_cloud(cloud, graph_config), rng_next
+
+
+def make_noise_point_cloud(
+    num_points: int,
+    graph_config: GraphConfig,
+    rng: jax.Array,
+) -> Tuple[jnp.ndarray, jax.Array]:
+    rng_points, rng_radius, rng_next = jax.random.split(rng, 3)
+    offsets = jax.random.normal(rng_points, (num_points, 3))
+    radii = jax.random.uniform(rng_radius, (num_points, 1), minval=0.2, maxval=1.0)
+    cloud = offsets * radii
+    cloud = cloud.at[:, 2].add(1.0)
+    return _clamp_point_cloud(cloud, graph_config), rng_next
+
+
+def build_point_cloud_for_mode(
+    mode: str,
+    base_cloud: jnp.ndarray,
+    graph_config: GraphConfig,
+    rng: jax.Array,
+) -> Tuple[jnp.ndarray, jax.Array]:
+    mode_lower = mode.lower()
+    num_points = graph_config.max_points
+    if mode_lower == "ring":
+        return base_cloud, rng
+    if mode_lower == "cylinder":
+        return make_cylinder_point_cloud(num_points, graph_config, rng)
+    if mode_lower == "box":
+        return make_box_point_cloud(num_points, graph_config, rng)
+    if mode_lower == "noise":
+        return make_noise_point_cloud(num_points, graph_config, rng)
+    if mode_lower == "mixed":
+        rng_cyl, rng_box, rng_noise, rng_next = jax.random.split(rng, 4)
+        cyl_cloud, _ = make_cylinder_point_cloud(num_points // 3, graph_config, rng_cyl)
+        box_cloud, _ = make_box_point_cloud(num_points // 3, graph_config, rng_box)
+        noise_cloud, _ = make_noise_point_cloud(num_points - 2 * (num_points // 3), graph_config, rng_noise)
+        cloud = jnp.concatenate([cyl_cloud, box_cloud, noise_cloud], axis=0)
+        return _clamp_point_cloud(cloud, graph_config), rng_next
+    return base_cloud, rng
+
+
 def sample_augmented_point_cloud(
     base_cloud: jnp.ndarray,
     graph_config: GraphConfig,
     rng: jax.Array,
     jitter_scale: float = 0.3,
     replace_prob: float = 0.3,
-) -> jnp.ndarray:
-    rng_jitter, rng_replace, rng_new = jax.random.split(rng, 3)
+) -> Tuple[jnp.ndarray, jax.Array]:
+    rng_jitter, rng_replace, rng_new, rng_next = jax.random.split(rng, 4)
     noise = jitter_scale * jax.random.normal(rng_jitter, base_cloud.shape)
     jittered = base_cloud + noise
     max_dist = jnp.asarray(graph_config.max_distance, dtype=jittered.dtype)
@@ -162,7 +276,7 @@ def sample_augmented_point_cloud(
     new_z = jnp.abs(new_samples[:, 2]) + 0.05
     new_samples = new_samples.at[:, 2].set(jnp.clip(new_z, 0.05, max_dist))
     augmented = jnp.where(replace_mask, new_samples, jittered)
-    return augmented
+    return augmented, rng_next
 
 
 # ---------------------------------------------------------------------------
@@ -175,9 +289,16 @@ def sample_augmented_point_cloud(
 # ---------------------------------------------------------------------------
 
 
-def sample_initial_state(rng: jax.Array) -> DroneState:
-    pos = jax.random.uniform(rng, (3,), minval=-0.5, maxval=0.5)
-    pos = pos.at[2].set(jax.random.uniform(rng, (), minval=0.8, maxval=1.2))
+def sample_initial_state(
+    rng: jax.Array,
+    xy_range: float = 0.5,
+    z_min: float = 0.8,
+    z_max: float = 1.2,
+) -> DroneState:
+    rng_xy, rng_z = jax.random.split(rng)
+    xy = jax.random.uniform(rng_xy, (2,), minval=-xy_range, maxval=xy_range)
+    z = jax.random.uniform(rng_z, (), minval=z_min, maxval=z_max)
+    pos = jnp.concatenate([xy, jnp.array([z])])
     return create_initial_state(position=pos)
 
 
@@ -199,29 +320,26 @@ def compute_total_loss(
     noise_scale: float,
     baseline_policy_params: Dict | None,
     blend_alpha: float,
+    point_cloud_mode: str,
     augment_flag: bool,
+    target_position: jnp.ndarray,
     relaxation_weight_scale: float = 1.0,
     solver_weight_scale: float = 1.0,
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     key_init, rollout_rng = jax.random.split(rng)
-
-    def do_augment(key):
-        cloud_rng, next_rng = jax.random.split(key)
-        augmented = sample_augmented_point_cloud(
-            base_point_cloud, graph_config, cloud_rng
-        )
-        return augmented, next_rng
-
-    def no_augment(key):
-        return base_point_cloud, key
-
-    point_cloud, rollout_rng = jax.lax.cond(
-        augment_flag,
-        do_augment,
-        no_augment,
-        rollout_rng,
+    point_cloud, rollout_rng = build_point_cloud_for_mode(
+        point_cloud_mode, base_point_cloud, graph_config, rollout_rng
     )
-    init_state = sample_initial_state(key_init)
+    if augment_flag:
+        point_cloud, rollout_rng = sample_augmented_point_cloud(
+            point_cloud, graph_config, rollout_rng
+        )
+    init_state = sample_initial_state(
+        key_init,
+        xy_range=config.initial_xy_range,
+        z_min=float(config.initial_z_range[0]),
+        z_max=float(config.initial_z_range[1]),
+    )
 
     _, rollout = execute_rollout(
         params=params,
@@ -232,7 +350,7 @@ def compute_total_loss(
         point_cloud=point_cloud,
         graph_config=graph_config,
         safety_config=safety_config,
-        target_position=config.target_position,
+        target_position=target_position,
         horizon=config.horizon,
         gradient_decay=config.gradient_decay,
         rng=rollout_rng,
@@ -250,17 +368,50 @@ def compute_total_loss(
         "velocities": velocities,
     }
     efficiency_loss, eff_metrics = compute_efficiency_loss(
-        trajectory, config.target_position, DEFAULT_EFFICIENCY_CONFIG
+        trajectory, target_position, DEFAULT_EFFICIENCY_CONFIG
     )
+    velocity_dirs = target_position - positions
+    velocity_dirs_norm = jnp.linalg.norm(velocity_dirs, axis=1, keepdims=True) + 1e-6
+    velocity_dirs_unit = velocity_dirs / velocity_dirs_norm
+    velocity_projection = jnp.sum(velocities * velocity_dirs_unit, axis=1)
+    desired_speed = jnp.asarray(config.desired_speed, dtype=velocity_projection.dtype)
+    velocity_alignment_loss = jnp.mean(jnn.relu(desired_speed - velocity_projection))
+    projection_reward = jnp.mean(velocity_projection)
+    projection_deficit = velocity_alignment_loss
+    final_velocity = velocities[-1]
+    final_velocity_penalty = jnp.linalg.norm(final_velocity) ** 2
+    final_distance = jnp.linalg.norm(target_position - positions[-1])
+    distance_bonus = -jnn.relu(config.distance_bonus_threshold - final_distance)
+    trajectory_projection_penalty = projection_deficit
+    final_distance_penalty = final_distance**2
+    teacher_loss = jnp.array(0.0, dtype=jnp.float32)
+    if config.teacher_weight > 0.0 and (config.teacher_gain_p > 0.0 or config.teacher_gain_d > 0.0):
+        teacher_actions = (
+            config.teacher_gain_p * (target_position - positions)
+            - config.teacher_gain_d * velocities
+        )
+        teacher_actions = jnp.clip(
+            teacher_actions,
+            -physics_params.max_acceleration,
+            physics_params.max_acceleration,
+        )
+        teacher_loss = jnp.mean((rollout.u_nominal - teacher_actions) ** 2)
     safety_penalty = jnp.mean(jnp.nan_to_num(rollout.soft_violation))
     violation_penalty = jnp.mean(jnp.nan_to_num(rollout.constraint_violation))
     relaxation_cost = jnp.mean(jnp.nan_to_num(rollout.relaxation))
     relaxation_rate = jnp.mean(jnp.nan_to_num(rollout.relaxation_active))
+    # 安全求解器可能退回到备用控制，因此单独统计失败频次，后续可以在日志中对齐定位。
+    qp_fail_rate = jnp.mean(jnp.nan_to_num(rollout.qp_failed))
+    qp_nan_rate = jnp.mean(jnp.nan_to_num(rollout.qp_nan_detected))
+    relaxation_exceeded_rate = jnp.mean(jnp.nan_to_num(rollout.relaxation_limit_exceeded))
+    qp_iteration_mean = jnp.mean(jnp.nan_to_num(rollout.qp_iterations))
+    qp_iteration_max = jnp.max(jnp.nan_to_num(rollout.qp_iterations))
+    qp_status_latest = jnp.nan_to_num(rollout.qp_status[-1])
     cbf_mean = jnp.mean(cbf_values)
     cbf_min = jnp.min(cbf_values)
     distill_loss = jnp.array(0.0, dtype=jnp.float32)
     if baseline_policy_params is not None and config.policy_distill_weight > 0.0:
-        target_offsets = config.target_position - positions
+        target_offsets = target_position - positions
         observations = jnp.concatenate(
             [positions, velocities, target_offsets, cbf_values[:, None]], axis=1
         )
@@ -282,6 +433,13 @@ def compute_total_loss(
         + (config.relaxation_weight * relaxation_weight_scale) * relaxation_cost
         + (config.relaxation_usage_weight * relaxation_weight_scale) * relaxation_rate
         + config.policy_distill_weight * distill_loss
+        + config.velocity_alignment_weight * velocity_alignment_loss
+        + config.teacher_weight * teacher_loss
+        + config.final_velocity_weight * final_velocity_penalty
+        + config.distance_bonus_weight * distance_bonus
+        - config.trajectory_projection_weight * projection_reward
+        + config.distance_tracking_weight * trajectory_projection_penalty
+        + config.final_distance_weight * final_distance_penalty
     )
 
     cbf_safe_loss = jnp.array(0.0, dtype=jnp.float32)
@@ -351,6 +509,7 @@ def compute_total_loss(
         cbf_analytic_mean = jnp.mean(analytic_values)
         cbf_analytic_min = jnp.min(analytic_values)
 
+    target_xy = jnp.linalg.norm(target_position[:2])
     metrics = {
         "loss/total": total_loss,
         "loss/efficiency": efficiency_loss,
@@ -359,17 +518,31 @@ def compute_total_loss(
         "loss/distill": distill_loss,
         "safety/relaxation_mean": relaxation_cost,
         "safety/relaxation_rate": relaxation_rate,
+        "safety/qp_fail_rate": qp_fail_rate,
+        "safety/qp_nan_rate": qp_nan_rate,
+        "safety/relaxation_exceeded_rate": relaxation_exceeded_rate,
+        "safety/qp_iterations_mean": qp_iteration_mean,
+        "safety/qp_iterations_max": qp_iteration_max,
+        "safety/qp_status_last": qp_status_latest,
         "safety/cbf_mean": cbf_mean,
         "safety/cbf_min": cbf_min,
         "loss/cbf_safe": cbf_safe_loss,
         "loss/cbf_unsafe": cbf_unsafe_loss,
         "loss/cbf_hdot": cbf_hdot_loss,
         "loss/cbf_value": cbf_value_loss,
+        "loss/velocity_alignment": velocity_alignment_loss,
+        "loss/teacher": teacher_loss,
+        "loss/final_velocity": final_velocity_penalty,
+        "loss/distance_bonus": distance_bonus,
+        "loss/distance_tracking": trajectory_projection_penalty,
+        "loss/final_distance": final_distance_penalty,
+        "reward/projection": projection_reward,
         "cbf/safe_fraction": cbf_safe_fraction,
         "cbf/unsafe_fraction": cbf_unsafe_fraction,
         "cbf/analytic_mean": cbf_analytic_mean,
         "cbf/analytic_min": cbf_analytic_min,
         "curriculum/noise_scale": jnp.array(noise_scale, dtype=jnp.float32),
+        "curriculum/target_distance": jnp.array(target_xy, dtype=jnp.float32),
     }
     metrics.update({f"eff/{k}": v for k, v in eff_metrics.items()})
     metrics = {k: jnp.nan_to_num(v) for k, v in metrics.items()}
@@ -390,7 +563,7 @@ def make_train_step(
     baseline_policy_params: Dict | None,
 ):
 
-    @jax.jit
+    @functools.partial(jax.jit, static_argnames=("point_cloud_mode", "augment_flag"))
     def train_step(
         params: Dict[str, Dict],
         opt_state_policy: optax.OptState,
@@ -398,10 +571,13 @@ def make_train_step(
         rng: jax.Array,
         noise_scale: float,
         blend_alpha: float,
+        point_cloud_mode: str,
         augment_flag: bool,
+        target_position: jnp.ndarray,
         step_index: int,
         relaxation_scale: float,
         solver_scale: float,
+        teacher_blend: float = 0.0,
     ):
         def loss_fn(p):
             return compute_total_loss(
@@ -417,7 +593,9 @@ def make_train_step(
                 noise_scale,
                 baseline_policy_params,
                 blend_alpha,
+                point_cloud_mode,
                 augment_flag,
+                target_position,
                 relaxation_scale,
                 solver_scale,
             )
@@ -477,6 +655,22 @@ def make_train_step(
 # ---------------------------------------------------------------------------
 # 主训练流程
 # ---------------------------------------------------------------------------
+
+
+CONFIG_REGISTRY = {
+    "default": default_config.get_config,
+    "stage1": stage1_analytic.get_config,
+    "stage1_analytic": stage1_analytic.get_config,
+    "stage1_efficiency": stage1_efficiency.get_config,
+}
+
+
+def load_base_config(name: str):
+    """根据用户指定的配置名称返回基础配置，确保 macOS 与 Windows 都能走相同流程。"""
+    key = name.lower()
+    if key not in CONFIG_REGISTRY:
+        raise ValueError(f"未识别的配置名称: {name}")
+    return CONFIG_REGISTRY[key]()
 
 
 def parse_args() -> argparse.Namespace:
@@ -715,11 +909,156 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="逗号分隔的 0/1 标记，控制各阶段是否启用点云增强",
     )
+    parser.add_argument(
+        "--point-cloud-modes",
+        type=str,
+        default=None,
+        help="逗号分隔的点云模式（ring/cylinder/box/noise/mixed），与阶段对应",
+    )
+    parser.add_argument(
+        "--hard-nan-rate",
+        type=float,
+        default=None,
+        help="安全诊断硬阈值：允许的 qp NaN 率上限（<0 表示禁用）",
+    )
+    parser.add_argument(
+        "--hard-relax-rate",
+        type=float,
+        default=None,
+        help="安全诊断硬阈值：允许的松弛超限率上限（<0 表示禁用）",
+    )
+    parser.add_argument(
+        "--hard-qp-fail-rate",
+        type=float,
+        default=None,
+        help="安全诊断硬阈值：允许的 QP 失败率上限（<0 表示禁用）",
+    )
+    parser.add_argument(
+        "--hard-warmup-episodes",
+        type=int,
+        default=None,
+        help="硬阈值启用前的热身 episode 数（0 表示立即启用）",
+    )
+    parser.add_argument(
+        "--hard-nan-schedule",
+        type=str,
+        default=None,
+        help="逗号分隔的 NaN 率阈值 schedule，与阶段对应",
+    )
+    parser.add_argument(
+        "--hard-relax-schedule",
+        type=str,
+        default=None,
+        help="逗号分隔的松弛超限阈值 schedule，与阶段对应",
+    )
+    parser.add_argument(
+        "--hard-qp-fail-schedule",
+        type=str,
+        default=None,
+        help="逗号分隔的 QP 失败率阈值 schedule，与阶段对应",
+    )
+    parser.add_argument(
+        "--relax-scale-schedule",
+        type=str,
+        default=None,
+        help="逗号分隔的初始松弛惩罚缩放 schedule",
+    )
+    parser.add_argument(
+        "--solver-scale-schedule",
+        type=str,
+        default=None,
+        help="逗号分隔的初始求解器惩罚缩放 schedule",
+    )
+    parser.add_argument(
+        "--target-distance-schedule",
+        type=str,
+        default=None,
+        help="逗号分隔的目标距离课程（米），与阶段对应",
+    )
+    parser.add_argument(
+        "--teacher-gain-p",
+        type=float,
+        default=None,
+        help="教师控制比例增益，如果>0 则启用教师蒸馏",
+    )
+    parser.add_argument(
+        "--teacher-gain-d",
+        type=float,
+        default=None,
+        help="教师控制速度增益",
+    )
+    parser.add_argument(
+        "--teacher-weight",
+        type=float,
+        default=None,
+        help="教师蒸馏损失权重",
+    )
+    parser.add_argument(
+        "--velocity-alignment-weight",
+        type=float,
+        default=None,
+        help="速度对齐损失权重",
+    )
+    parser.add_argument(
+        "--desired-speed",
+        type=float,
+        default=None,
+        help="速度对齐的期望速度",
+    )
+    parser.add_argument(
+        "--final-velocity-weight",
+        type=float,
+        default=None,
+        help="末端速度惩罚权重",
+    )
+    parser.add_argument(
+        "--final-distance-weight",
+        type=float,
+        default=None,
+        help="终点距离平方惩罚权重",
+    )
+    parser.add_argument(
+        "--distance-bonus-weight",
+        type=float,
+        default=None,
+        help="终点距离奖励的权重",
+    )
+    parser.add_argument(
+        "--distance-bonus-threshold",
+        type=float,
+        default=None,
+        help="终点距离奖励的阈值（米）",
+    )
+    parser.add_argument(
+        "--trajectory-projection-weight",
+        type=float,
+        default=None,
+        help="轨迹沿目标方向积分奖励权重",
+    )
+    parser.add_argument(
+        "--distance-tracking-weight",
+        type=float,
+        default=None,
+        help="轨迹距离平方损失权重",
+    )
+    parser.add_argument(
+        "--teacher-force-schedule",
+        type=str,
+        default=None,
+        help="逗号分隔的教师混合系数 schedule (0-1)",
+    )
+    parser.add_argument(
+        "--config-name",
+        type=str,
+        default="default",
+        help="基础配置名称，例如 default 或 stage1_analytic，用于不同阶段之间对齐参数",
+    )
     return parser.parse_args()
 
 
-def build_config(args: argparse.Namespace) -> TrainingConfig:
-    cfg = default_config.get_config()
+def build_config(args: argparse.Namespace, base_cfg) -> TrainingConfig:
+    """结合基础配置与命令行参数，生成训练阶段使用的结构化配置。"""
+    cfg = base_cfg
 
     horizon = args.horizon if args.horizon is not None else int(cfg.physics.max_steps)
     policy_lr = args.policy_lr if args.policy_lr is not None else float(cfg.training.learning_rate_policy)
@@ -753,6 +1092,12 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
             raise ValueError(f"noise_levels 格式不合法: {raw}") from exc
         if not values:
             raise ValueError("noise_levels 至少需要包含一个浮点数")
+        return values
+
+    def parse_str_tuple(raw: str) -> Tuple[str, ...]:
+        values = tuple(s.strip() for s in raw.split(",") if s.strip())
+        if not values:
+            raise ValueError("point_cloud_modes 至少需要包含一个模式名称")
         return values
 
     curriculum_enabled = bool(cfg.training.curriculum.enable) and not args.disable_curriculum
@@ -817,9 +1162,11 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         args.cbf_blend_alpha if args.cbf_blend_alpha is not None else 1.0
     )
     augment_point_cloud = not args.disable_pointcloud_augment
+    base_success_threshold = float(getattr(cfg.evaluation, "success_threshold", 0.95))
     success_threshold = (
-        args.success_threshold if args.success_threshold is not None else 0.95
+        args.success_threshold if args.success_threshold is not None else base_success_threshold
     )
+    success_tolerance = float(getattr(cfg.env, "goal_tolerance", 0.1))
     policy_distill_weight = (
         args.distill_weight if args.distill_weight is not None else 0.0
     )
@@ -901,6 +1248,122 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         else:
             success_eval_random_pc_schedule = None
 
+    if args.point_cloud_modes:
+        point_cloud_modes = parse_str_tuple(args.point_cloud_modes)
+    else:
+        point_cloud_modes = tuple(getattr(cfg.training, "point_cloud_modes", ("ring",)))
+    if len(point_cloud_modes) < stage_count and stage_count > 0:
+        point_cloud_modes = point_cloud_modes + (point_cloud_modes[-1],) * (stage_count - len(point_cloud_modes))
+
+    hard_nan_rate = (
+        args.hard_nan_rate
+        if args.hard_nan_rate is not None
+        else float(getattr(cfg.training, "hard_nan_rate", 0.05))
+    )
+    hard_relax_rate = (
+        args.hard_relax_rate
+        if args.hard_relax_rate is not None
+        else float(getattr(cfg.training, "hard_relaxation_exceed_rate", 0.5))
+    )
+    hard_qp_fail_rate = (
+        args.hard_qp_fail_rate
+        if args.hard_qp_fail_rate is not None
+        else float(getattr(cfg.training, "hard_qp_fail_rate", 0.3))
+    )
+    hard_warmup = (
+        args.hard_warmup_episodes
+        if args.hard_warmup_episodes is not None
+        else int(getattr(cfg.training, "hard_abort_warmup_episodes", 40))
+    )
+
+    if args.hard_nan_schedule:
+        hard_nan_schedule = parse_float_tuple(args.hard_nan_schedule)
+    else:
+        hard_nan_schedule = tuple(getattr(cfg.training, "hard_nan_schedule", ()))
+    if args.hard_relax_schedule:
+        hard_relax_schedule = parse_float_tuple(args.hard_relax_schedule)
+    else:
+        hard_relax_schedule = tuple(getattr(cfg.training, "hard_relax_schedule", ()))
+    if args.hard_qp_fail_schedule:
+        hard_qp_schedule = parse_float_tuple(args.hard_qp_fail_schedule)
+    else:
+        hard_qp_schedule = tuple(getattr(cfg.training, "hard_qp_fail_schedule", ()))
+
+    if args.relax_scale_schedule:
+        relax_scale_schedule = parse_float_tuple(args.relax_scale_schedule)
+    else:
+        relax_scale_schedule = tuple(getattr(cfg.training, "relaxation_scale_schedule", ()))
+
+    if args.solver_scale_schedule:
+        solver_scale_schedule = parse_float_tuple(args.solver_scale_schedule)
+    else:
+        solver_scale_schedule = tuple(getattr(cfg.training, "solver_scale_schedule", ()))
+    if args.target_distance_schedule:
+        target_distance_schedule = parse_float_tuple(args.target_distance_schedule)
+    else:
+        target_distance_schedule = tuple(getattr(cfg.training, "target_distance_schedule", ()))
+    teacher_gain_p = (
+        args.teacher_gain_p if args.teacher_gain_p is not None else float(getattr(cfg.training, "teacher_gain_p", 0.0))
+    )
+    teacher_gain_d = (
+        args.teacher_gain_d if args.teacher_gain_d is not None else float(getattr(cfg.training, "teacher_gain_d", 0.0))
+    )
+    teacher_weight = (
+        args.teacher_weight if args.teacher_weight is not None else float(getattr(cfg.training, "teacher_weight", 0.0))
+    )
+    velocity_alignment_weight = (
+        args.velocity_alignment_weight if args.velocity_alignment_weight is not None else float(getattr(cfg.training, "velocity_alignment_weight", 0.0))
+    )
+    desired_speed = (
+        args.desired_speed if args.desired_speed is not None else float(getattr(cfg.training, "desired_speed", 1.0))
+    )
+    final_velocity_weight = (
+        args.final_velocity_weight if args.final_velocity_weight is not None else float(getattr(cfg.training, "final_velocity_weight", 0.0))
+    )
+    final_distance_weight = (
+        args.final_distance_weight if args.final_distance_weight is not None else float(getattr(cfg.training, "final_distance_weight", 0.0))
+    )
+    distance_bonus_weight = (
+        args.distance_bonus_weight if args.distance_bonus_weight is not None else float(getattr(cfg.training, "distance_bonus_weight", 0.0))
+    )
+    distance_bonus_threshold = (
+        args.distance_bonus_threshold if args.distance_bonus_threshold is not None else float(getattr(cfg.training, "distance_bonus_threshold", 0.0))
+    )
+    initial_xy_range = float(getattr(cfg.training, "initial_xy_range", 0.5))
+    initial_z_range = tuple(getattr(cfg.training, "initial_z_range", (0.8, 1.2)))
+    trajectory_projection_weight = (
+        args.trajectory_projection_weight if args.trajectory_projection_weight is not None else float(getattr(cfg.training, "trajectory_projection_weight", 0.0))
+    )
+    distance_tracking_weight = (
+        args.distance_tracking_weight if args.distance_tracking_weight is not None else float(getattr(cfg.training, "distance_tracking_weight", 0.0))
+    )
+    if args.teacher_force_schedule:
+        teacher_force_schedule = parse_float_tuple(args.teacher_force_schedule)
+    else:
+        teacher_force_schedule = tuple(getattr(cfg.training, "teacher_force_schedule", ()))
+
+    def _normalize_schedule(schedule: Tuple[float, ...]) -> Tuple[float, ...] | None:
+        if stage_count > 0 and schedule:
+            if len(schedule) < stage_count:
+                schedule = schedule + (schedule[-1],) * (stage_count - len(schedule))
+            return schedule
+        return None
+
+    def _normalize_schedule_float(schedule: Tuple[float, ...]) -> Tuple[float, ...] | None:
+        if stage_count > 0 and schedule:
+            if len(schedule) < stage_count:
+                schedule = schedule + (schedule[-1],) * (stage_count - len(schedule))
+            return schedule
+        return None
+
+    hard_nan_schedule = _normalize_schedule_float(hard_nan_schedule)
+    hard_relax_schedule = _normalize_schedule_float(hard_relax_schedule)
+    hard_qp_schedule = _normalize_schedule_float(hard_qp_schedule)
+    relax_scale_schedule = _normalize_schedule_float(relax_scale_schedule)
+    solver_scale_schedule = _normalize_schedule_float(solver_scale_schedule)
+    teacher_force_schedule = _normalize_schedule_float(teacher_force_schedule)
+    target_distance_schedule = _normalize_schedule_float(target_distance_schedule)
+
     config = TrainingConfig(
         horizon=horizon,
         policy_lr=policy_lr,
@@ -929,6 +1392,7 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         cbf_blend_alpha=cbf_blend_alpha,
         augment_point_cloud=augment_point_cloud,
         success_threshold=success_threshold,
+        success_tolerance=success_tolerance,
         policy_distill_weight=policy_distill_weight,
         cbf_blend_levels=blend_levels,
         augment_levels=augment_levels,
@@ -948,6 +1412,31 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
         blend_backoff=blend_backoff,
         blend_min=blend_min,
         relaxation_alert=relax_alert,
+        hard_nan_rate=hard_nan_rate,
+        hard_relaxation_exceed_rate=hard_relax_rate,
+        hard_qp_fail_rate=hard_qp_fail_rate,
+        point_cloud_modes=point_cloud_modes,
+        hard_abort_warmup_episodes=hard_warmup,
+        hard_nan_schedule=hard_nan_schedule,
+        hard_relax_schedule=hard_relax_schedule,
+        hard_qp_fail_schedule=hard_qp_schedule,
+        relaxation_scale_schedule=relax_scale_schedule,
+        solver_scale_schedule=solver_scale_schedule,
+        target_distance_schedule=target_distance_schedule,
+        teacher_gain_p=teacher_gain_p,
+        teacher_gain_d=teacher_gain_d,
+        teacher_weight=teacher_weight,
+        velocity_alignment_weight=velocity_alignment_weight,
+        desired_speed=desired_speed,
+        final_velocity_weight=final_velocity_weight,
+        distance_bonus_weight=distance_bonus_weight,
+        distance_bonus_threshold=distance_bonus_threshold,
+        initial_xy_range=initial_xy_range,
+        initial_z_range=initial_z_range,
+        trajectory_projection_weight=trajectory_projection_weight,
+        distance_tracking_weight=distance_tracking_weight,
+        teacher_force_schedule=teacher_force_schedule,
+        final_distance_weight=final_distance_weight,
     )
 
     return config
@@ -955,13 +1444,14 @@ def build_config(args: argparse.Namespace) -> TrainingConfig:
 
 def main(
     config: TrainingConfig,
+    base_cfg,
     use_rnn: bool,
     output_dir: str | None = None,
     cbf_params_path: str | None = None,
     policy_params_path: str | None = None,
     distill_policy_path: str | None = None,
 ):
-    cfg = default_config.get_config()
+    cfg = base_cfg
 
     physics_params = PhysicsParams(
         dt=float(cfg.physics.dt),
@@ -1045,6 +1535,7 @@ def main(
             relaxation_penalty=float(cfg.safety.relaxation_penalty),
             max_relaxation=float(cfg.safety.max_relaxation),
             tolerance=float(cfg.safety.violation_tolerance),
+            relaxation_alert=float(getattr(cfg.safety, "relaxation_alert", config.relaxation_alert)),
         )
         params = {"policy": policy_params, "cbf": cbf_params}
     else:
@@ -1083,14 +1574,47 @@ def main(
     blend_overrides = list(config.cbf_blend_levels if config.cbf_blend_levels else (config.cbf_blend_alpha,))
     if len(blend_overrides) < stage_count_runtime:
         blend_overrides.extend([blend_overrides[-1]] * (stage_count_runtime - len(blend_overrides)))
-    relaxation_scales = [1.0] * stage_count_runtime
-    solver_scales = [1.0] * stage_count_runtime
+    if config.relaxation_scale_schedule is not None:
+        relaxation_scales = [float(config.relaxation_scale_schedule[min(i, len(config.relaxation_scale_schedule) - 1)]) for i in range(stage_count_runtime)]
+    else:
+        relaxation_scales = [1.0] * stage_count_runtime
+    if config.solver_scale_schedule is not None:
+        solver_scales = [float(config.solver_scale_schedule[min(i, len(config.solver_scale_schedule) - 1)]) for i in range(stage_count_runtime)]
+    else:
+        solver_scales = [1.0] * stage_count_runtime
+    point_cloud_modes_runtime = list(config.point_cloud_modes if config.point_cloud_modes else ("ring",))
+    if len(point_cloud_modes_runtime) < stage_count_runtime:
+        point_cloud_modes_runtime.extend([point_cloud_modes_runtime[-1]] * (stage_count_runtime - len(point_cloud_modes_runtime)))
+    point_mode_indices = {mode: idx for idx, mode in enumerate(sorted(set(point_cloud_modes_runtime)))}
+    base_target = jnp.asarray(config.target_position)
+    base_xy = base_target[:2]
+    base_xy_norm = jnp.linalg.norm(base_xy) + 1e-6
+    base_xy_dir = base_xy / base_xy_norm
+    base_z = float(base_target[2])
+    default_distance = float(base_xy_norm)
+    if config.target_distance_schedule is not None and len(config.target_distance_schedule) > 0:
+        target_distances_runtime = [float(config.target_distance_schedule[min(i, len(config.target_distance_schedule) - 1)]) for i in range(stage_count_runtime)]
+    else:
+        target_distances_runtime = [default_distance] * stage_count_runtime
+    final_target_distance = target_distances_runtime[-1]
+    if config.teacher_force_schedule is not None and len(config.teacher_force_schedule) > 0:
+        teacher_force_runtime = [float(config.teacher_force_schedule[min(i, len(config.teacher_force_schedule) - 1)]) for i in range(stage_count_runtime)]
+    else:
+        teacher_force_runtime = [0.0] * stage_count_runtime
+    final_teacher_force = teacher_force_runtime[-1]
 
     final_blend = config.cbf_blend_levels[-1] if config.cbf_blend_levels else config.cbf_blend_alpha
     final_augment = bool(config.augment_levels[-1]) if config.augment_levels else config.augment_point_cloud
+    final_point_mode = point_cloud_modes_runtime[-1]
 
-    @functools.partial(jax.jit, static_argnums=(2,))
-    def evaluate_success(params, rng_key, stage_idx: int):
+    @functools.partial(jax.jit, static_argnums=(2, 3))
+    def evaluate_success(
+        params,
+        rng_key,
+        stage_idx: int,
+        point_cloud_mode: str,
+        target_position: jnp.ndarray,
+    ):
         keys = jax.random.split(rng_key, config.success_eval_trials)
         if config.success_eval_schedule:
             idx = min(len(config.success_eval_schedule) - 1, stage_idx)
@@ -1109,12 +1633,19 @@ def main(
             eval_random_pc = config.success_eval_random_pc
 
         def rollout(key):
-            key_init, key_cloud = jax.random.split(key)
-            init_state = sample_initial_state(key_init)
-            point_cloud = base_point_cloud
+            key_init, key_cloud, key_rollout = jax.random.split(key, 3)
+            init_state = sample_initial_state(
+                key_init,
+                xy_range=config.initial_xy_range,
+                z_min=float(config.initial_z_range[0]),
+                z_max=float(config.initial_z_range[1]),
+            )
+            point_cloud, key_cloud = build_point_cloud_for_mode(
+                point_cloud_mode, base_point_cloud, graph_config, key_cloud
+            )
             if eval_random_pc or final_augment:
-                point_cloud = sample_augmented_point_cloud(
-                    base_point_cloud, graph_config, key_cloud
+                point_cloud, key_cloud = sample_augmented_point_cloud(
+                    point_cloud, graph_config, key_cloud
                 )
             _, outputs = execute_rollout(
                 params=params,
@@ -1125,16 +1656,17 @@ def main(
                 point_cloud=point_cloud,
                 graph_config=graph_config,
                 safety_config=safety_config,
-                target_position=config.target_position,
+                target_position=target_position,
                 horizon=config.horizon,
                 gradient_decay=config.gradient_decay,
-                rng=key,
+                rng=key_rollout,
                 noise_scale=eval_noise,
                 cbf_blend_alpha=eval_blend,
             )
             final_pos = outputs.position[-1]
-            dist = jnp.linalg.norm(final_pos - config.target_position)
-            success = dist < 0.1
+            dist = jnp.linalg.norm(final_pos - target_position)
+            # 这里使用可配置的距离阈值，便于在不同平台上同步评估标准。
+            success = dist < config.success_tolerance
             relax = jnp.mean(outputs.relaxation)
             violation = jnp.max(outputs.constraint_violation)
             return success.astype(jnp.float32), relax, violation
@@ -1147,8 +1679,15 @@ def main(
     bad_eval_count = 0
     robust_noise_levels = tuple(float(x) for x in config.robust_eval_noise_levels)
 
-    @functools.partial(jax.jit, static_argnums=(2,))
-    def evaluate_robustness(params, rng_key, noise_levels: Tuple[float, ...], blend_alpha: float):
+    @functools.partial(jax.jit, static_argnums=(2, 4))
+    def evaluate_robustness(
+        params,
+        rng_key,
+        noise_levels: Tuple[float, ...],
+        blend_alpha: float,
+        point_cloud_mode: str,
+        target_position: jnp.ndarray,
+    ):
         noise_array = jnp.array(noise_levels, dtype=jnp.float32)
         keys = jax.random.split(rng_key, noise_array.shape[0])
 
@@ -1156,12 +1695,19 @@ def main(
             rollout_keys = jax.random.split(key, config.robust_eval_trials)
 
             def rollout_eval(inner_key):
-                key_init, key_cloud = jax.random.split(inner_key)
-                init_state = sample_initial_state(key_init)
-                point_cloud = base_point_cloud
+                key_init, key_cloud, key_rollout = jax.random.split(inner_key, 3)
+                init_state = sample_initial_state(
+                    key_init,
+                    xy_range=config.initial_xy_range,
+                    z_min=float(config.initial_z_range[0]),
+                    z_max=float(config.initial_z_range[1]),
+                )
+                point_cloud, key_cloud = build_point_cloud_for_mode(
+                    point_cloud_mode, base_point_cloud, graph_config, key_cloud
+                )
                 if config.robust_eval_random_pc or final_augment:
-                    point_cloud = sample_augmented_point_cloud(
-                        base_point_cloud, graph_config, key_cloud
+                    point_cloud, key_cloud = sample_augmented_point_cloud(
+                        point_cloud, graph_config, key_cloud
                     )
                 _, outputs = execute_rollout(
                     params=params,
@@ -1172,14 +1718,14 @@ def main(
                     point_cloud=point_cloud,
                     graph_config=graph_config,
                     safety_config=safety_config,
-                    target_position=config.target_position,
+                    target_position=target_position,
                     horizon=config.horizon,
                     gradient_decay=config.gradient_decay,
-                    rng=inner_key,
-                    noise_scale=noise,
+                    rng=key_rollout,
+                    noise_scale=jnp.asarray(noise, dtype=jnp.float32),
                     cbf_blend_alpha=blend_alpha,
                 )
-                success = jnp.linalg.norm(outputs.position[-1] - config.target_position) < 0.1
+                success = jnp.linalg.norm(outputs.position[-1] - target_position) < config.success_tolerance
                 relax = jnp.mean(outputs.relaxation)
                 violation = jnp.max(outputs.constraint_violation)
                 cbf_min = jnp.min(outputs.cbf_value)
@@ -1195,10 +1741,10 @@ def main(
 
         return jax.vmap(single)(noise_array, keys)
 
-    def stage_values(step: int) -> Tuple[float, float, bool, int]:
+    def stage_values(step: int) -> Tuple[float, float, bool, int, str, float, float]:
         if not config.curriculum_enabled or len(config.stage_steps) == 0:
             noise = config.noise_levels[-1] if len(config.noise_levels) else 0.0
-            return noise, config.cbf_blend_alpha, config.augment_point_cloud, 0
+            return noise, config.cbf_blend_alpha, config.augment_point_cloud, 0, point_cloud_modes_runtime[0], target_distances_runtime[0], teacher_force_runtime[0]
         cumulative = 0
         for idx, span in enumerate(config.stage_steps):
             cumulative += span
@@ -1206,11 +1752,17 @@ def main(
                 noise_idx = min(idx, len(config.noise_levels) - 1)
                 blend_idx = min(idx, len(blend_overrides) - 1)
                 augment_idx = min(idx, len(config.augment_levels) - 1)
+                mode_idx = min(idx, len(point_cloud_modes_runtime) - 1)
+                target_idx = min(idx, len(target_distances_runtime) - 1)
+                teacher_idx = min(idx, len(teacher_force_runtime) - 1)
                 return (
                     config.noise_levels[noise_idx],
                     blend_overrides[blend_idx],
                     bool(config.augment_levels[augment_idx]),
                     idx,
+                    point_cloud_modes_runtime[mode_idx],
+                    target_distances_runtime[target_idx],
+                    teacher_force_runtime[teacher_idx],
                 )
         last_idx = len(config.stage_steps) - 1
         return (
@@ -1218,17 +1770,22 @@ def main(
             blend_overrides[-1],
             bool(config.augment_levels[-1]),
             last_idx,
+            point_cloud_modes_runtime[-1],
+            target_distances_runtime[-1],
+            teacher_force_runtime[-1],
         )
 
     rng = jax.random.PRNGKey(config.seed + 2)
     history = []
     for step in range(config.episodes):
         rng, step_key = jax.random.split(rng)
-        noise_scale, current_blend, current_augment, current_stage_idx = stage_values(step)
+        noise_scale, current_blend, current_augment, current_stage_idx, current_point_mode, current_target_distance, current_teacher_force = stage_values(step)
         current_stage_idx = int(current_stage_idx)
         current_stage_idx = max(0, min(current_stage_idx, stage_count_runtime - 1))
         current_relax_scale = relaxation_scales[current_stage_idx]
         current_solver_scale = solver_scales[current_stage_idx]
+        current_target_xy = base_xy_dir * current_target_distance
+        current_target = jnp.array([current_target_xy[0], current_target_xy[1], base_z], dtype=jnp.float32)
         if config.violation_threshold_schedule:
             idx_v = min(len(config.violation_threshold_schedule) - 1, current_stage_idx)
             stage_violation_threshold = config.violation_threshold_schedule[idx_v]
@@ -1242,14 +1799,18 @@ def main(
             step_key,
             noise_scale,
             current_blend,
-            current_augment,
-            step,
-            current_relax_scale,
-            current_solver_scale,
+            point_cloud_mode=current_point_mode,
+            augment_flag=current_augment,
+            target_position=current_target,
+            step_index=step,
+            relaxation_scale=current_relax_scale,
+            solver_scale=current_solver_scale,
+            teacher_blend=current_teacher_force,
         )
 
         metrics["curriculum/blend_alpha"] = current_blend
         metrics["curriculum/augment"] = float(current_augment)
+        metrics["curriculum/point_mode_id"] = jnp.array(point_mode_indices.get(current_point_mode, 0), dtype=jnp.float32)
         metrics["adaptive/relax_scale"] = jnp.array(current_relax_scale, dtype=jnp.float32)
         metrics["adaptive/solver_scale"] = jnp.array(current_solver_scale, dtype=jnp.float32)
         metrics["adaptive/blend_alpha_effective"] = jnp.array(current_blend, dtype=jnp.float32)
@@ -1259,6 +1820,7 @@ def main(
         metrics["adaptive/relax_scale_next"] = jnp.array(current_relax_scale, dtype=jnp.float32)
         metrics["adaptive/solver_scale_next"] = jnp.array(current_solver_scale, dtype=jnp.float32)
         metrics["adaptive/blend_alpha_next"] = jnp.array(blend_overrides[current_stage_idx], dtype=jnp.float32)
+        metrics["adaptive/hard_abort"] = jnp.array(0.0, dtype=jnp.float32)
         metrics["eval/violation_threshold"] = jnp.array(stage_violation_threshold, dtype=jnp.float32)
         metrics["eval/violation_exceeded"] = 0.0
         metrics["eval/rollback"] = 0.0
@@ -1276,17 +1838,43 @@ def main(
         if (step + 1) % config.success_eval_frequency == 0:
             rng, eval_key = jax.random.split(rng)
             eval_success, eval_relax, eval_violation = map(
-                float, evaluate_success(params, eval_key, current_stage_idx)
+                float,
+                evaluate_success(
+                    params,
+                    eval_key,
+                    current_stage_idx,
+                    current_point_mode,
+                    current_target,
+                ),
             )
             metrics["eval/success_rate"] = eval_success
             metrics["eval/relax_mean"] = eval_relax
             metrics["eval/max_violation"] = eval_violation
+            # 这里额外打印一次评估结果，方便在 macOS、Windows 或 Kaggle 上快速对比训练状态。
+            print(
+                f"[eval] step={step + 1} stage={current_stage_idx} "
+                f"success={eval_success:.3f} max_violation={eval_violation:.3f} "
+                f"relax_mean={eval_relax:.3e}"
+            )
             violation_exceeded = eval_violation > stage_violation_threshold
             if violation_exceeded:
                 eval_success = 0.0
                 metrics["eval/violation_exceeded"] = 1.0
+                # 当约束违约超标时立刻提醒，便于我们针对性调整课程或参数。
+                print(
+                    f"[warn] 约束跨越阈值，当前阈值={stage_violation_threshold:.2f} "
+                    f"实际最大违约={eval_violation:.3f}"
+                )
             else:
                 metrics["eval/violation_exceeded"] = 0.0
+            if eval_relax > config.relaxation_alert:
+                eval_success = 0.0
+                metrics["eval/relaxation_alert"] = 1.0
+                print(
+                    f"[warn] 松弛均值超出阈值 {config.relaxation_alert:.3f}, 当前 {eval_relax:.3f}"
+                )
+            else:
+                metrics["eval/relaxation_alert"] = 0.0
             adaptive_triggered = adaptive_triggered or violation_exceeded
             if eval_success >= config.success_threshold:
                 best_params = jax.tree_util.tree_map(lambda x: x, params)
@@ -1307,9 +1895,23 @@ def main(
             and (step + 1) % config.robust_eval_frequency == 0
         ):
             rng, robust_key = jax.random.split(rng)
-            blend_results = evaluate_robustness(params, robust_key, robust_noise_levels, current_blend)
+            blend_results = evaluate_robustness(
+                params,
+                robust_key,
+                robust_noise_levels,
+                current_blend,
+                current_point_mode,
+                current_target,
+            )
             rng, robust_key_neural = jax.random.split(rng)
-            neural_results = evaluate_robustness(params, robust_key_neural, robust_noise_levels, 1.0)
+            neural_results = evaluate_robustness(
+                params,
+                robust_key_neural,
+                robust_noise_levels,
+                1.0,
+                current_point_mode,
+                current_target,
+            )
             blend_results = jnp.asarray(blend_results)
             neural_results = jnp.asarray(neural_results)
 
@@ -1355,12 +1957,75 @@ def main(
 
         metrics["adaptive/robust_violation_peak"] = jnp.array(robust_peak_violation, dtype=jnp.float32)
 
+        hard_abort = False
+        nan_rate = 0.0
+        relax_exceed_rate = 0.0
+        qp_fail_rate = float(metrics.get("safety/qp_fail_rate", 0.0))
+        base_nan_threshold = (
+            config.hard_nan_schedule[current_stage_idx]
+            if (config.hard_nan_schedule is not None and len(config.hard_nan_schedule) > current_stage_idx)
+            else config.hard_nan_rate
+        )
+        base_relax_threshold = (
+            config.hard_relax_schedule[current_stage_idx]
+            if (config.hard_relax_schedule is not None and len(config.hard_relax_schedule) > current_stage_idx)
+            else config.hard_relaxation_exceed_rate
+        )
+        base_qp_threshold = (
+            config.hard_qp_fail_schedule[current_stage_idx]
+            if (config.hard_qp_fail_schedule is not None and len(config.hard_qp_fail_schedule) > current_stage_idx)
+            else config.hard_qp_fail_rate
+        )
+        warmup_active = (
+            config.hard_abort_warmup_episodes > 0
+            and step < config.hard_abort_warmup_episodes
+        )
+
+        def _effective_threshold(base: float) -> float:
+            if base < 0.0:
+                return float("inf")
+            if warmup_active:
+                return 1.0
+            return base
+
+        nan_threshold = _effective_threshold(base_nan_threshold)
+        relax_threshold = _effective_threshold(base_relax_threshold)
+        qp_fail_threshold = _effective_threshold(base_qp_threshold)
+
+        if config.use_safety:
+            nan_rate = float(metrics.get("safety/qp_nan_rate", 0.0))
+            relax_exceed_rate = float(metrics.get("safety/relaxation_exceeded_rate", 0.0))
+            hard_abort = (
+                (nan_rate > nan_threshold)
+                or (relax_exceed_rate > relax_threshold)
+                or (qp_fail_rate > qp_fail_threshold)
+            )
+
+        metrics["adaptive/hard_threshold_nan"] = jnp.array(nan_threshold, dtype=jnp.float32)
+        metrics["adaptive/hard_threshold_relax"] = jnp.array(relax_threshold, dtype=jnp.float32)
+        metrics["adaptive/hard_threshold_qp_fail"] = jnp.array(qp_fail_threshold, dtype=jnp.float32)
+        metrics["adaptive/hard_threshold_base_nan"] = jnp.array(base_nan_threshold, dtype=jnp.float32)
+        metrics["adaptive/hard_threshold_base_relax"] = jnp.array(base_relax_threshold, dtype=jnp.float32)
+        metrics["adaptive/hard_threshold_base_qp_fail"] = jnp.array(base_qp_threshold, dtype=jnp.float32)
+        metrics["adaptive/hard_warmup"] = jnp.array(1.0 if warmup_active else 0.0, dtype=jnp.float32)
+
+        if hard_abort:
+            metrics["adaptive/hard_abort"] = jnp.array(1.0, dtype=jnp.float32)
+            print(
+                "[abort] 检测到安全诊断指标超限: "
+                f"nan_rate={nan_rate:.3f}, relax_exceed={relax_exceed_rate:.3f}, qp_fail={qp_fail_rate:.3f}. "
+                "回退至最佳参数并终止训练。"
+            )
+            params = jax.tree_util.tree_map(lambda x: x, best_params)
+
         history.append(
             {
                 k: float(v) if jnp.ndim(v) == 0 else [float(x) for x in jnp.atleast_1d(v)]
                 for k, v in metrics.items()
             }
         )
+        if hard_abort:
+            break
         if step % 10 == 0 or step == config.episodes - 1:
             print(
                 f"[{step:04d}] total={metrics['loss/total']:.4f} "
@@ -1393,9 +2058,11 @@ def main(
 
 if __name__ == "__main__":
     args = parse_args()
-    cfg = build_config(args)
+    base_cfg = load_base_config(args.config_name)
+    cfg = build_config(args, base_cfg)
     main(
         cfg,
+        base_cfg,
         use_rnn=args.use_rnn,
         output_dir=args.output_dir,
         cbf_params_path=args.cbf_params,

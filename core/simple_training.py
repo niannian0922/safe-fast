@@ -10,6 +10,7 @@
 """
 
 import jax
+import jax.nn as jnn
 import jax.numpy as jnp
 from dataclasses import dataclass
 from typing import Dict, Any, Tuple
@@ -29,6 +30,8 @@ class EfficiencyLossConfig:
     """
     # 目标到达损失权重 - 最重要的损失项
     goal_weight: float = 10.0
+    goal_hard_weight: float = 0.0
+    goal_hard_threshold: float = 0.0
     
     # Z轴特殊权重 - 针对无人机在垂直方向的控制难度
     # 该权重会乘以Z轴误差，让网络明白维持高度比水平移动更重要
@@ -108,7 +111,8 @@ def compute_goal_loss(positions: jnp.ndarray,
     final_penalty = config.final_goal_weight * final_anisotropic_distance
     
     # 总目标损失
-    total_goal_loss = config.goal_weight * (weighted_distance_loss + final_penalty)
+    hard_penalty = config.goal_hard_weight * jnn.relu(final_anisotropic_distance - config.goal_hard_threshold)
+    total_goal_loss = config.goal_weight * (weighted_distance_loss + final_penalty) + hard_penalty
     
     # 收集详细指标，包括XY和Z的分别统计
     metrics = {
@@ -359,11 +363,11 @@ def create_efficiency_loss_fn(target_position: jnp.ndarray,
 
 # 用于验证的默认配置（物理感知版本）
 DEFAULT_EFFICIENCY_CONFIG = EfficiencyLossConfig(
-    goal_weight=16.0,
-    z_axis_weight_multiplier=12.0,  # 强调Z轴控制的重要性
+    goal_weight=3.0,
+    z_axis_weight_multiplier=2.0,  # 垂直方向仍保留更高权重，但不过度放大
     control_weight=0.08,
     smoothness_weight=0.45,
-    final_goal_weight=80.0,
+    final_goal_weight=8.0,
     hover_weight=8.0,  # 鼓励悬停行为
     time_decay_factor=0.95
 )

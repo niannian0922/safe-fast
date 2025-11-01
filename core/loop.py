@@ -43,6 +43,11 @@ class RolloutStepOutput:
     relaxation: jnp.ndarray
     constraint_violation: jnp.ndarray
     relaxation_active: jnp.ndarray
+    qp_failed: jnp.ndarray  # 记录安全求解器是否退化到备用策略，方便训练时统计
+    qp_nan_detected: jnp.ndarray
+    relaxation_limit_exceeded: jnp.ndarray
+    qp_iterations: jnp.ndarray
+    qp_status: jnp.ndarray
 
 
 def rollout_episode(
@@ -123,6 +128,11 @@ def rollout_episode(
                 constraint_violation=jnp.array(0.0, dtype=jnp.float32),
                 relaxation=jnp.array(0.0, dtype=jnp.float32),
                 used_relaxation=jnp.array(0.0, dtype=jnp.float32),
+                qp_failed=jnp.array(0.0, dtype=jnp.float32),
+                nan_detected=jnp.array(0.0, dtype=jnp.float32),
+                relaxation_limit_exceeded=jnp.array(0.0, dtype=jnp.float32),
+                qp_iterations=jnp.array(0.0, dtype=jnp.float32),
+                qp_status=jnp.array(0.0, dtype=jnp.float32),
             )
 
         next_state = dynamics_step(state, u_safe, physics_params)
@@ -142,6 +152,11 @@ def rollout_episode(
             relaxation=safety_diag.relaxation,
             constraint_violation=safety_diag.constraint_violation,
             relaxation_active=safety_diag.used_relaxation,
+            qp_failed=safety_diag.qp_failed,
+            qp_nan_detected=safety_diag.nan_detected,
+            relaxation_limit_exceeded=safety_diag.relaxation_limit_exceeded,
+            qp_iterations=safety_diag.qp_iterations,
+            qp_status=safety_diag.qp_status,
         )
         new_carry = RolloutCarry(drone=next_state, policy=new_policy_state)
         return new_carry, outputs

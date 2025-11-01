@@ -114,6 +114,7 @@ def get_config():
     config.safety.relaxation_penalty = 150.0
     config.safety.max_relaxation = 3.0
     config.safety.violation_tolerance = 1e-5
+    config.safety.relaxation_alert = 0.5
     
     # 带性能优化的训练配置
     config.training = ml_collections.ConfigDict()
@@ -140,6 +141,10 @@ def get_config():
     config.training.loss_control_coef = 0.05  # 减少控制惩罚
     config.training.loss_collision_coef = 5.0  # 高碑撞规避
     config.training.loss_safety_coef = 2.5  # 增强安全重要性
+    config.training.hard_nan_rate = 0.05
+    config.training.hard_relaxation_exceed_rate = 0.5
+    config.training.hard_qp_fail_rate = 0.3
+    config.training.hard_abort_warmup_episodes = 80
     
     # 高级梯度处理
     config.training.gradient_clip_norm = 1.0
@@ -164,6 +169,7 @@ def get_config():
     config.training.curriculum.stage_noise_level = (0.0, 0.02, 0.05)
     config.training.curriculum.annealing_start = 1e-6  # 初始松弛惩罚
     config.training.curriculum.annealing_end = 1e6    # 最终松弛惩罚
+    config.training.point_cloud_modes = ["ring", "cylinder", "mixed"]
     
     # =============================================================================
     # 环境配置

@@ -52,7 +52,15 @@ def load_training_config(payload: dict) -> TrainingConfig:
         "policy_freeze_steps": data.get("policy_freeze_steps", base.policy_freeze_steps),
         "cbf_blend_alpha": data.get("cbf_blend_alpha", base.cbf_blend_alpha),
         "augment_point_cloud": data.get("augment_point_cloud", base.augment_point_cloud),
+        "success_threshold": data.get("success_threshold", base.success_threshold),
+        "success_tolerance": data.get("success_tolerance", base.success_tolerance),
     }
+    pcmodes = data.get("point_cloud_modes")
+    if pcmodes is not None:
+        kwargs["point_cloud_modes"] = tuple(pcmodes)
+    td_sched = data.get("target_distance_schedule")
+    if td_sched is not None:
+        kwargs["target_distance_schedule"] = tuple(td_sched)
     return TrainingConfig(**{**base.__dict__, **kwargs})
 
 
@@ -108,11 +116,23 @@ def evaluate(
     seed: int,
     noise: float,
     random_point_cloud: bool,
+    target_distance: float | None,
+    success_threshold: float | None,
 ) -> EvalResult:
     payload = pickle.load(artifact.open("rb"))
     params_policy = payload["params_policy"]
     params_cbf = payload.get("params_cbf", {})
     cfg = load_training_config(payload)
+    if target_distance is not None:
+        base_target = cfg.target_position
+        base_xy = base_target[:2]
+        base_norm = float(jnp.linalg.norm(base_xy))
+        if base_norm < 1e-6:
+            base_dir = jnp.array([1.0, 0.0])
+        else:
+            base_dir = base_xy / base_norm
+        new_xy = base_dir * target_distance
+        cfg = cfg.replace(target_position=jnp.array([new_xy[0], new_xy[1], base_target[2]], dtype=jnp.float32))
 
     (
         physics_params,
@@ -127,11 +147,16 @@ def evaluate(
     if params_cbf:
         params["cbf"] = params_cbf
 
+    if success_threshold is None:
+        success_radius = float(cfg.success_tolerance)
+    else:
+        success_radius = float(success_threshold)
+
     def single_rollout(key):
         key_init, key_cloud = jax.random.split(key)
         init_state = sample_initial_state(key_init)
         if random_point_cloud:
-            point_cloud = sample_augmented_point_cloud(base_point_cloud, graph_config, key_cloud)
+            point_cloud, key_cloud = sample_augmented_point_cloud(base_point_cloud, graph_config, key_cloud)
         else:
             point_cloud = base_point_cloud
         _, outputs = rollout_episode(
@@ -151,7 +176,7 @@ def evaluate(
         )
         final_pos = outputs.position[-1]
         dist = jnp.linalg.norm(final_pos - cfg.target_position)
-        success = (dist < 0.1).astype(jnp.float32)
+        success = (dist < success_radius).astype(jnp.float32)
         relax_mean = jnp.mean(outputs.relaxation)
         violation_max = jnp.max(outputs.constraint_violation)
         cbf_min = jnp.min(outputs.cbf_value)
@@ -178,9 +203,21 @@ def main():
     parser.add_argument("--seed", type=int, default=2025, help="随机种子")
     parser.add_argument("--noise", type=float, default=0.0, help="观测噪声的标准差")
     parser.add_argument(
+        "--success-threshold",
+        type=float,
+        default=None,
+        help="自定义成功判定距离阈值（米），默认使用训练配置中的 success_tolerance",
+    )
+    parser.add_argument(
         "--random-point-cloud",
         action="store_true",
         help="评估时是否使用扰动点云",
+    )
+    parser.add_argument(
+        "--target-distance",
+        type=float,
+        default=None,
+        help="覆盖默认目标距离（米），仅作用于 XY 平面",
     )
     parser.add_argument("--json", type=Path, default=None, help="可选的 JSON 输出路径")
     args = parser.parse_args()
@@ -191,6 +228,8 @@ def main():
         args.seed,
         args.noise,
         args.random_point_cloud,
+        args.target_distance,
+        args.success_threshold,
     )
 
     if args.json:

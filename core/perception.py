@@ -253,22 +253,23 @@ def _analytic_cbf_statistics(
     """
     points = point_cloud_world
     if points.shape[0] == 0:
-        # 没有障碍物时返回较大的正值
-        value = jnp.array(1.0, dtype=jnp.float32)
+        value = jnp.array(5.0, dtype=jnp.float32)
         grad = jnp.zeros(3, dtype=jnp.float32)
         hess = jnp.zeros((3, 3), dtype=jnp.float32)
         return value, grad, hess
 
-    def softmin_distance(position: jnp.ndarray) -> jnp.ndarray:
-        diffs = points - position[None, :]
-        dists = jnp.linalg.norm(diffs, axis=-1)
-        weights = jax.nn.softmax(-temperature * dists)
-        return jnp.sum(weights * dists)
+    diffs = state.position[None, :] - points
+    dists = jnp.linalg.norm(diffs, axis=-1)
+    weights = jax.nn.softmax(-temperature * dists)
 
-    value_fn = lambda pos: softmin_distance(pos) - safety_radius
-    h_value, grad = jax.value_and_grad(value_fn)(state.position)
-    hess = jax.jacfwd(jax.grad(value_fn))(state.position)
-    return h_value, grad, hess
+    smooth_dist = jnp.sum(weights * dists)
+    value = smooth_dist - safety_radius
+
+    grad_each = diffs / (dists[:, None] + 1e-6)
+    grad = jnp.sum(weights[:, None] * grad_each, axis=0)
+
+    hess = jnp.eye(3) * 2.0
+    return value, grad, hess
 
 
 def compute_cbf_statistics(
