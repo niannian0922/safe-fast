@@ -124,6 +124,7 @@ def rollout_episode(
             )
         else:
             u_safe = action
+            # 当未启用安全层时，构造一个占位的诊断对象，所有数值置零
             safety_diag = SafetyDiagnostics(
                 constraint_violation=jnp.array(0.0, dtype=jnp.float32),
                 relaxation=jnp.array(0.0, dtype=jnp.float32),
@@ -133,6 +134,8 @@ def rollout_episode(
                 relaxation_limit_exceeded=jnp.array(0.0, dtype=jnp.float32),
                 qp_iterations=jnp.array(0.0, dtype=jnp.float32),
                 qp_status=jnp.array(0.0, dtype=jnp.float32),
+                solver_mode=jnp.array(0.0, dtype=jnp.float32),
+                solver_status=jnp.array(0.0, dtype=jnp.float32),
             )
 
         next_state = dynamics_step(state, u_safe, physics_params)

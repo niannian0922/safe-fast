@@ -126,6 +126,11 @@ class TrainingConfig:
     relaxation_scale_schedule: Tuple[float, ...] | None = None
     solver_scale_schedule: Tuple[float, ...] | None = None
     target_distance_schedule: Tuple[float, ...] | None = None
+    # 新增两个课程设置，用于在效率阶段充分多样化目标：
+    # 1) 目标方位角的课程（单位为度，沿 XY 平面绕原点旋转基向量）
+    # 2) 目标高度的课程（单位为米，绝对 z 值），如果未提供则使用基准 z
+    target_angle_schedule: Tuple[float, ...] | None = None
+    target_z_schedule: Tuple[float, ...] | None = None
     teacher_gain_p: float = 0.0
     teacher_gain_d: float = 0.0
     teacher_weight: float = 0.0
@@ -976,6 +981,18 @@ def parse_args() -> argparse.Namespace:
         help="逗号分隔的目标距离课程（米），与阶段对应",
     )
     parser.add_argument(
+        "--target-angle-schedule",
+        type=str,
+        default=None,
+        help="逗号分隔的目标方位角课程（度），与阶段对应；未提供则默认 0",
+    )
+    parser.add_argument(
+        "--target-z-schedule",
+        type=str,
+        default=None,
+        help="逗号分隔的目标高度课程（米，绝对 z），与阶段对应；未提供则使用基准 z",
+    )
+    parser.add_argument(
         "--teacher-gain-p",
         type=float,
         default=None,
@@ -1302,6 +1319,17 @@ def build_config(args: argparse.Namespace, base_cfg) -> TrainingConfig:
         target_distance_schedule = parse_float_tuple(args.target_distance_schedule)
     else:
         target_distance_schedule = tuple(getattr(cfg.training, "target_distance_schedule", ()))
+
+    # 解析方位角与高度课程；不提供时留空，后续在运行期补全为默认值
+    if args.target_angle_schedule:
+        target_angle_schedule = parse_float_tuple(args.target_angle_schedule)
+    else:
+        target_angle_schedule = tuple(getattr(cfg.training, "target_angle_schedule", ()))
+
+    if args.target_z_schedule:
+        target_z_schedule = parse_float_tuple(args.target_z_schedule)
+    else:
+        target_z_schedule = tuple(getattr(cfg.training, "target_z_schedule", ()))
     teacher_gain_p = (
         args.teacher_gain_p if args.teacher_gain_p is not None else float(getattr(cfg.training, "teacher_gain_p", 0.0))
     )
@@ -1363,6 +1391,8 @@ def build_config(args: argparse.Namespace, base_cfg) -> TrainingConfig:
     solver_scale_schedule = _normalize_schedule_float(solver_scale_schedule)
     teacher_force_schedule = _normalize_schedule_float(teacher_force_schedule)
     target_distance_schedule = _normalize_schedule_float(target_distance_schedule)
+    target_angle_schedule = _normalize_schedule_float(target_angle_schedule)
+    target_z_schedule = _normalize_schedule_float(target_z_schedule)
 
     config = TrainingConfig(
         horizon=horizon,
@@ -1423,6 +1453,8 @@ def build_config(args: argparse.Namespace, base_cfg) -> TrainingConfig:
         relaxation_scale_schedule=relax_scale_schedule,
         solver_scale_schedule=solver_scale_schedule,
         target_distance_schedule=target_distance_schedule,
+        target_angle_schedule=target_angle_schedule,
+        target_z_schedule=target_z_schedule,
         teacher_gain_p=teacher_gain_p,
         teacher_gain_d=teacher_gain_d,
         teacher_weight=teacher_weight,
@@ -1597,6 +1629,17 @@ def main(
     else:
         target_distances_runtime = [default_distance] * stage_count_runtime
     final_target_distance = target_distances_runtime[-1]
+
+    # 生成方位角与高度课程的运行时数组；未提供时使用 0 度与基准 z
+    if config.target_angle_schedule is not None and len(config.target_angle_schedule) > 0:
+        target_angles_runtime = [float(config.target_angle_schedule[min(i, len(config.target_angle_schedule) - 1)]) for i in range(stage_count_runtime)]
+    else:
+        target_angles_runtime = [0.0] * stage_count_runtime
+
+    if config.target_z_schedule is not None and len(config.target_z_schedule) > 0:
+        target_z_runtime = [float(config.target_z_schedule[min(i, len(config.target_z_schedule) - 1)]) for i in range(stage_count_runtime)]
+    else:
+        target_z_runtime = [base_z] * stage_count_runtime
     if config.teacher_force_schedule is not None and len(config.teacher_force_schedule) > 0:
         teacher_force_runtime = [float(config.teacher_force_schedule[min(i, len(config.teacher_force_schedule) - 1)]) for i in range(stage_count_runtime)]
     else:
@@ -1741,10 +1784,11 @@ def main(
 
         return jax.vmap(single)(noise_array, keys)
 
-    def stage_values(step: int) -> Tuple[float, float, bool, int, str, float, float]:
+    # 返回当前步的课程值：噪声、混合、是否增强、阶段索引、点云模式、目标距离、教师强度、目标角度、目标高度
+    def stage_values(step: int) -> Tuple[float, float, bool, int, str, float, float, float, float]:
         if not config.curriculum_enabled or len(config.stage_steps) == 0:
             noise = config.noise_levels[-1] if len(config.noise_levels) else 0.0
-            return noise, config.cbf_blend_alpha, config.augment_point_cloud, 0, point_cloud_modes_runtime[0], target_distances_runtime[0], teacher_force_runtime[0]
+            return noise, config.cbf_blend_alpha, config.augment_point_cloud, 0, point_cloud_modes_runtime[0], target_distances_runtime[0], teacher_force_runtime[0], target_angles_runtime[0], target_z_runtime[0]
         cumulative = 0
         for idx, span in enumerate(config.stage_steps):
             cumulative += span
@@ -1755,6 +1799,8 @@ def main(
                 mode_idx = min(idx, len(point_cloud_modes_runtime) - 1)
                 target_idx = min(idx, len(target_distances_runtime) - 1)
                 teacher_idx = min(idx, len(teacher_force_runtime) - 1)
+                angle_idx = min(idx, len(target_angles_runtime) - 1)
+                z_idx = min(idx, len(target_z_runtime) - 1)
                 return (
                     config.noise_levels[noise_idx],
                     blend_overrides[blend_idx],
@@ -1763,6 +1809,8 @@ def main(
                     point_cloud_modes_runtime[mode_idx],
                     target_distances_runtime[target_idx],
                     teacher_force_runtime[teacher_idx],
+                    target_angles_runtime[angle_idx],
+                    target_z_runtime[z_idx],
                 )
         last_idx = len(config.stage_steps) - 1
         return (
@@ -1773,19 +1821,27 @@ def main(
             point_cloud_modes_runtime[-1],
             target_distances_runtime[-1],
             teacher_force_runtime[-1],
+            target_angles_runtime[-1],
+            target_z_runtime[-1],
         )
 
     rng = jax.random.PRNGKey(config.seed + 2)
     history = []
     for step in range(config.episodes):
         rng, step_key = jax.random.split(rng)
-        noise_scale, current_blend, current_augment, current_stage_idx, current_point_mode, current_target_distance, current_teacher_force = stage_values(step)
+        noise_scale, current_blend, current_augment, current_stage_idx, current_point_mode, current_target_distance, current_teacher_force, current_target_angle_deg, current_target_z = stage_values(step)
         current_stage_idx = int(current_stage_idx)
         current_stage_idx = max(0, min(current_stage_idx, stage_count_runtime - 1))
         current_relax_scale = relaxation_scales[current_stage_idx]
         current_solver_scale = solver_scales[current_stage_idx]
-        current_target_xy = base_xy_dir * current_target_distance
-        current_target = jnp.array([current_target_xy[0], current_target_xy[1], base_z], dtype=jnp.float32)
+        # 根据课程旋转目标方位角，并设置目标高度。角度以度为单位，沿 XY 平面旋转。
+        rad = jnp.deg2rad(jnp.asarray(current_target_angle_deg, dtype=jnp.float32))
+        cos_a = jnp.cos(rad)
+        sin_a = jnp.sin(rad)
+        rot = jnp.array([[cos_a, -sin_a], [sin_a, cos_a]], dtype=jnp.float32)
+        rotated_xy_dir = rot @ base_xy_dir
+        current_target_xy = rotated_xy_dir * current_target_distance
+        current_target = jnp.array([current_target_xy[0], current_target_xy[1], current_target_z], dtype=jnp.float32)
         if config.violation_threshold_schedule:
             idx_v = min(len(config.violation_threshold_schedule) - 1, current_stage_idx)
             stage_violation_threshold = config.violation_threshold_schedule[idx_v]
@@ -2053,6 +2109,42 @@ def main(
             payload["params_cbf"] = params["cbf"]
         with open(out_path / "training_results.pkl", "wb") as fh:
             pickle.dump(payload, fh)
+        # 另存配置快照为 JSON，便于跨平台复现加载
+        try:
+            import json  # 局部导入以避免上方命名冲突
+            from typing import Any
+
+            def _to_jsonable(x: Any):
+                # 将 JAX/NumPy 标量与数组转为 Python 原生类型
+                try:
+                    # jnp.ndarray / np.ndarray
+                    if hasattr(x, "tolist"):
+                        return x.tolist()
+                except Exception:
+                    pass
+                # dataclass 已 asdict，无需再处理
+                if isinstance(x, dict):
+                    return {k: _to_jsonable(v) for k, v in x.items()}
+                if isinstance(x, (list, tuple)):
+                    return [_to_jsonable(v) for v in x]
+                # JAX/NumPy 标量
+                try:
+                    import numpy as _np  # 局部导入，避免全局依赖
+                    if isinstance(x, (_np.floating, _np.integer)):
+                        return x.item()
+                except Exception:
+                    pass
+                return x
+
+            json_payload = _to_jsonable(asdict(config))
+            with open(out_path / "config.json", "w", encoding="utf-8") as fh:
+                json.dump(json_payload, fh, indent=2, ensure_ascii=False)
+        except Exception as _exc:
+            # 配置保存失败不应中断训练流程；在控制台打印提示即可。
+            print(f"[warn] 写入配置快照 config.json 失败: {_exc}")
+        # 额外导出独立的策略参数文件，方便后续阶段直接载入
+        with open(out_path / "policy_params.pkl", "wb") as fh:
+            pickle.dump({"params": params["policy"]}, fh)
         print(f"Saved training artifacts to {out_path}")
 
 
